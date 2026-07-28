@@ -37,3 +37,6 @@ pyzed*.whl
 tiptop/checkpoints/timing_data/**
 tiptop/checkpoints/flow_data/shards/**
 tiptop/checkpoints/flow_data/stroke_flow.npz
+tiptop/checkpoints/traj_timing_data/**
+tiptop/checkpoints/traj_timing_data_commanded/**
+tiptop/checkpoints/traj_geom_data/**

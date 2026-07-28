@@ -344,13 +344,21 @@ def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool, den
                     try:
                         robot.start_joint_impedance()
                         streamed = 0
+                        # Pace to an ABSOLUTE per-waypoint deadline rather than sleeping the full
+                        # duration after each setpoint. update_desired_joint_positions is a ~5 ms gRPC
+                        # round trip; sleeping d ON TOP of it adds that overhead to every ~20 ms
+                        # waypoint, so trajectories ran a near-constant ~1.25x slower than commanded
+                        # (measured 1.21-1.26x on real episodes). Sleeping to a running deadline absorbs
+                        # the call time instead, so the arm tracks the planned duration.
+                        t_next = time.monotonic()
                         for wp in waypoints:
                             q = wp.get("q_goal") or []
                             if len(q) != 7:
                                 raise ValueError(f"waypoint {streamed} q_goal len {len(q)} != 7")
                             d = float(wp.get("duration", default_duration))
                             robot.update_desired_joint_positions(torch.tensor(q, dtype=torch.float32))
-                            time.sleep(d if d > 0 else default_duration)
+                            t_next += d if d > 0 else default_duration
+                            time.sleep(max(0.0, t_next - time.monotonic()))
                             streamed += 1
                         # Leave the arm holding the final setpoint for the next command.
                         robot.terminate_current_policy()

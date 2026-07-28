@@ -169,25 +169,13 @@ def run_planning(
 def _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit):
     """Dispatch trajectory blending on ``blend_config.mode`` (see resolve_blend_config).
 
-    ``spline`` (default) uses the analytic time law in ``trajectory_blending``. ``neural`` uses the
-    DROID-learned, geometry-conditioned deterministic timing model (``neural_blending``). ``flow`` samples a
-    full human-like stroke per operation from the conditional flow-matching model (``flow_blending``), so
-    generated data reproduces the distribution of teleoperator styles. Both learned modes load from
-    ``blend_config.model_path``; any setup failure (missing/corrupt checkpoint, import error) is logged and
-    falls back to the analytic spline blend, so a plan is never lost to a model problem.
+    ``spline`` (default) uses the analytic time law in ``trajectory_blending``. ``flow`` samples a full
+    human-like stroke per operation from the conditional flow-matching model (``flow_blending``), so
+    generated data reproduces the distribution of teleoperator styles; it loads from
+    ``blend_config.model_path``, and any setup failure (missing/corrupt checkpoint, import error) is logged
+    and falls back to the analytic spline blend, so a plan is never lost to a model problem.
     """
-    if blend_config.mode == "neural":
-        try:
-            from tiptop.neural_blending import neural_blend_cutamp_plan
-            from tiptop.networks.timing_net import TimingModel
-
-            model = TimingModel(blend_config.model_path)
-            return neural_blend_cutamp_plan(
-                cutamp_plan, blend_config, model, vel_limit=vel_limit, acc_limit=acc_limit
-            )
-        except Exception:
-            _log.exception("Neural blending unavailable; falling back to the analytic spline blend")
-    elif blend_config.mode == "flow":
+    if blend_config.mode == "flow":
         try:
             from tiptop.flow_blending import flow_blend_cutamp_plan
             from tiptop.networks.flow_timing import FlowModel

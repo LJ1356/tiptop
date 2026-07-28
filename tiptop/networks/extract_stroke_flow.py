@@ -39,12 +39,10 @@ from extract_stroke_timing import (  # noqa: E402
     _episode_bounds,
     _list2d,
     _scalar,
-    gripper_event_frames,
+    gripper_events,
 )
 
-T_TIME = 32  # samples uniform in time (the generation target length)
-S_ARC = 32   # samples uniform in arc length (the condition length)
-DOF = 7
+from flow_timing import DOF, KIND, S_ARC, T_TIME  # noqa: E402  (the model-side contract)
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "checkpoints" / "flow_data"
 SHARD_DIR = OUT_DIR / "shards"
@@ -69,9 +67,11 @@ def _resample_arc(q: np.ndarray, n: int) -> np.ndarray | None:
     return np.stack([np.interp(dst, u, q[:, j]) for j in range(q.shape[1])], axis=1)
 
 
-def _episode_pairs(q: np.ndarray, g: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+def _episode_pairs(q: np.ndarray, g: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Strokes of one episode -> (x, c, k), k = the [start, end] event kinds as KIND codes."""
     T = len(q)
-    bounds = sorted({0, T - 1, *gripper_event_frames(g)})
+    events = dict(gripper_events(g))
+    bounds = sorted({0, T - 1, *events})
     pairs = []
     for a, b in zip(bounds[:-1], bounds[1:]):
         if b - a + 1 < MIN_STROKE_LEN:
@@ -85,7 +85,10 @@ def _episode_pairs(q: np.ndarray, g: np.ndarray) -> list[tuple[np.ndarray, np.nd
         x = _resample_time(seg, T_TIME)
         x = (x - x[0:1]).astype(np.float32)   # start-centered trajectory over time
         c = (c - c[0:1]).astype(np.float32)   # start-centered path over arc length
-        pairs.append((x, c))
+        # The stroke boundaries ARE the gripper events, so these labels say what the generated stroke
+        # must decelerate into (or accelerate out of). "none" = an episode end, not a gripper event.
+        k = np.array([KIND[events.get(a, "none")], KIND[events.get(b, "none")]], np.int64)
+        pairs.append((x, c, k))
     return pairs
 
 
@@ -95,19 +98,56 @@ def reduce_file(tbl) -> dict:
     A = _list2d(tbl["action"], 8)
     if not np.isfinite(J).all():
         raise ValueError("NaN/inf in DROID joints")
-    xs, cs = [], []
+    xs, cs, ks = [], [], []
     n_eps = 0
     for a, b in _episode_bounds(ep):
         qseg = J[a:b]
         if len(qseg) < MIN_STROKE_LEN:
             continue
         n_eps += 1
-        for x, c in _episode_pairs(qseg, A[a:b, ACT_GRIPPER_COL]):
+        for x, c, k in _episode_pairs(qseg, A[a:b, ACT_GRIPPER_COL]):
             xs.append(x)
             cs.append(c)
+            ks.append(k)
     return dict(
         x=np.asarray(xs, np.float32).reshape(-1, T_TIME, DOF),
         c=np.asarray(cs, np.float32).reshape(-1, S_ARC, DOF),
+        k=np.asarray(ks, np.int64).reshape(-1, 2),
+        n_episodes=np.int64(n_eps),
+        n_strokes=np.int64(len(xs)),
+    )
+
+
+def reduce_cached_shards(shard_dir: Path, max_files: int = None) -> dict:
+    """Same reduction over the proprio shards ``vae/data_full.py fetch`` already wrote.
+
+    Those shards hold exactly the columns this extractor needs (joints + the 8-wide action whose last
+    column is the commanded gripper), so when they are present the training set can be rebuilt without
+    re-streaming the Hub.
+    """
+    shards = sorted(Path(shard_dir).glob("shard_*.npz"))[:max_files]
+    if not shards:
+        raise FileNotFoundError(f"no shard_*.npz under {shard_dir}")
+    xs, cs, ks = [], [], []
+    n_eps = 0
+    for sp in shards:
+        blob = np.load(sp, allow_pickle=True)
+        J, A = blob["joints"], blob["actions"]
+        for i in range(int(blob["n_eps"])):
+            q = np.asarray(J[i], np.float64)
+            a = np.asarray(A[i], np.float64)
+            if len(q) < MIN_STROKE_LEN or a.ndim != 2 or a.shape[1] <= ACT_GRIPPER_COL:
+                continue
+            n_eps += 1
+            for x, c, k in _episode_pairs(q, a[:, ACT_GRIPPER_COL]):
+                xs.append(x)
+                cs.append(c)
+                ks.append(k)
+        print(f"[{sp.name}] cumulative: {n_eps} episodes, {len(xs)} strokes", flush=True)
+    return dict(
+        x=np.asarray(xs, np.float32).reshape(-1, T_TIME, DOF),
+        c=np.asarray(cs, np.float32).reshape(-1, S_ARC, DOF),
+        k=np.asarray(ks, np.int64).reshape(-1, 2),
         n_episodes=np.int64(n_eps),
         n_strokes=np.int64(len(xs)),
     )
@@ -154,8 +194,9 @@ def merge():
         raise FileNotFoundError(f"no shards under {SHARD_DIR}")
     x = np.concatenate([np.load(s)["x"] for s in shards], 0)
     c = np.concatenate([np.load(s)["c"] for s in shards], 0)
-    np.savez_compressed(MERGED, x=x, c=c)
-    print(f"\nmerged {len(shards)} shards -> {MERGED}   x{x.shape} c{c.shape}")
+    k = np.concatenate([np.load(s)["k"] for s in shards], 0)
+    np.savez_compressed(MERGED, x=x, c=c, k=k)
+    print(f"\nmerged {len(shards)} shards -> {MERGED}   x{x.shape} c{c.shape} k{k.shape}")
 
 
 if __name__ == "__main__":
@@ -165,8 +206,15 @@ if __name__ == "__main__":
     ap.add_argument("--sleep", type=float, default=0.5)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--merge-only", action="store_true")
+    ap.add_argument("--from-cache", type=str, default=None,
+                    help="Build from vae/data_cache/droid_full_proprio shards instead of streaming.")
     a = ap.parse_args()
-    if a.merge_only:
+    if a.from_cache:
+        agg = reduce_cached_shards(Path(a.from_cache), a.files if a.files > 0 else None)
+        MERGED.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(MERGED, x=agg["x"], c=agg["c"], k=agg["k"])
+        print(f"\n{int(agg['n_episodes'])} episodes -> {int(agg['n_strokes'])} strokes -> {MERGED}")
+    elif a.merge_only:
         merge()
     else:
         stream(a.files, a.start, a.sleep, a.overwrite)

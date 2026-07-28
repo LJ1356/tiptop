@@ -76,7 +76,7 @@ from scipy.interpolate import CubicSpline, make_smoothing_spline
 # NOTE: ``from curobo.types.state import JointState`` is imported lazily inside
 # ``_blend_trajectory_steps`` (its only user) rather than at module top, so this module's pure
 # geometry/timing helpers (``_fit_geometry``, ``_finish_stroke``, ``blend_group`` ...) can be
-# imported -- and unit-tested -- without a cuRobo install. ``neural_blending`` reuses them.
+# imported -- and unit-tested -- without a cuRobo install. ``flow_blending`` reuses them.
 
 _log = logging.getLogger(__name__)
 
@@ -112,6 +112,11 @@ _DEFAULT_BOUNDARY_WINDOW = 0.0
 # normalized speed profile numerically sane.
 _MAX_BOUNDARY_RATIO = 40.0
 
+# Physical width (seconds) of the window the flow backend's boundary correction acts over at each end
+# (flow_blending._warp_profile). DROID's speed dip around a gripper event spans about +-0.53 s, so a
+# wider correction stops adjusting an endpoint and starts repainting the whole approach.
+_DEFAULT_BOUNDARY_WINDOW_SEC = 0.5
+
 # Waypoints closer than this (Euclidean, joint space, radians) to the previous kept one are dropped
 # before fitting so the arc-length parameter is strictly increasing. Consecutive segments share an
 # exact endpoint, and each segment's decel tail is a cluster of near-identical points -- this removes
@@ -142,18 +147,55 @@ class BlendConfig:
     boundary_window: float = _DEFAULT_BOUNDARY_WINDOW
     # Operation names to restrict blending to (e.g. ("Pick", "Place")); None blends every operation.
     ops: tuple[str, ...] | None = None
-    # Timing backend: "spline" (the analytic min-jerk / asymmetric time law here, the default), "neural"
-    # (a DROID-learned deterministic timing model supplies the speed profile -- see neural_blending), or
-    # "flow" (a DROID-learned conditional flow-matching model SAMPLES a full human stroke per operation --
-    # see flow_blending; each sample is a different human-like realization, so generated data reproduces
-    # the distribution of teleoperator styles). In every mode the GEOMETRY smoothing, vel/accel caps,
+    # Timing backend: "spline" (the analytic min-jerk / asymmetric time law here, the default) or "flow"
+    # (a DROID-learned conditional flow-matching model SAMPLES a full human stroke per operation -- see
+    # flow_blending; each sample is a different human-like realization, so generated data reproduces the
+    # distribution of teleoperator styles). In both modes the GEOMETRY smoothing, vel/accel caps,
     # endpoint pinning and non-idle boundary speed are enforced by the same engine.
     mode: str = "spline"
-    # Path to the learned timing/flow checkpoint (neural / flow modes). Relative paths resolve under the
-    # tiptop package dir; when omitted each model uses its own default (timing_net.pt / flow_net.pt).
+    # Path to the learned flow checkpoint (flow mode). Relative paths resolve under the tiptop package
+    # dir; when omitted the model uses its own default (flow_net_t64.pt).
     model_path: str | None = None
     # Flow mode only: number of Euler ODE steps when sampling the flow model (more = finer, slower).
     flow_steps: int = 60
+    # Flow mode only: use ONLY the flow's sampled timing and keep the collision-checked cuTAMP geometry,
+    # instead of also adopting the flow sample's own path. Default True: the flow sample's own path is a
+    # 32-point resample that measurably STRAIGHTENS the planner's, deleting both the collision guarantee
+    # and the configuration-space texture the VAE-manifold cost put there (arc-length curvature drops
+    # from the planner's ~64 to ~6, against DROID's ~10 -- i.e. straighter than human, the wrong way).
+    flow_retime_only: bool = True
+    # Where each stroke's PACE (mean joint speed) comes from. "plan" (default) inherits the cuTAMP
+    # group's own wall-clock, so absolute velocity follows time_dilation_factor and is deterministic.
+    # "droid" draws it from the measured DROID conditional on arc length + event kinds (see
+    # networks.droid_timing_stats), which is what makes the emitted speed a human statistic.
+    pace_mode: str = "plan"
+    # Global multiplier on the sampled pace -- the safety lever for "droid" pace, replacing the role
+    # time_dilation_factor plays for "plan" pace. 1.0 = run at DROID's measured speed.
+    pace_scale: float = 1.0
+    # Where the joint speed AT a gripper event comes from. "const" uses blend_boundary_speed for every
+    # event of both kinds. "droid" draws once per event from the measured conditional on the event KIND,
+    # restoring DROID's ~1.6x grasp-vs-release asymmetry that one constant flattens to 1.0; the draw is
+    # shared by the strokes on both sides, which is what makes the commanded speed continuous there.
+    boundary_mode: str = "const"
+    # Seconds at each end over which the boundary correction is applied (see flow_blending._warp_profile).
+    boundary_window_sec: float = _DEFAULT_BOUNDARY_WINDOW_SEC
+    # Seconds at each end over which the flow model's normalized-time profile is compressed to a human
+    # PHYSICAL width (flow_blending._end_remap). DROID's dip around a gripper event is ~1.5 s wide
+    # whatever the stroke's length, but the model generates in normalized time, so on a stroke longer
+    # than DROID's median its approach stretches with it -- measured, the model is at 0.54 of cruise
+    # with a quarter of the stroke still to go, a 1.6 s decel on a 6.5 s stroke. 0 disables the remap.
+    profile_end_sec: float = 1.0
+    # Upper bound on a stroke's duration, as a multiple of the cuTAMP group's own wall-clock. Only bites
+    # under blend_pace: droid, where target_duration otherwise constrains nothing and a bottom-tail pace
+    # draw on a long path can run several times longer than the planner intended. The vel/accel caps are
+    # applied after it, so they still win.
+    max_duration_mult: float = 2.0
+    # Path to the fitted DROID timing stats (relative paths resolve under the tiptop package dir).
+    stats_path: str | None = None
+    # Seed for the pace / boundary / flow draws. None (default) means fresh entropy per plan, which is
+    # the point in dataset generation -- every episode a different human-like realization. Set it to
+    # reproduce one plan exactly.
+    seed: int | None = None
 
 
 def resolve_blend_config(overrides: dict | None) -> BlendConfig:
@@ -177,13 +219,38 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
                                         without speeding up the careful cruise (see _asymmetric_stroke).
         blend_ops:        list[str]  -- restrict blending to these operations by name, e.g.
                                         [Pick, Place]; omitted/empty blends every operation
-        blend_mode:       str        -- "spline" (default; the analytic time law here) or "neural"
-                                        (a DROID-learned timing model supplies the speed profile -- see
-                                        neural_blending). Only the TIMING differs; geometry + limits +
-                                        endpoint/non-idle handling are identical between the two modes.
-        blend_model_path: str        -- checkpoint for the learned timing model (neural mode); relative
-                                        paths resolve under the tiptop package dir. Defaults to the
-                                        model's own default checkpoint when omitted.
+        blend_mode:       str        -- "spline" (default; the analytic time law here) or "flow" (a
+                                        DROID-learned flow-matching model samples the stroke's speed
+                                        profile -- see flow_blending). Only the TIMING differs; geometry +
+                                        limits + endpoint/non-idle handling are identical between the two.
+        blend_model_path: str        -- checkpoint for the learned flow model (flow mode); relative paths
+                                        resolve under the tiptop package dir. Defaults to the model's own
+                                        default checkpoint when omitted.
+        blend_flow_retime_only: bool -- flow mode only: keep the collision-checked cuTAMP geometry and use
+                                        ONLY the flow model's sampled timing (default True). False adopts
+                                        the flow sample's own path, which straightens it and deletes the
+                                        VAE-manifold texture. See flow_blending.
+        blend_pace:       str        -- flow mode only: where each stroke's mean joint speed comes from.
+                                        "plan" (default) = the cuTAMP group's own wall-clock, so absolute
+                                        velocity follows time_dilation_factor. "droid" = drawn from the
+                                        measured DROID conditional on arc length + event kinds, so the
+                                        emitted speed is a human statistic and varies per stroke.
+        blend_pace_scale: float      -- global multiplier on the "droid" pace (default 1.0). This is the
+                                        safety lever for blend_pace: droid, the way time_dilation_factor
+                                        is for blend_pace: plan.
+        blend_boundary_mode: str     -- flow mode only: where the joint speed AT a gripper event comes
+                                        from. "const" (default) = blend_boundary_speed everywhere.
+                                        "droid" = one draw per event from the measured conditional on the
+                                        event KIND, shared by the strokes on both sides so the commanded
+                                        speed is continuous there. Under "droid", blend_boundary_speed
+                                        becomes a FLOOR only.
+        blend_boundary_window_sec: float -- seconds at each end over which the learned backends' boundary
+                                        correction acts (default 0.5, matching DROID's ~+-0.53 s dip).
+        blend_stats_path: str        -- fitted DROID timing stats for the two modes above; relative paths
+                                        resolve under the tiptop package dir. Defaults to
+                                        checkpoints/droid_timing_stats.npz.
+        blend_seed:       int        -- seed the pace / boundary / flow draws. Omitted (default) means a
+                                        fresh draw per plan, which is the point in dataset generation.
     """
     o = overrides or {}
     raw_ops = o.get("blend_ops")
@@ -195,10 +262,24 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
     if boundary_window < 0.0:
         raise ValueError(f"blend_boundary_window must be >= 0 (got {boundary_window})")
     mode = str(o.get("blend_mode", "spline")).strip().lower()
-    if mode not in ("spline", "neural", "flow"):
-        raise ValueError(f"blend_mode must be 'spline', 'neural' or 'flow' (got {mode!r})")
+    if mode not in ("spline", "flow"):
+        raise ValueError(f"blend_mode must be 'spline' or 'flow' (got {mode!r})")
     raw_model_path = o.get("blend_model_path")
     model_path = str(raw_model_path) if raw_model_path else None
+    pace_mode = str(o.get("blend_pace", "plan")).strip().lower()
+    if pace_mode not in ("plan", "droid"):
+        raise ValueError(f"blend_pace must be 'plan' or 'droid' (got {pace_mode!r})")
+    pace_scale = float(o.get("blend_pace_scale", 1.0))
+    if pace_scale <= 0.0:
+        raise ValueError(f"blend_pace_scale must be > 0 (got {pace_scale})")
+    boundary_mode = str(o.get("blend_boundary_mode", "const")).strip().lower()
+    if boundary_mode not in ("const", "droid"):
+        raise ValueError(f"blend_boundary_mode must be 'const' or 'droid' (got {boundary_mode!r})")
+    window_sec = float(o.get("blend_boundary_window_sec", _DEFAULT_BOUNDARY_WINDOW_SEC))
+    if window_sec <= 0.0:
+        raise ValueError(f"blend_boundary_window_sec must be > 0 (got {window_sec})")
+    raw_stats = o.get("blend_stats_path")
+    raw_seed = o.get("blend_seed")
     return BlendConfig(
         enabled=bool(o.get("blend_trajectory", False)),
         smoothing=float(o.get("blend_smoothing", _DEFAULT_SMOOTHING)),
@@ -211,6 +292,15 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         mode=mode,
         model_path=model_path,
         flow_steps=int(o.get("blend_flow_steps", 60)),
+        flow_retime_only=bool(o.get("blend_flow_retime_only", True)),
+        pace_mode=pace_mode,
+        pace_scale=pace_scale,
+        boundary_mode=boundary_mode,
+        boundary_window_sec=window_sec,
+        profile_end_sec=float(o.get("blend_profile_end_sec", 1.0)),
+        max_duration_mult=float(o.get("blend_max_duration_mult", 2.0)),
+        stats_path=str(raw_stats) if raw_stats else None,
+        seed=int(raw_seed) if raw_seed is not None else None,
     )
 
 

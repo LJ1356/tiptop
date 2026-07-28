@@ -136,7 +136,7 @@ def evaluate(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, default="checkpoints/flow_net.pt")
+    ap.add_argument("--model", type=str, default="checkpoints/flow_net_t64.pt")
     ap.add_argument("--start", type=int, default=45)
     ap.add_argument("--files", type=int, default=2)
     ap.add_argument("--k", type=int, default=32)
