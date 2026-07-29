@@ -71,8 +71,11 @@ from tiptop.utils import (
     get_robot_rerun,
     load_gripper_mask,
     print_tiptop_banner,
+    reconnect_robot_client,
+    release_robot_client,
     remove_file_handler,
     setup_logging,
+    wait_for_robot_stationary,
 )
 from tiptop.lerobot_capture import GRIPPER_MAX_WIDTH, GripperSampler, JointSampler, _read_gripper_width, dump_raw_episode
 from tiptop.viz_utils import get_gripper_mesh, get_heatmap
@@ -138,6 +141,101 @@ def _clear_preempt() -> None:
     """Called once a rollout abort has fully unwound, so the next Ctrl-C preempts again."""
     global _preempting
     _preempting = False
+
+
+# Set by the "switch to teleop" trigger (SIGUSR1) so the KeyboardInterrupt handler in the rollout
+# loop knows to run the teleop hand-off (release the robot, wait for the human to hand it back, then
+# auto-replan the same task) instead of just landing at the task prompt like a plain preempt.
+_teleop_requested = False
+
+# Set by _run_teleop_handoff once teleop hands the robot back; consumed by the NEXT call to
+# _get_task_instruction() so the loop immediately replans/executes the SAME task from the human's
+# hand-off pose instead of blocking on a typed task.
+_pending_instruction: str | None = None
+
+
+def _sigusr1_teleop_switch(_signum, _frame) -> None:
+    """"Switch to teleop" trigger (SIGUSR1) from the data-collection UI's button.
+
+    Identical unwind to Ctrl-C/Preempt (see _sigint_preempt): the in-flight motion segment finishes
+    (bamboo has no abort), no further plan steps are sent, and the loop lands back at the task
+    prompt. The only difference is _teleop_requested, which routes the KeyboardInterrupt handler into
+    _run_teleop_handoff instead of just waiting for a new typed task.
+    """
+    global _teleop_requested
+    _teleop_requested = True
+    _sigint_preempt(_signum, _frame)
+
+
+def _run_teleop_handoff(container: "_DemoContainer") -> None:
+    """Hand the physical arm off to a human teleop session, then block until it's handed back.
+
+    Called from the rollout loop's KeyboardInterrupt handler once the in-flight rollout has already
+    unwound. From here:
+      1. release this process's RobotClient connection so a separate teleop process (DROID's
+         StableRobotEnv) can take over the arm -- they talk to the same NUC-side polymetis server and
+         cannot hold it at once (see data-collection/ARCHITECTURE.md).
+      2. confirm the arm has ACTUALLY stopped moving (wait_for_robot_stationary) before anyone is
+         told it's safe to touch the shim -- releasing our connection does not mean the shim is
+         done: it still has to finish the in-flight trajectory segment and hand control back to
+         polymetis's default hold controller, which takes real time. Skipping this check would let
+         an operator kill the shim (or start teleop) while the arm is still moving.
+      3. emit "awaiting_teleop_resume" so the data-collection server knows it's safe to start the
+         teleop session, and waits for a "resume" command back once that session ends.
+      4. block on stdin for "resume"
+      5. reconnect the RobotClient and queue the SAME task instruction so the next loop iteration
+         re-runs perception + cuTAMP planning + execution from wherever the human left the arm.
+    """
+    global _pending_instruction
+    _log.info("Teleop switch requested: releasing the robot connection for hand-off")
+    _emit_event({"event": "teleop_handoff_start"})
+    release_robot_client(container.robot)
+
+    _log.info("Confirming the arm has come to a full stop before handing off to teleop...")
+    if wait_for_robot_stationary():
+        _log.info("Confirmed: the arm is stationary")
+    else:
+        _log.warning(
+            "Could not confirm the arm has stopped moving (state port unreachable, or it is "
+            "genuinely still moving after the timeout) -- warning instead of silently proceeding"
+        )
+        _emit_event(
+            {
+                "event": "teleop_handoff_warning",
+                "message": (
+                    "Could not confirm the arm has stopped moving. Visually confirm it is "
+                    "stationary before touching the shim or starting teleop."
+                ),
+            }
+        )
+
+    _emit_event({"event": "awaiting_teleop_resume"})
+    _log.info(
+        "Robot connection released; waiting for 'resume' on stdin (sent once the teleop session "
+        "has ended and released the arm) before reconnecting and replanning the same task..."
+    )
+    try:
+        while True:
+            raw = input().strip()
+            cmd = raw
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and "cmd" in parsed:
+                    cmd = parsed["cmd"]
+            except ValueError:
+                pass
+            if cmd.lower() == "resume":
+                break
+            _log.warning(f"Ignoring unexpected input while awaiting teleop resume: {raw!r}")
+    except EOFError:
+        raise UserExitException("EOF while awaiting teleop resume")
+
+    _log.info("Resuming: reconnecting to the robot")
+    object.__setattr__(container, "robot", reconnect_robot_client())
+    _emit_event({"event": "teleop_handoff_done"})
+
+    if _LAST_TASK:
+        _pending_instruction = _LAST_TASK
 
 
 class UserExitException(Exception):
@@ -386,8 +484,16 @@ def _get_task_instruction() -> str:
 
     A ROBOT_COMMANDS word ('home'/'open') is returned as-is instead of a task; the caller runs it
     and re-prompts. It is deliberately NOT remembered as the last task, so a later bare Enter still
-    repeats the real instruction rather than nudging the robot again."""
-    global _LAST_TASK
+    repeats the real instruction rather than nudging the robot again.
+
+    If a teleop hand-off just finished (_run_teleop_handoff queued _pending_instruction), that is
+    consumed here first, WITHOUT blocking on stdin -- the loop replans/executes the same task
+    immediately from wherever the human left the arm."""
+    global _LAST_TASK, _pending_instruction
+    if _pending_instruction is not None:
+        instr = _pending_instruction
+        _pending_instruction = None
+        return instr
     env_task = os.environ.get('TIPTOP_TASK', '')
     if env_task:
         os.environ['TIPTOP_TASK'] = ''  # consume the launch task
@@ -1059,6 +1165,10 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # Unwind is done (the finally-blocks above ran as the exception propagated), so a
                 # new Ctrl-C should preempt the next rollout rather than be swallowed.
                 _clear_preempt()
+                global _teleop_requested
+                if _teleop_requested:
+                    _teleop_requested = False
+                    _run_teleop_handoff(container)
                 continue
             except Exception as e:
                 # A single rollout failing (a transient Gemini/perception 503, a planning
@@ -1167,6 +1277,11 @@ def _sync_entrypoint(
     # tail of its current trajectory segment. Installed after the pool so its workers (which set
     # SIG_IGN in their own initializer) are unaffected.
     signal.signal(signal.SIGINT, _sigint_preempt)
+    # SIGUSR1 is the "switch to teleop" trigger from the data-collection UI's button: same in-flight
+    # abort as SIGINT, plus _teleop_requested routes the KeyboardInterrupt handler into the teleop
+    # hand-off (release the robot, wait for it back, auto-replan the same task). See
+    # _sigusr1_teleop_switch / _run_teleop_handoff.
+    signal.signal(signal.SIGUSR1, _sigusr1_teleop_switch)
 
     exit_code = 1
     try:
