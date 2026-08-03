@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,7 +55,11 @@ from tiptop.perception.cameras import (
 from tiptop.perception.m2t2 import m2t2_to_tiptop_transform
 from tiptop.perception.sam2 import sam2_client
 from tiptop.perception.segmentation import segment_pointcloud_by_masks, segment_table_with_ransac
-from tiptop.perception.utils import convert_trimesh_box_to_curobo_cuboid, convert_trimesh_to_curobo_mesh
+from tiptop.perception.utils import (
+    convert_trimesh_box_to_curobo_cuboid,
+    convert_trimesh_to_curobo_mesh,
+    project_spheres_to_mask,
+)
 from tiptop.perception_wrapper import detect_and_segment, predict_depth_and_grasps
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import (
@@ -158,6 +163,19 @@ _pending_instruction: str | None = None
 # gripper reset. Homing would undo the hand-off (the whole point is to replan from where the human
 # left the arm) and opening the gripper would drop whatever the operator is holding.
 _skip_episode_reset = False
+
+# Hand-off lineage. One task attempt can span many legs -- tamp, teleop, tamp, ... -- and they are
+# ONE trajectory, not N episodes. Every leg is stamped with this id; collect/merge_trajectory.py
+# joins them into a single episode afterwards. A fresh rollout mints a new id; a rollout resuming
+# from a hand-off keeps the current one (this process lives across the whole hand-off, so a module
+# global is all the continuity that is needed). Segment ORDER is never derived from a counter --
+# the merge sorts legs by their camera record_start, which needs no agreement between processes.
+_trajectory_id: str | None = None
+
+# True once the CURRENT trajectory has been handed off at least once, i.e. it spans several legs.
+# Such a trajectory is post-processed by collect/merge_trajectory.py after the legs are joined;
+# exporting the final leg on its own here would export a fragment of the episode.
+_trajectory_handed_off = False
 
 # True only while the driver is blocked in input() at a stdin prompt. There, no rollout checkpoint
 # will ever be reached, so SIGUSR1 has to raise out of the prompt instead of setting a flag; see
@@ -317,8 +335,10 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
          _skip_episode_reset so the next loop iteration replans from the hand-off pose without
          moving the arm first -- no return to home, no gripper open, no move to the capture pose.
     """
-    global _pending_instruction, _skip_episode_reset
+    global _pending_instruction, _skip_episode_reset, _trajectory_handed_off
     _log.info("Teleop switch: releasing the robot connection for hand-off")
+    # This trajectory now spans several legs, so its export waits for the merge (see _spawn_postprocess).
+    _trajectory_handed_off = True
     _emit_event({"event": "teleop_handoff_start"})
     release_robot_client(container.robot)
 
@@ -350,7 +370,9 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
         # (measured). Leave a little slack and let the opener, which retries, confirm the rest.
         time.sleep(CAMERA_RELEASE_SETTLE_S)
 
-    _emit_event({"event": "awaiting_teleop_resume"})
+    # trajectory_id rides along so the server can stamp the teleop leg it is about to spawn with the
+    # same id, making the human's demonstration a segment of this trajectory rather than its own episode.
+    _emit_event({"event": "awaiting_teleop_resume", "trajectory_id": _trajectory_id})
     _log.info(
         "Robot and cameras released; waiting for 'resume' on stdin (sent once the operator hands "
         "control back and the teleop process has exited) before reconnecting and replanning..."
@@ -417,6 +439,10 @@ class Observation:
     # Additional stereo frames captured back-to-back at the same (static) pose, used for
     # temporal depth smoothing. Empty for replay/websocket paths, which fuse nothing.
     depth_frames: tuple[Frame, ...] = ()
+    # Image-space mask of the robot's own geometry, dropped from the point cloud: the static
+    # gripper mask in the wrist camera's view, the projected collision spheres in a third-person
+    # camera's (where the arm is in frame from wherever it happens to be standing).
+    robot_mask: Bool[np.ndarray, "h w"] | None = None
 
 
 @dataclass(frozen=True)
@@ -428,10 +454,23 @@ class _DemoContainer:
     external_cam: Camera | None
     external_cam_2: Camera | None
     enable_recording: bool
+
+    # Which of the cameras above perception reads: "hand" or "external" (cameras.perception).
+    # Stored as a key rather than a handle because the teleop hand-off closes and re-opens the
+    # cameras -- see perception_camera().
+    perception_cam_key: str
+    # Perception camera's pose when it is static (third-person): world_from_cam straight out of
+    # calibration. None for the wrist camera, whose pose is only known through the arm and is
+    # recomputed by FK from ee_from_cam at each capture.
+    world_from_perception_cam: Float[np.ndarray, "4 4"] | None
     ee_from_cam: Float[np.ndarray, "4 4"]
+    # Built from the PERCEPTION camera's intrinsics -- FoundationStereo is given fx/fy/cx/cy and the
+    # baseline of the camera whose stereo pair it is fed.
     depth_estimator: DepthEstimator
 
-    gripper_mask: Bool[np.ndarray, "h w"]
+    # Wrist-view image-space mask of the gripper, dropped from the point cloud. None when a
+    # third-person camera does perception: the mask is only meaningful in the wrist's view.
+    gripper_mask: Bool[np.ndarray, "h w"] | None
 
     ik_solver: IKSolver
     motion_gen: MotionGen
@@ -456,22 +495,64 @@ class ProcessedScene:
     grasps: dict[str, dict]  # Label -> grasp data with tensor versions
 
 
+def perception_camera(container: _DemoContainer) -> Camera:
+    """The camera perception reads.
+
+    Resolved per call rather than held: the teleop hand-off closes every camera and re-opens it
+    afterwards (_release_cameras / _reacquire_cameras), so a cached handle would go stale.
+    """
+    cam = container.cam if container.perception_cam_key == "hand" else container.external_cam
+    if cam is None:
+        raise RuntimeError(
+            f"The {container.perception_cam_key} camera does perception (cameras.perception) but is not open"
+        )
+    return cam
+
+
 def capture_live_observation(container: _DemoContainer) -> Observation:
-    """Read robot joint positions and compute world_from_cam via forward kinematics."""
+    """Read robot joint positions, the perception camera's pose, and a burst of frames."""
+    cfg = tiptop_cfg()
     q_curr = container.robot.get_joint_positions()
     q_curr_pt = tensor_args.to_device(q_curr)
-    world_from_ee = container.motion_gen.kinematics.get_state(q_curr_pt).ee_pose.get_numpy_matrix()[0]
-    world_from_cam = world_from_ee @ container.ee_from_cam
+    kin_state = container.motion_gen.kinematics.get_state(q_curr_pt)
+    if container.world_from_perception_cam is not None:
+        world_from_cam = container.world_from_perception_cam
+    else:
+        world_from_cam = kin_state.ee_pose.get_numpy_matrix()[0] @ container.ee_from_cam
 
     # Grab a short burst of frames at this static pose for temporal depth smoothing. The first
     # frame is the representative one (used for rgb/intrinsics); the rest feed the median fusion.
-    num_frames = max(1, int(tiptop_cfg().perception.depth_smoothing.num_frames))
-    frames = [container.cam.read_camera() for _ in range(num_frames)]
+    num_frames = max(1, int(cfg.perception.depth_smoothing.num_frames))
+    frames = [perception_camera(container).read_camera() for _ in range(num_frames)]
+
+    if container.world_from_perception_cam is not None:
+        # A third-person camera sees the arm itself, from wherever it is standing, and no fixed
+        # image-space mask can cover that. Project the same collision spheres cuRobo plans against
+        # into this frame instead -- they follow the joints, so the arm is dropped from the point
+        # cloud whether it is at home or mid-hand-off. (Gemini is already told not to report the
+        # robot, so only the geometry needs handling.)
+        if kin_state.link_spheres_tensor is None:
+            raise RuntimeError(
+                "cuRobo returned no collision spheres for the current joint state, so the robot "
+                "cannot be masked out of the third-person view"
+            )
+        robot_mask = project_spheres_to_mask(
+            kin_state.link_spheres_tensor[0].cpu().numpy(),
+            world_from_cam,
+            frames[0].intrinsics,
+            frames[0].rgb.shape[:2],
+            margin_m=float(cfg.perception.robot_mask_margin_m),
+        )
+        _log.debug(f"Robot self-mask covers {robot_mask.mean():.1%} of the third-person view")
+    else:
+        robot_mask = container.gripper_mask
+
     return Observation(
         frame=frames[0],
         world_from_cam=world_from_cam,
         q_init=q_curr,
         depth_frames=tuple(frames),
+        robot_mask=robot_mask,
     )
 
 
@@ -516,6 +597,25 @@ def get_demo_container(
                 "comment out cameras.external_2 in tiptop.yml."
             )
 
+    # Which camera perception reads, and how its world pose is obtained. A third-person camera is
+    # bolted to the room: its calibration entry IS world_from_cam (droid stores third-person
+    # extrinsics base-relative, wrist extrinsics gripper-relative), so nothing about it depends on
+    # where the arm is. The wrist camera's pose has to be recomputed by FK at every capture instead.
+    perception_cam_key = str(tiptop_cfg().cameras.get("perception", "hand"))
+    if perception_cam_key == "hand":
+        perception_cam = cam
+        world_from_perception_cam = None
+        gripper_mask = load_gripper_mask()
+    elif perception_cam_key == "external":
+        perception_cam = external_cam
+        world_from_perception_cam = load_calibration(perception_cam.serial)
+        # The gripper mask is drawn in the WRIST camera's image; in a third-person view it would
+        # blank out an arbitrary patch of the scene.
+        gripper_mask = None
+    else:
+        raise ValueError(f"cameras.perception must be 'hand' or 'external', got {perception_cam_key!r}")
+    _log.info(f"Perception reads the {perception_cam_key} camera (s/n {perception_cam.serial})")
+
     # Create depth estimator once — closed over camera intrinsics
     # Cache the SAM2 client
     sam2_client()
@@ -530,9 +630,11 @@ def get_demo_container(
         external_cam=external_cam,
         external_cam_2=external_cam_2,
         enable_recording=enable_recording,
+        perception_cam_key=perception_cam_key,
+        world_from_perception_cam=world_from_perception_cam,
         ee_from_cam=ee_from_cam,
-        depth_estimator=get_depth_estimator(cam),
-        gripper_mask=load_gripper_mask(),
+        depth_estimator=get_depth_estimator(perception_cam),
+        gripper_mask=gripper_mask,
         ik_solver=ik_solver,
         motion_gen=motion_gen,
         curobo_config_summary=curobo_config_summary or {},
@@ -576,7 +678,15 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(save_dir, dest)
                 _log.info(f"Moved rollout to {cls} directory: {dest}")
-                _emit_event({"event": "labeled", "dir": str(dest), "success": user_input == "y"})
+                # The label rates the whole task attempt, so it is also the one unambiguous signal
+                # that the trajectory has ENDED (the operator could always have handed off again).
+                # The server merges the trajectory's legs on this event.
+                _emit_event({
+                    "event": "labeled",
+                    "dir": str(dest),
+                    "success": user_input == "y",
+                    "trajectory_id": _trajectory_id,
+                })
                 return dest
             elif user_input == "":
                 _log.info(f"Keeping rollout in eval directory: {save_dir}")
@@ -780,6 +890,7 @@ def process_scene_geometry(
     masks: np.ndarray,
     bboxes: list,
     grasps: dict,
+    valid_mask: np.ndarray | None = None,
     object_pcds: dict[str, o3d.geometry.PointCloud] | None = None,
 ) -> ProcessedScene:
     """Process perception results into 3D scene geometry for TAMP.
@@ -790,13 +901,15 @@ def process_scene_geometry(
         masks: Segmentation masks from SAM2
         bboxes: Bounding boxes from Gemini
         grasps: Grasp predictions from M2T2
+        valid_mask: Optional (H, W) mask of usable points (see predict_depth_and_grasps): the robot's
+            own geometry and invalid depth are excluded from the table fit and the object meshes
         object_pcds: Optional pre-computed object point clouds
 
     Returns:
         ProcessedScene with table cuboid, object meshes, pcds, and filtered grasps
     """
     # Segment table with RANSAC (returns trimesh Box)
-    table_trimesh = segment_table_with_ransac(xyz_map, rgb_map, masks)
+    table_trimesh = segment_table_with_ransac(xyz_map, rgb_map, masks, valid_mask=valid_mask)
     table_cuboid = convert_trimesh_box_to_curobo_cuboid(table_trimesh, name="table")
     log_curobo_mesh_to_rerun("world/table", table_cuboid.get_mesh(), static_transform=True)
 
@@ -811,6 +924,7 @@ def process_scene_geometry(
         table_top_z,
         return_pcd=True,
         erode_pixels=tiptop_cfg().perception.mask_erosion_pixels,
+        valid_mask=valid_mask,
     )
 
     # Use provided point clouds if available, otherwise use computed ones
@@ -947,7 +1061,6 @@ async def run_perception(
     task_instruction: str,
     save_dir: Path,
     depth_estimator: DepthEstimator | None = None,
-    gripper_mask: Bool[np.ndarray, "h w"] | None = None,
     include_workspace: bool = True,
     log_to_rerun: bool = True,
 ) -> tuple[TAMPEnvironment, list, ProcessedScene, list[dict]]:
@@ -966,7 +1079,7 @@ async def run_perception(
             observation.world_from_cam,
             tiptop_cfg().perception.voxel_downsample_size,
             depth_estimator=depth_estimator,
-            gripper_mask=gripper_mask,
+            robot_mask=observation.robot_mask,
             depth_frames=observation.depth_frames,
         ),
         detect_and_segment(rgb, task_instruction),
@@ -986,7 +1099,7 @@ async def run_perception(
         detection_results["bboxes"],
         detection_results["masks"],
         save_dir,
-        gripper_mask,
+        observation.robot_mask,
     )
 
     if log_to_rerun:
@@ -1006,6 +1119,7 @@ async def run_perception(
         detection_results["masks"],
         detection_results["bboxes"],
         depth_results["grasps"],
+        depth_results["valid_mask"],
     )
     processed_scene, save_result = await asyncio.gather(process_coroutine, save_future)
 
@@ -1123,16 +1237,24 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # Skipped entirely when resuming from a teleop hand-off: this run is a CONTINUATION
                 # of the same task from wherever the operator left the arm, so homing would throw
                 # that away and opening the gripper would drop whatever they are holding.
-                global _skip_episode_reset
+                global _skip_episode_reset, _trajectory_id, _trajectory_handed_off
                 resuming_from_handoff = _skip_episode_reset
                 _skip_episode_reset = False
+                # A resumed rollout continues the SAME trajectory as the leg that handed off; any
+                # other rollout starts a fresh one.
+                if not resuming_from_handoff:
+                    _trajectory_id = uuid.uuid4().hex[:16]
+                    _trajectory_handed_off = False
                 if resuming_from_handoff:
                     # The move to the capture pose is skipped too, so the arm does not move AT ALL
-                    # before replanning. capture_live_observation derives world_from_cam from FK, so
-                    # the geometry is right from any pose -- what q_capture buys is a guaranteed view
-                    # of the whole table. From a hand-off pose the wrist camera sees only what it
+                    # before replanning. The geometry is right from any pose either way
+                    # (capture_live_observation tracks the wrist camera by FK, and a third-person
+                    # camera does not move with the arm) -- what q_capture buys the WRIST camera is a
+                    # guaranteed view of the whole table. From a hand-off pose it sees only what it
                     # happens to point at, so perception can come back partial (or fail outright, in
                     # which case the rollout is abandoned and the session drops back to the prompt).
+                    # A third-person camera keeps its view, but the arm sits wherever the operator
+                    # left it, possibly in frame.
                     _log.info(
                         "Resuming after a teleop hand-off: not moving the arm at all -- no return "
                         "home, no gripper open, no move to the capture pose. Perception and planning "
@@ -1146,12 +1268,18 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     except Exception as _e:
                         _log.exception('Gripper open/check failed: ' + str(_e))
 
-                    # Perception reads the WRIST camera, so the arm goes to q_capture to point it at
-                    # the scene.
-                    _log.debug("Moving robot to capture joint positions")
-                    go_to_capture(
-                        time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen
-                    )
+                    if container.perception_cam_key == "hand":
+                        # Perception reads the WRIST camera, so the arm goes to q_capture to point it
+                        # at the scene.
+                        _log.debug("Moving robot to capture joint positions")
+                        go_to_capture(
+                            time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen
+                        )
+                    else:
+                        # A third-person camera already sees the scene, and q_capture would only put
+                        # the arm in front of it -- an arm in frame ends up in the point cloud, the
+                        # RANSAC table fit and the grasps. Perceive from home instead.
+                        _log.debug("Perception reads a third-person camera; staying at home instead of q_capture")
 
                 # Set once a "switch to teleop" has been observed at one of this rollout's
                 # checkpoints (see _sigusr1_teleop_switch); drives the hand-off after the rollout
@@ -1193,7 +1321,6 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         task_instruction,
                         save_dir,
                         depth_estimator=container.depth_estimator,
-                        gripper_mask=container.gripper_mask,
                     )
                     perception_duration = time.perf_counter() - perception_start
 
@@ -1230,8 +1357,8 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             _log.info(f"Saved TiPToP plan to {plan_path}")
 
                         # A "switch to teleop" that arrived during perception/planning: hand over
-                        # here rather than starting a plan we are about to interrupt anyway. The
-                        # arm is still parked at the capture pose, so there is nothing to finish.
+                        # here rather than starting a plan we are about to interrupt anyway. The arm
+                        # has not moved since perception, so there is nothing to finish.
                         if _consume_teleop_request():
                             _log.info("Teleop switch requested during perception/planning: not starting this plan")
                             handoff_pending = True
@@ -1313,6 +1440,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                         config_id=os.environ.get("TIPTOP_CONFIG_ID"),
                                         record_start=rec_window.get("t_start"),
                                         record_stop=rec_window.get("t_stop"),
+                                        trajectory_id=_trajectory_id,
                                     )
                                     if raw_path is not None:
                                         n_frames = json.loads((save_dir / "_meta.json").read_text()).get("n_frames", 0)
@@ -1359,8 +1487,11 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     elif execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp)
                         # Post-process this rollout (gifs + LeRobot export) in the background so
-                        # the next rollout can start immediately instead of blocking on it.
-                        _spawn_postprocess(final_dir)
+                        # the next rollout can start immediately instead of blocking on it. Skipped
+                        # for a multi-leg trajectory: this dir is only its LAST leg, and exporting
+                        # it would produce a fragment. merge_trajectory.py joins the legs first.
+                        if not _trajectory_handed_off:
+                            _spawn_postprocess(final_dir)
                         # PATCH (cortex v3): DO NOT auto-open the gripper after Pick.
                         # The original tiptop demo opened the gripper post-pick for
                         # standalone "did the grasp work?" tests. For cortex we WANT

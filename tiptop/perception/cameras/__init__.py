@@ -72,15 +72,15 @@ def get_hand_camera(depth: bool = False) -> Camera:
         raise ValueError(f"Unknown camera type: {cam_type}")
 
 
-def get_external_camera() -> Camera:
+def get_external_camera(depth: bool = False) -> Camera:
     """Get the external camera by serial number."""
     cfg = tiptop_cfg()
     cam_cfg = cfg.cameras.external
     cam_type = cam_cfg.type
     if cam_type == "zed":
-        return _get_zed_camera(cam_cfg)
+        return _get_zed_camera(cam_cfg, depth=depth)
     elif cam_type == "realsense":
-        return RealsenseCamera(str(cam_cfg.serial))
+        return RealsenseCamera(str(cam_cfg.serial), enable_depth=depth)
     else:
         raise ValueError(f"Unknown camera type: {cam_type}")
 

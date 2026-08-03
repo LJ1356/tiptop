@@ -170,7 +170,7 @@ def save_perception_outputs(
     bboxes: list[dict],
     masks: np.ndarray,
     save_dir: Path,
-    gripper_mask: Bool[np.ndarray, "h w"] | None = None,
+    robot_mask: Bool[np.ndarray, "h w"] | None = None,
 ):
     """Save perception outputs to disk.
 
@@ -217,9 +217,11 @@ def save_perception_outputs(
     masks_bool = masks > 0.5
     np.savez_compressed(str(perception_dir / "masks.npz"), masks_bool)  # masks are sparse so can compress
 
-    if gripper_mask is not None:
-        gripper_mask_img = Image.fromarray(gripper_mask.astype(np.uint8) * 255)
-        gripper_mask_img.save(str(perception_dir / "gripper_mask.png"))
+    if robot_mask is not None:
+        # Filename predates third-person perception, where the mask covers the whole arm rather than
+        # just the gripper. Kept so viz-tiptop-run reads old and new runs the same way.
+        robot_mask_img = Image.fromarray(robot_mask.astype(np.uint8) * 255)
+        robot_mask_img.save(str(perception_dir / "gripper_mask.png"))
 
     save_dur = time.perf_counter() - start_time
     _log.info(f"Saved perception outputs to {save_dir} in {save_dur:.2f}s")

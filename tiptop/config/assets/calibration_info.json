@@ -21,5 +21,17 @@
     ],
     "timestamp": 1783991597.6599455,
     "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448)"
+  },
+  "34032889": {
+    "pose": [
+      0.5910751310713035,
+      -0.5549574184102548,
+      0.3822894686382285,
+      -1.7661334236094726,
+      0.03738306174530326,
+      0.41597192208417944
+    ],
+    "timestamp": 1785792139.3234599,
+    "source": "copied verbatim from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1). world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from"
   }
 }

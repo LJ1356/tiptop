@@ -97,7 +97,7 @@ async def predict_depth_and_grasps(
     world_from_cam: Float[np.ndarray, "4 4"],
     downsample_voxel_size: float,
     depth_estimator: DepthEstimator | None = None,
-    gripper_mask: Bool[np.ndarray, "h w 3"] | None = None,
+    robot_mask: Bool[np.ndarray, "h w"] | None = None,
     depth_frames: tuple[Frame, ...] = (),
 ) -> dict:
     """Predict depth map using FoundationStereo and grasps using M2T2. Uses depth_estimator if provided, otherwise uses frame.depth.
@@ -127,8 +127,17 @@ async def predict_depth_and_grasps(
     K = frame.intrinsics
     xyz_map = depth_to_xyz(depth_map, K)
     xyz_map = xyz_map @ world_from_cam[:3, :3].T + world_from_cam[:3, 3]
-    if gripper_mask is not None:
-        xyz_map[gripper_mask] = 0.0
+    # Pixels that are a real measurement of something that is not the robot itself. Invalid depth
+    # (0 is FoundationStereo's convention) projects to the camera centre and masked pixels are
+    # zeroed below -- neither is a place anything actually is, so segmentation is handed this mask
+    # instead of being left to recognise those coordinates. Matters most for a third-person camera,
+    # whose mask covers the whole arm rather than a corner of the wrist's view.
+    valid_mask = np.isfinite(xyz_map).all(axis=-1) & (depth_map > 0)
+    if robot_mask is not None:
+        valid_mask &= ~robot_mask
+        # Zeroing is what keeps the robot out of the o3d cloud M2T2 sees: every masked pixel lands
+        # on the same point, so the voxel downsample collapses the lot into one.
+        xyz_map[robot_mask] = 0.0
     rgb_map = frame.rgb.astype(np.float32) / 255.0  # make it float with [0, 1]
 
     # Create open3d point cloud and downsample
@@ -155,6 +164,7 @@ async def predict_depth_and_grasps(
         # (h, w, 3) for xyz, rgb, and valid mask map
         "xyz_map": xyz_map,
         "rgb_map": rgb_map,
+        "valid_mask": valid_mask,
         # (n, 3) for downsampled point cloud
         "xyz_downsampled": xyz_downsampled,
         "rgb_downsampled": rgb_downsampled,

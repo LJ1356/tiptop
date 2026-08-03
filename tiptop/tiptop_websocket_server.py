@@ -310,7 +310,6 @@ class TiptopPlanningServer:
                         task_instruction,
                         save_dir,
                         depth_estimator=None,
-                        gripper_mask=None,
                         include_workspace=self._include_workspace,
                     )
                     perception_duration = time.monotonic() - perception_start

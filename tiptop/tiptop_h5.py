@@ -158,7 +158,6 @@ def run_tiptop_h5(
                     task_instruction,
                     save_dir,
                     depth_estimator=None,
-                    gripper_mask=None,
                     include_workspace=False,
                 )
 

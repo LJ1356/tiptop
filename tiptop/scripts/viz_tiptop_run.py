@@ -164,14 +164,15 @@ def viz_tiptop_run(
     rgb = Image.open(save_dir / "rgb.png")
     rr.log("cam/rgb", rr.Image(rgb), static=True)
 
-    # Mask out depth where gripper is present
+    # Mask out depth where the robot is: the gripper in a wrist-camera run, the whole arm in a
+    # third-person one (the file name predates that, see save_perception_outputs)
     depth = cv2.imread(str(perception_dir / "depth.png"), cv2.IMREAD_UNCHANGED)
-    gripper_mask_path = perception_dir / "gripper_mask.png"
-    if gripper_mask_path.exists():
-        gripper_mask = cv2.imread(str(perception_dir / "gripper_mask.png"), cv2.IMREAD_GRAYSCALE)
-        depth[gripper_mask == 255] = 0
+    robot_mask_path = perception_dir / "gripper_mask.png"
+    if robot_mask_path.exists():
+        robot_mask = cv2.imread(str(robot_mask_path), cv2.IMREAD_GRAYSCALE)
+        depth[robot_mask == 255] = 0
     else:
-        _log.warning("Gripper mask not found, using full depth")
+        _log.warning("Robot mask not found, using full depth")
     rr.log("cam/depth", rr.DepthImage(depth, meter=1000.0), static=True)
 
     # Bounding boxes and mask visualization

@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import Literal
 
 import numpy as np
 import rerun as rr
@@ -13,18 +14,44 @@ from cutamp.robots import (
 )
 
 from tiptop.config import load_calibration, tiptop_cfg
-from tiptop.perception.cameras import get_hand_camera
+from tiptop.perception.cameras import get_external_camera, get_hand_camera
 from tiptop.perception.utils import depth_to_xyz
 from tiptop.utils import get_robot_client, get_robot_rerun, patch_log_level, setup_logging
 
 _log = logging.getLogger(__name__)
 
 
-def viz_calibration(rr_spawn: bool = True, viz_freq: float = 5.0, max_time: float = 60.0):
+def _load_robot_container(tensor_args: TensorDeviceType):
+    """Load the cuTAMP robot container for the configured robot, for forward kinematics."""
+    robot_type = tiptop_cfg().robot.type
+    with patch_log_level("curobo", logging.ERROR):
+        if robot_type == "fr3_robotiq":
+            return load_fr3_robotiq_container(tensor_args)
+        elif robot_type == "fr3":
+            return load_fr3_franka_container(tensor_args)
+        elif robot_type == "panda":
+            return load_panda_container(tensor_args)
+        elif robot_type == "panda_robotiq":
+            return load_panda_robotiq_container(tensor_args)
+        elif robot_type == "ur5":
+            return load_ur5_container(tensor_args)
+        else:
+            raise ValueError(f"Unknown robot type: {robot_type}")
+
+
+def viz_calibration(
+    camera: Literal["hand", "external"] = "hand",
+    rr_spawn: bool = True,
+    viz_freq: float = 5.0,
+    max_time: float = 60.0,
+):
     """
-    Visualize hand camera calibration with robot in rerun.
+    Visualize camera calibration with robot in rerun: a correct calibration puts the point cloud on
+    the robot model.
 
     Args:
+        camera: Which camera to check. "hand" follows the wrist camera through forward kinematics;
+            "external" uses the third-person camera's static world_from_cam from calibration_info.
         rr_spawn: Spawn rerun viewer. You should only set to False if you're connecting to remote visualizer.
         viz_freq: Visualization loop frequency in Hz.
         max_time: Maximum visualization time in seconds before automatically stopping. Used to prevent the script from
@@ -36,25 +63,15 @@ def viz_calibration(rr_spawn: bool = True, viz_freq: float = 5.0, max_time: floa
     client = get_robot_client()
     robot_rr = get_robot_rerun()
 
-    # Setup wrist camera
-    cam = get_hand_camera(depth=True)
-    ee_from_cam = load_calibration(cam.serial)
-
-    cfg = tiptop_cfg()
     tensor_args = TensorDeviceType()
-    with patch_log_level("curobo", logging.ERROR):
-        if cfg.robot.type == "fr3_robotiq":
-            robot_container = load_fr3_robotiq_container(tensor_args)
-        elif cfg.robot.type == "fr3":
-            robot_container = load_fr3_franka_container(tensor_args)
-        elif cfg.robot.type == "panda":
-            robot_container = load_panda_container(tensor_args)
-        elif cfg.robot.type == "panda_robotiq":
-            robot_container = load_panda_robotiq_container(tensor_args)
-        elif cfg.robot.type == "ur5":
-            robot_container = load_ur5_container(tensor_args)
-        else:
-            raise ValueError(f"Unknown robot type: {cfg.robot.type}")
+    if camera == "hand":
+        cam = get_hand_camera(depth=True)
+        ee_from_cam = load_calibration(cam.serial)
+        robot_container = _load_robot_container(tensor_args)
+    else:
+        cam = get_external_camera(depth=True)
+        world_from_cam_static = load_calibration(cam.serial)
+    _log.info(f"Checking calibration of the {camera} camera (s/n {cam.serial})")
 
     start_time = time.perf_counter()
     sleep_time = 1.0 / viz_freq
@@ -74,9 +91,12 @@ def viz_calibration(rr_spawn: bool = True, viz_freq: float = 5.0, max_time: floa
             # Get joint positions, camera pose, and camera frame
             frame = cam.read_camera()
             q_curr = client.get_joint_positions()
-            q_curr_pt = tensor_args.to_device(q_curr)
-            world_from_ee = robot_container.kin_model.get_state(q_curr_pt).ee_pose.get_numpy_matrix()[0]
-            world_from_cam = world_from_ee @ ee_from_cam
+            if camera == "hand":
+                q_curr_pt = tensor_args.to_device(q_curr)
+                world_from_ee = robot_container.kin_model.get_state(q_curr_pt).ee_pose.get_numpy_matrix()[0]
+                world_from_cam = world_from_ee @ ee_from_cam
+            else:
+                world_from_cam = world_from_cam_static
 
             # Read camera frame
             rgb = frame.rgb

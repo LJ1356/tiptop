@@ -17,6 +17,13 @@ Use [`viz-gripper-cam`](command-reference.md#viz-gripper-cam) while arranging ob
 view of the hand camera. As TiPToP currently uses a single view of the workspace, anything outside of view cannot be
 perceived and manipulated.
 
+When a third-person camera does perception instead (`cameras.perception: external`), check its view with [
+`viz-scene`](command-reference.md#viz-scene) — with the arm parked at home, since that is where it sits during
+perception. The arm is in frame from such a view, and its own geometry is dropped from the point cloud
+automatically — the robot's cuRobo collision spheres are projected into the image, the way the painted gripper mask
+works for the wrist camera (`perception.robot_mask_margin_m` pads them). What that cannot recover is whatever the arm
+*hides*, so keep objects out of the band it occludes.
+
 ```{figure} _static/viz-gripper-cam.png
 :width: 85%
 :align: center

@@ -1,8 +1,9 @@
+import cv2
 import numpy as np
 import open3d as o3d
 import trimesh
 from curobo.geom.types import Cuboid, Mesh
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 
 def depth_to_xyz(
@@ -40,6 +41,53 @@ def depth_to_xyz(
     # Stack into (h, w, 3) array
     xyz = np.stack([x, y, z], axis=-1)
     return xyz
+
+
+def project_spheres_to_mask(
+    spheres: Float[np.ndarray, "n 4"],
+    world_from_cam: Float[np.ndarray, "4 4"],
+    K: Float[np.ndarray, "3 3"],
+    image_shape: tuple[int, int],
+    margin_m: float = 0.0,
+) -> Bool[np.ndarray, "h w"]:
+    """Mask of the image covered by world-frame spheres [x, y, z, r], e.g. a robot's collision spheres.
+
+    Each sphere is drawn as a filled circle, so the mask is a silhouette: it also covers whatever is
+    BEHIND a sphere, which is what makes it safe to drop from a point cloud (points behind the robot
+    are occluded anyway). Spheres with a non-positive radius are cuRobo's padding and are skipped, as
+    are spheres at or behind the image plane.
+
+    Args:
+        spheres: Sphere centers and radii in world coordinates, (n, 4).
+        world_from_cam: Camera pose in the world frame.
+        K: Camera intrinsics of the image being masked.
+        image_shape: (height, width) of that image.
+        margin_m: Radius padding in meters, to cover calibration and kinematics error.
+    """
+    height, width = image_shape
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    spheres = np.asarray(spheres, dtype=np.float64).reshape(-1, 4)
+    spheres = spheres[spheres[:, 3] > 0.0]
+    if len(spheres) == 0:
+        return mask.astype(bool)
+
+    cam_from_world = np.linalg.inv(world_from_cam)
+    centers = spheres[:, :3] @ cam_from_world[:3, :3].T + cam_from_world[:3, 3]
+    radii = spheres[:, 3] + margin_m
+
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    z = centers[:, 2]
+    in_front = z > 1e-3
+    u = centers[in_front, 0] * fx / z[in_front] + cx
+    v = centers[in_front, 1] * fy / z[in_front] + cy
+    # max(fx, fy) keeps the circle conservative on non-square pixels
+    r_px = radii[in_front] * max(fx, fy) / z[in_front]
+
+    for u_i, v_i, r_i in zip(u, v, r_px):
+        cv2.circle(mask, (int(round(u_i)), int(round(v_i))), max(1, int(np.ceil(r_i))), 255, thickness=-1)
+    return mask.astype(bool)
 
 
 def get_o3d_pcd(

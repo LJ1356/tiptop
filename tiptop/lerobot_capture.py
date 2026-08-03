@@ -360,6 +360,7 @@ def dump_raw_episode(
     config_id: str | None = None,
     record_start: float | None = None,
     record_stop: float | None = None,
+    trajectory_id: str | None = None,
 ) -> Path | None:
     """Write ``robot_state.npz`` + ``_meta.json`` (ARCHITECTURE.md §3) for one executed rollout.
 
@@ -375,9 +376,13 @@ def dump_raw_episode(
     state frame to a camera frame by wall clock (ARCHITECTURE.md "Camera <-> state alignment"); each
     is written as a float, or ``None`` when unavailable.
 
-    Returns the npz path, or None if the plan is too short, has no execution timeline, or the
-    measured joint trace is missing (in which case we REFUSE to fall back to plan positions -- that
-    silent fallback is the exact proprioception bug this rewrite fixes).
+    A plan that stopped early (a teleop hand-off) is dumped as the partial rollout it is: only the
+    executed prefix of the plan has wall times, and only that prefix is kept. ``trajectory_id`` ties
+    such a leg to the other legs of the same task attempt (see ``collect/merge_trajectory.py``).
+
+    Returns the npz path, or None if fewer than two rows executed or the measured joint trace is
+    missing (in which case we REFUSE to fall back to plan positions -- that silent fallback is the
+    exact proprioception bug this rewrite fixes).
     """
     save_dir = Path(save_dir)
     plan_path = Path(plan_path)
@@ -387,10 +392,26 @@ def dump_raw_episode(
 
     dense = _flatten_plan(_load_plan(plan_path), timeline=timeline)
     t_wall = dense["t_wall"]
+    # A teleop hand-off (and any other early stop) leaves the tail of the plan unexecuted. Those
+    # steps get no timeline entry, so _flatten_plan gives them NaN wall times -- and since
+    # execute_cutamp_plan appends one entry per step, in order, immediately before honouring
+    # should_stop, the executed rows are always a contiguous PREFIX. Keep that prefix and dump the
+    # partial rollout: it is a real leg of a hand-off trajectory, and dropping it threw away every
+    # state/action the human-in-the-loop run produced.
+    executed = int(np.count_nonzero(np.isfinite(t_wall)))
+    if executed and not np.all(np.isfinite(t_wall[:executed])):
+        _log.error("Execution timeline has non-finite wall times inside the executed prefix "
+                   "(%d finite of %d rows); refusing to guess where the rollout stopped. save_dir=%s",
+                   executed, len(t_wall), save_dir)
+        return None
+    if executed < len(t_wall):
+        _log.info("Partial rollout: keeping the %d executed rows of %d (the plan stopped early, "
+                  "e.g. a teleop hand-off)", executed, len(t_wall))
+        dense = {k: v[:executed] for k, v in dense.items()}
+        t_wall = dense["t_wall"]
     m = len(t_wall)
-    if m < 2 or not np.all(np.isfinite(t_wall)):
-        _log.warning("Plan has no usable execution timeline (%d rows, finite=%s); skipping raw episode dump",
-                     m, bool(m) and np.all(np.isfinite(t_wall)))
+    if m < 2:
+        _log.warning("Plan has no usable execution timeline (%d executed rows); skipping raw episode dump", m)
         return None
 
     # Uniform fps grid over the measured wall-clock span; the last frame clamps to t_wall[-1].
@@ -450,6 +471,11 @@ def dump_raw_episode(
         "cameras": cameras,
         "record_start": float(record_start) if record_start is not None else None,
         "record_stop": float(record_stop) if record_stop is not None else None,
+        # Hand-off lineage: every leg of one task attempt (tamp -> teleop -> tamp -> ...) shares a
+        # trajectory_id, and collect/merge_trajectory.py joins them into a single episode. None for
+        # a rollout that was never handed off.
+        "trajectory_id": trajectory_id,
+        "segment_source": "tamp",
     }
     (save_dir / "_meta.json").write_text(json.dumps(meta, indent=2))
     _log.info("Wrote raw episode (%d frames @ %d Hz, %.1fs) to %s", n, fps, t1 - t0, npz_path)

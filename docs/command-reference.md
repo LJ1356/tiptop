@@ -73,7 +73,7 @@ tiptop-run --output-dir my_results
 ```
 
 ```{warning}
-The robot will move to the capture position when the command starts. Ensure the workspace is clear and keep your hand on the e-stop.
+The robot will move when the command starts: home, then on to the capture position when the wrist camera does perception (`cameras.perception: hand`). Ensure the workspace is clear and keep your hand on the e-stop.
 ```
 
 **What to expect:**
@@ -286,24 +286,25 @@ Camera must be plugged in for all commands in this section.
 
 ### viz-calibration
 
-Visualizes the wrist camera calibration with the robot in Rerun. This shows real-time robot state, camera pose, RGB images, depth maps, and projected point clouds in the world frame. Use this to verify that camera-to-gripper transformation is accurate.
+Visualizes a camera's calibration with the robot in Rerun. This shows real-time robot state, camera pose, RGB images, depth maps, and projected point clouds in the world frame. Use this to verify that the camera's extrinsics are accurate: the wrist camera's camera-to-gripper transform, or a third-person camera's static world-from-camera transform.
 
 **Prerequisites:**
 
 - Bamboo controller must be running
-- Camera must be calibrated (run `calibrate-wrist-cam` first)
+- Camera must be calibrated (`calibrate-wrist-cam` for the wrist camera; for a third-person camera, DROID's calibration GUI, whose result is copied into `calibration_info.json` under the bare serial)
 
 **What it shows:**
 
 - Robot visualization with live joint positions
 - Camera coordinate frame (axes near camera mount)
-- RGB image from wrist camera
+- RGB image from the selected camera
 - Depth map
 - 3D point cloud in world coordinates
 - Gripper coordinate frame
 
 **Available flags:**
 
+- `--camera STR` - Which camera to check: `hand` (pose tracked through forward kinematics) or `external` (static pose from calibration) (default: `hand`)
 - `--rr-spawn / --no-rr-spawn` - Spawn Rerun viewer; set to False if connecting to remote visualizer (default: True)
 - `--viz-freq FLOAT` - Visualization loop frequency in Hz (default: 5.0)
 - `--max-time FLOAT` - Maximum visualization time in seconds before auto-stopping (default: 60.0)
@@ -312,6 +313,9 @@ Visualizes the wrist camera calibration with the robot in Rerun. This shows real
 
 ```bash
 viz-calibration
+
+# Check the third-person camera's extrinsics instead
+viz-calibration --camera external
 
 # Run for shorter duration at lower frequency
 viz-calibration --max-time 10.0 --viz-freq 1.0
@@ -322,7 +326,8 @@ This command logs a lot of data to Rerun. Don't run it for extended periods - us
 ```
 
 A Rerun window will open automatically. Check that:
-- Camera frame aligns with the gripper frame
+- Camera frame aligns with the gripper frame (`--camera hand`), or with the camera's physical mount (`--camera external`)
+- The point cloud lands on the robot model — the table surface at the right height, the arm where the robot visualization is
 - Point cloud geometry looks correct and is in proper scale
 - Camera frustum visualization makes sense relative to robot geometry
 

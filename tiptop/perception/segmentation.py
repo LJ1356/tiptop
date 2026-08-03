@@ -40,7 +40,7 @@ def aabb_to_cuboid(aabb: np.ndarray, name: str) -> trimesh.primitives.Box:
     return box
 
 
-def _object_contact_points(xyz_world: np.ndarray, masks: np.ndarray) -> np.ndarray:
+def _object_contact_points(xyz_world: np.ndarray, masks: np.ndarray, valid_mask: np.ndarray = None) -> np.ndarray:
     """Estimate the 3D contact point of each object with the surface it rests on.
 
     For each object mask, takes the bottom 10th-percentile z points and returns their centroid.
@@ -49,6 +49,9 @@ def _object_contact_points(xyz_world: np.ndarray, masks: np.ndarray) -> np.ndarr
     Args:
         xyz_world: (H, W, 3) structured point cloud in world frame.
         masks: (N, 1, H, W) segmentation masks from SAM.
+        valid_mask: Optional (H, W) boolean mask of usable points. Without it only NaNs are
+            excluded, and a masked-out point (the robot, invalid depth) would pull the contact
+            point away from the object -- the bottom percentile is exactly where such points sit.
 
     Returns:
         (M, 3) array of contact points, one per object with enough valid points (M <= N).
@@ -57,7 +60,7 @@ def _object_contact_points(xyz_world: np.ndarray, masks: np.ndarray) -> np.ndarr
     contacts = []
     for mask in masks_2d:
         obj_xyz = xyz_world[mask]
-        valid = ~np.isnan(obj_xyz).any(axis=1)
+        valid = valid_mask[mask] if valid_mask is not None else ~np.isnan(obj_xyz).any(axis=1)
         if valid.sum() < 10:
             continue
         obj_xyz = obj_xyz[valid]
@@ -97,7 +100,7 @@ def segment_table_with_ransac(
         raise ValueError(f"Expected structured (H, W, 3) point cloud, got shape {xyz_world.shape}")
 
     # Estimate where each object contacts its supporting surface
-    contact_pts = _object_contact_points(xyz_world, masks)
+    contact_pts = _object_contact_points(xyz_world, masks, valid_mask=valid_mask)
     if len(contact_pts) == 0:
         raise RuntimeError("No object contact points found — ensure objects are detected before calling this function.")
     _log.debug(f"Object contact points (world frame):\n{contact_pts}")
@@ -234,6 +237,7 @@ def segment_pointcloud_by_masks(
     max_z: float,
     return_pcd: bool = False,
     erode_pixels: int = 0,
+    valid_mask: np.ndarray = None,
 ) -> dict[str, trimesh.Trimesh] | tuple[dict[str, trimesh.Trimesh], dict]:
     """Segment pointcloud using object masks.
 
@@ -245,6 +249,8 @@ def segment_pointcloud_by_masks(
         max_z: Maximum z value for filtering points
         return_pcd: Whether to return point clouds in addition to meshes
         erode_pixels: Number of pixels to erode the mask by to handle depth edge noise. Default is 0 (no erosion).
+        valid_mask: Optional (H, W) boolean mask of usable points, e.g. excluding the robot's own
+            geometry and invalid depth. Only NaNs are excluded without it.
 
     Returns:
         Dictionary mapping object labels to trimesh.Trimesh objects
@@ -352,7 +358,7 @@ def segment_pointcloud_by_masks(
         rgb_obj = rgb[mask_2d]
 
         # Filter out invalid points
-        valid = ~np.isnan(xyz_obj).any(axis=1)
+        valid = valid_mask[mask_2d] if valid_mask is not None else ~np.isnan(xyz_obj).any(axis=1)
         xyz_obj = xyz_obj[valid]
         rgb_obj = rgb_obj[valid]
 
@@ -362,7 +368,7 @@ def segment_pointcloud_by_masks(
             )
             xyz_obj = xyz_world[original_mask]
             rgb_obj = rgb[original_mask]
-            valid = ~np.isnan(xyz_obj).any(axis=1)
+            valid = valid_mask[original_mask] if valid_mask is not None else ~np.isnan(xyz_obj).any(axis=1)
             xyz_obj = xyz_obj[valid]
             rgb_obj = rgb_obj[valid]
 

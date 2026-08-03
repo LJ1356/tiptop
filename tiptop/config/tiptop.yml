@@ -27,14 +27,25 @@ cameras:
   # TIPTOP_HAND_CAMERA_ID / TIPTOP_EXTERNAL_CAMERA_ID / TIPTOP_EXTERNAL_2_CAMERA_ID instead of
   # editing this file; droid reads the same variables (droid/droid/misc/parameters.py). Any serial
   # you point at needs its own entry in calibration_info.json — extrinsics are keyed by serial.
-  # Hand (wrist) camera — used for perception
+  #
+  # Which camera the perception pipeline (depth -> point cloud -> detection/grasps) reads:
+  #   hand      wrist camera. Its pose is only known through the arm, so world_from_cam is
+  #             recomputed by forward kinematics at every capture and the arm first drives to
+  #             q_capture to aim it at the scene. The gripper is masked out of the point cloud.
+  #   external  third-person camera. Its pose is static, read straight out of calibration_info
+  #             as world_from_cam, so the arm is left at q_home instead of driving into the shot
+  #             (an arm in frame lands in the point cloud, the RANSAC table fit and the grasps).
+  #             q_home must be clear of this camera's view.
+  # Either way the hand and external cameras are both opened and recorded as usual.
+  perception: external
   hand:
     serial: "${oc.env:TIPTOP_HAND_CAMERA_ID,14846828}"
     type: zed
     resolution: HD720
     fps: 15
 
-  # External (side) camera — optional, for recording / viz only
+  # External (side/third-person) camera — recorded, and the perception camera when
+  # cameras.perception is "external"
   external:
     serial: "${oc.env:TIPTOP_EXTERNAL_CAMERA_ID,32439448}"
     type: zed
@@ -64,6 +75,12 @@ perception:
 
   sam:
     mode: "local"
+
+  # Padding added to each of the robot's cuRobo collision spheres before they are projected into a
+  # third-person view and dropped from the point cloud (see project_spheres_to_mask). Covers
+  # extrinsics and kinematics error; raise it if a rim of arm survives in the cloud. Unused when the
+  # wrist camera does perception -- that view uses the painted gripper mask.
+  robot_mask_margin_m: 0.02
 
   depth_trunc_m: 5.0
   voxel_downsample_size: 0.0075
