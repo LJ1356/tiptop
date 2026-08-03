@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import sys
+import time
 from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
@@ -115,6 +117,138 @@ def new_robot_client() -> RobotClient:
         return UR5Client(cfg.robot.host)
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
+
+
+def _clear_robot_client_cache() -> None:
+    """Drop the cached RobotClient(s) so the next get_robot_client() builds a fresh connection."""
+    get_bamboo_client.cache_clear()
+    try:
+        from tiptop.ur5.ur5_client import get_ur5_client
+
+        get_ur5_client.cache_clear()
+    except ImportError:
+        pass
+
+
+def release_robot_client(client: RobotClient) -> None:
+    """Best-effort graceful release of a RobotClient's connection (ZMQ sockets etc.), e.g. before
+    handing the physical robot off to a different controller such as DROID's StableRobotEnv for a
+    teleop interlude. See data-collection/ARCHITECTURE.md: bamboo shim and DROID's RobotEnv both
+    talk to the same NUC-side polymetis server and cannot hold it at the same time.
+
+    Tries the common close/disconnect method names; a client exposing none of them just gets GC'd
+    once every reference is dropped, which is not guaranteed to happen immediately.
+
+    The cache is dropped either way, so a get_robot_client() call during the hand-off window builds a
+    new connection instead of handing back the closed one we just released.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        for name in ("close", "disconnect", "shutdown"):
+            fn = getattr(client, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    log.info(f"Released {type(client).__name__} via .{name}()")
+                except Exception:
+                    log.exception(f"{type(client).__name__}.{name}() raised while releasing")
+                return
+        log.warning(
+            f"{type(client).__name__} exposes no close/disconnect/shutdown method; relying on GC to "
+            "drop its connection. If a subsequent controller (e.g. teleop) fails to take over the arm, "
+            "this is the first place to look."
+        )
+    finally:
+        _clear_robot_client_cache()
+
+
+def wait_for_robot_stationary(
+    *,
+    velocity_threshold: float = 0.02,  # rad/s, per joint
+    settle_seconds: float = 0.4,  # must stay below the threshold this long, continuously
+    timeout_seconds: float = 15.0,
+    poll_hz: float = 30.0,
+) -> bool:
+    """Block until the measured joint velocities confirm the arm has actually stopped, or give up.
+
+    Closes a real timing gap in the teleop hand-off: release_robot_client() dropping tiptop's own
+    connection does NOT mean the arm has stopped -- the shim is still finishing whatever trajectory
+    segment it was mid-way through (terminate_current_policy() handing control back to polymetis's
+    default hold controller happens some milliseconds to ~1s later, depending on how much of the
+    segment was left). Telling the operator "safe to go stop the shim now" before that has actually
+    happened risks killing the shim out from under an arm that is still moving.
+
+    Uses its own short-lived ZMQ REQ connection to the shim's STATE port -- same wire protocol as
+    lerobot_capture.JointSampler (msgpack ``{"command": "get_robot_state"}`` -> ``{"success",
+    "data": {"q", "dq"}}``), deliberately NOT BambooFrankaClient, so this keeps working even after
+    that connection has already been torn down (or never existed, e.g. a UR5 robot).
+
+    Returns True once every joint's |velocity| has stayed under `velocity_threshold` for
+    `settle_seconds` straight. Returns False on timeout -- meaning "could not confirm": either the
+    state port itself is unreachable, or the arm is genuinely still moving. The caller must treat
+    False as a loud warning, never as "probably fine".
+    """
+    import msgpack
+    import zmq
+
+    log = logging.getLogger(__name__)
+    host = tiptop_cfg().robot.host
+    port = int(os.environ.get("TIPTOP_STATE_PORT", 5557))
+
+    ctx = zmq.Context()
+    sock: "zmq.Socket | None" = None
+
+    def _connect() -> None:
+        nonlocal sock
+        if sock is not None:
+            sock.close(linger=0)
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, 300)  # ms; a timed-out REQ socket is unusable, so we reconnect
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(f"tcp://{host}:{port}")
+
+    _connect()
+    req = msgpack.packb({"command": "get_robot_state"})
+    deadline = time.monotonic() + timeout_seconds
+    stationary_since: float | None = None
+    try:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            dq = None
+            try:
+                sock.send(req)
+                reply = msgpack.unpackb(sock.recv(), raw=False)
+                data = reply.get("data") if isinstance(reply, dict) and reply.get("success") else None
+                if data:
+                    dq = np.asarray(data.get("dq", []), dtype=np.float32).reshape(-1)
+            except zmq.Again:
+                log.warning(f"wait_for_robot_stationary: state port tcp://{host}:{port} timed out; reconnecting")
+                _connect()
+            except Exception:
+                log.exception("wait_for_robot_stationary: state port read failed; reconnecting")
+                _connect()
+
+            if dq is not None and dq.shape == (7,) and float(np.max(np.abs(dq))) < velocity_threshold:
+                if stationary_since is None:
+                    stationary_since = now
+                elif now - stationary_since >= settle_seconds:
+                    return True
+            else:
+                stationary_since = None  # no reading, or still moving: restart the settle window
+
+            time.sleep(max(0.0, 1.0 / poll_hz))
+        return False
+    finally:
+        if sock is not None:
+            sock.close(linger=0)
+        ctx.term()
+
+
+def reconnect_robot_client() -> RobotClient:
+    """Drop any cached RobotClient and build a fresh one. Use after release_robot_client() to hand
+    the robot back from another controller (e.g. after a teleop interlude)."""
+    _clear_robot_client_cache()
+    return get_robot_client()
 
 
 def get_robot_rerun(robot_type: str | None = None) -> RerunRobot:
