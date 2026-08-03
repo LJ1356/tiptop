@@ -143,9 +143,10 @@ def _clear_preempt() -> None:
     _preempting = False
 
 
-# Set by the "switch to teleop" trigger (SIGUSR1) so the KeyboardInterrupt handler in the rollout
-# loop knows to run the teleop hand-off (release the robot, wait for the human to hand it back, then
-# auto-replan the same task) instead of just landing at the task prompt like a plain preempt.
+# Set by the "switch to teleop" trigger (SIGUSR1). Unlike a preempt this is COOPERATIVE: nothing is
+# aborted. The flag is polled at the safe boundaries of a rollout (between plan steps, and again
+# before execution starts) and the hand-off runs there, so the arm is left at the end of a plan step
+# rather than mid-task. Cleared by whoever runs the hand-off.
 _teleop_requested = False
 
 # Set by _run_teleop_handoff once teleop hands the robot back; consumed by the NEXT call to
@@ -153,25 +154,151 @@ _teleop_requested = False
 # hand-off pose instead of blocking on a typed task.
 _pending_instruction: str | None = None
 
+# Set alongside _pending_instruction: the next rollout must NOT run its usual return-home + open-
+# gripper reset. Homing would undo the hand-off (the whole point is to replan from where the human
+# left the arm) and opening the gripper would drop whatever the operator is holding.
+_skip_episode_reset = False
+
+# True only while the driver is blocked in input() at a stdin prompt. There, no rollout checkpoint
+# will ever be reached, so SIGUSR1 has to raise out of the prompt instead of setting a flag; see
+# _sigusr1_teleop_switch. Each prompt site clears it as its first statement after input() returns,
+# keeping the window where a raise could land in unrelated bookkeeping down to a few bytecodes.
+_at_prompt = False
+
+
+class TeleopHandoffRequested(Exception):
+    """SIGUSR1 arrived while the driver sat at a stdin prompt: hand the arm off from there."""
+
 
 def _sigusr1_teleop_switch(_signum, _frame) -> None:
     """"Switch to teleop" trigger (SIGUSR1) from the data-collection UI's button.
 
-    Identical unwind to Ctrl-C/Preempt (see _sigint_preempt): the in-flight motion segment finishes
-    (bamboo has no abort), no further plan steps are sent, and the loop lands back at the task
-    prompt. The only difference is _teleop_requested, which routes the KeyboardInterrupt handler into
-    _run_teleop_handoff instead of just waiting for a new typed task.
+    Deliberately NOT a preempt: it does not abort anything. The current plan step runs to completion
+    (execute_cutamp_plan polls _teleop_requested between steps), this rollout's partial episode is
+    saved unlabeled, and only then does the hand-off run -- so the arm ends up parked at a plan
+    boundary instead of wherever an abort happened to catch it.
+
+    At a stdin prompt there is no such checkpoint to reach, so raise out of input() instead.
     """
     global _teleop_requested
     _teleop_requested = True
-    _sigint_preempt(_signum, _frame)
+    _emit_event({"event": "teleop_switch_pending"})
+    if _at_prompt:
+        raise TeleopHandoffRequested
+
+
+def _consume_teleop_request() -> bool:
+    """True (once) if a teleop hand-off has been requested; clears the flag so it can be re-armed."""
+    global _teleop_requested
+    if not _teleop_requested:
+        return False
+    _teleop_requested = False
+    return True
+
+
+# Margin between releasing a ZED and telling another process it may open it. ZedCamera.close()
+# already blocks for the SDK's teardown (~14s for two cameras, measured) and the device is claimable
+# about a second later, so this is slack rather than a readiness check.
+CAMERA_RELEASE_SETTLE_S = 2.0
+
+
+def _release_cameras(container: "_DemoContainer") -> list[str]:
+    """Close every ZED this process holds so the teleop driver can open them. Returns their serials.
+
+    A ZED is exclusive to one process: DROID's StableRobotEnv opens the same serials we do (it
+    discovers them from the SDK's device list), so it cannot start while our handles are alive.
+    Releasing only the robot connection is not enough.
+
+    Closing our handles is only half of it: the forked save workers hold the same devices, so the
+    caller must also _shutdown_save_pool() before anything else can open them.
+    """
+    serials: list[str] = []
+    for attr in ("cam", "external_cam", "external_cam_2"):
+        cam = getattr(container, attr, None)
+        if cam is None:
+            continue
+        serial = str(getattr(cam, "serial", "") or "")
+        try:
+            cam.close()
+            _log.info(f"Released camera {attr} (s/n {serial or '?'}) for teleop")
+            if serial:
+                serials.append(serial)
+        except Exception:
+            _log.exception(f"Failed to close camera {attr}; teleop may not be able to open it")
+        object.__setattr__(container, attr, None)
+    return serials
+
+
+def _shutdown_save_pool() -> None:
+    """Reap the save workers so they release the camera fds they inherited from us.
+
+    The pool is forked AFTER the cameras and CUDA are up (see _sync_entrypoint, which explains why
+    that ordering is deliberate), so every worker inherits the parent's CUDA context -- and, with
+    it, the parent's open /dev/video handles. Closing our own ZedCamera objects therefore does NOT
+    free the devices: four workers still hold them, the SDK reports the cameras as serial 0 /
+    NOT AVAILABLE, and the teleop driver's open fails with CAMERA NOT DETECTED. Killing the workers
+    is what actually hands the cameras over; _restart_save_pool re-forks them afterwards.
+
+    Deliberately does not block on a save in flight: the operator is waiting for the arm, and the
+    worst case is losing one rollout's perception debug images, never episode data.
+    """
+    global _executor_pool
+    if _executor_pool is None:
+        return
+    _log.info("Stopping the save workers: they hold the cameras until they exit")
+    # shutdown() drops the executor's handles on its workers, so grab them first. The budget is
+    # shared across all of them, not per worker.
+    workers = list((getattr(_executor_pool, "_processes", None) or {}).values())
+    _executor_pool.shutdown(wait=False)
+    _executor_pool = None
+    deadline = time.monotonic() + 5.0
+    for proc in workers:
+        proc.join(timeout=max(0.0, deadline - time.monotonic()))
+        if proc.is_alive():
+            _log.warning(f"Save worker {proc.pid} still holding the cameras after shutdown; terminating")
+            proc.terminate()
+            proc.join(timeout=2.0)
+
+
+def _restart_save_pool() -> None:
+    """Re-fork the save pool once we have the cameras and the robot back.
+
+    Same invariant as _sync_entrypoint: fork from a process whose CUDA context and cameras are
+    already up, so the workers share the parent's context instead of each building their own. They
+    inherit the new camera handles too -- which is exactly why the next hand-off reaps them again.
+    """
+    global _executor_pool
+    if _executor_pool is None:
+        _executor_pool = ProcessPoolExecutor(max_workers=4, initializer=_init_pool_worker)
+
+
+def _reacquire_cameras(container: "_DemoContainer", *, had_external_cam_2: bool) -> None:
+    """Re-open the cameras released by _release_cameras, once teleop has handed them back.
+
+    container.depth_estimator is left alone on purpose: get_depth_estimator closes over the
+    intrinsics VALUE, not the camera object, and the same serial at the same resolution reports the
+    same intrinsics, so it stays valid across the swap.
+    """
+    _log.info("Re-opening the cameras teleop was using")
+    object.__setattr__(container, "cam", get_hand_camera())
+    object.__setattr__(container, "external_cam", get_external_camera())
+    # get_external_camera_2 returns None both when it isn't configured and when it fails to open, so
+    # a camera that was recording before the hand-off and is None now would otherwise just vanish
+    # from the next episode's videos.
+    external_cam_2 = get_external_camera_2()
+    if external_cam_2 is None and had_external_cam_2:
+        _log.warning(
+            "The second external camera did not come back after the teleop hand-off; the next "
+            "rollouts will record without it"
+        )
+    object.__setattr__(container, "external_cam_2", external_cam_2)
 
 
 def _run_teleop_handoff(container: "_DemoContainer") -> None:
     """Hand the physical arm off to a human teleop session, then block until it's handed back.
 
-    Called from the rollout loop's KeyboardInterrupt handler once the in-flight rollout has already
-    unwound. From here:
+    Called at a rollout checkpoint (see _sigusr1_teleop_switch), so the current plan step has already
+    finished and this rollout's partial episode is already on disk. From here:
       1. release this process's RobotClient connection so a separate teleop process (DROID's
          StableRobotEnv) can take over the arm -- they talk to the same NUC-side polymetis server and
          cannot hold it at once (see data-collection/ARCHITECTURE.md).
@@ -180,14 +307,18 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
          done: it still has to finish the in-flight trajectory segment and hand control back to
          polymetis's default hold controller, which takes real time. Skipping this check would let
          an operator kill the shim (or start teleop) while the arm is still moving.
-      3. emit "awaiting_teleop_resume" so the data-collection server knows it's safe to start the
-         teleop session, and waits for a "resume" command back once that session ends.
-      4. block on stdin for "resume"
-      5. reconnect the RobotClient and queue the SAME task instruction so the next loop iteration
-         re-runs perception + cuTAMP planning + execution from wherever the human left the arm.
+      3. release the ZED cameras too (_release_cameras) -- teleop opens the same serials. This runs
+         AFTER the stationary check so a "could not confirm the arm stopped" warning reaches the
+         operator immediately, rather than behind several seconds of camera teardown.
+      4. emit "awaiting_teleop_resume" so the data-collection server knows it's safe to start the
+         teleop session, then block on stdin for "resume" (written once the operator hands control
+         back and the teleop process has exited, releasing the arm and the cameras).
+      5. re-open the cameras, reconnect the RobotClient, and queue the SAME task instruction with
+         _skip_episode_reset so the next loop iteration replans from the hand-off pose without
+         moving the arm first -- no return to home, no gripper open, no move to the capture pose.
     """
-    global _pending_instruction
-    _log.info("Teleop switch requested: releasing the robot connection for hand-off")
+    global _pending_instruction, _skip_episode_reset
+    _log.info("Teleop switch: releasing the robot connection for hand-off")
     _emit_event({"event": "teleop_handoff_start"})
     release_robot_client(container.robot)
 
@@ -209,10 +340,20 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
             }
         )
 
+    had_external_cam_2 = container.external_cam_2 is not None
+    released_any = _release_cameras(container)
+    # Our own handles are only half of it -- the forked save workers hold the same devices.
+    _shutdown_save_pool()
+    if released_any:
+        # close() blocks until the SDK has torn the camera down; with our handles gone AND the
+        # save workers reaped, another process can claim the device about a second later
+        # (measured). Leave a little slack and let the opener, which retries, confirm the rest.
+        time.sleep(CAMERA_RELEASE_SETTLE_S)
+
     _emit_event({"event": "awaiting_teleop_resume"})
     _log.info(
-        "Robot connection released; waiting for 'resume' on stdin (sent once the teleop session "
-        "has ended and released the arm) before reconnecting and replanning the same task..."
+        "Robot and cameras released; waiting for 'resume' on stdin (sent once the operator hands "
+        "control back and the teleop process has exited) before reconnecting and replanning..."
     )
     try:
         while True:
@@ -230,12 +371,22 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
     except EOFError:
         raise UserExitException("EOF while awaiting teleop resume")
 
-    _log.info("Resuming: reconnecting to the robot")
+    _log.info("Resuming: taking the robot and cameras back")
+    # Any switch-to-teleop pressed WHILE we were handed off is already satisfied by this hand-off;
+    # leaving it armed would bounce the resumed rollout straight back out at its first step.
+    _consume_teleop_request()
+    # Same slack in the other direction: teleop's capture processes have just died (possibly by
+    # SIGKILL, without closing their cameras, so the SDK teardown never ran). ZedCamera retries on
+    # its own, but each retry costs a USB reboot -- a moment here is cheaper than a failed attempt.
+    time.sleep(CAMERA_RELEASE_SETTLE_S)
+    _reacquire_cameras(container, had_external_cam_2=had_external_cam_2)
     object.__setattr__(container, "robot", reconnect_robot_client())
+    _restart_save_pool()
     _emit_event({"event": "teleop_handoff_done"})
 
     if _LAST_TASK:
         _pending_instruction = _LAST_TASK
+        _skip_episode_reset = True
 
 
 class UserExitException(Exception):
@@ -405,17 +556,20 @@ async def check_server_health(session: aiohttp.ClientSession):
 def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
     """Prompt user to label rollout as success/failure, moving it out of eval/ to
     <success|failure>/<timestamp>/. Loops on invalid input. Returns the final rollout
-    directory (or the unchanged eval dir if skipped) so it can be post-processed."""
+    directory (or the unchanged eval dir if skipped) so it can be post-processed.
+
+    A "switch to teleop" (SIGUSR1) landing here raises TeleopHandoffRequested out of the prompt (see
+    _at_prompt) -- the rollout stays unlabeled in eval/ and the caller hands the arm off."""
+    global _at_prompt
     _emit_event({"event": "awaiting_label", "dir": str(save_dir)})
     try:
         while True:
-            user_input = (
-                input(
-                    "\nWas the execution successful? Enter 'y' for success, 'n' for failure, or leave empty to skip: "
-                )
-                .strip()
-                .lower()
+            _at_prompt = True
+            user_input = input(
+                "\nWas the execution successful? Enter 'y' for success, 'n' for failure, or leave empty to skip: "
             )
+            _at_prompt = False
+            user_input = user_input.strip().lower()
             if user_input in ("y", "n"):
                 cls = "success" if user_input == "y" else "failure"
                 dest = Path(output_dir) / cls / timestamp
@@ -432,6 +586,8 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
     except EOFError:
         _log.info("No input received, keeping rollout in eval directory")
         return save_dir
+    finally:
+        _at_prompt = False
 
 
 _LAST_TASK: str | None = None
@@ -505,12 +661,24 @@ def _get_task_instruction() -> str:
     # Interactive: keep reusing the warm container for back-to-back rollouts.
     suffix = f" [{_LAST_TASK}]" if _LAST_TASK else ""
     _emit_event({"event": "awaiting_task"})
+    global _at_prompt
     try:
-        raw = input(f"\nNext task (Enter = repeat{suffix}, 'home'/'open' to nudge the robot, 'q' to quit): ").strip()
+        _at_prompt = True
+        raw = input(f"\nNext task (Enter = repeat{suffix}, 'home'/'open' to nudge the robot, 'q' to quit): ")
+        _at_prompt = False
+        raw = raw.strip()
     except EOFError:
         raise UserExitException('EOF; ending session')
+    finally:
+        _at_prompt = False
     if raw.lower() in ('q', 'exit', 'quit'):
         raise UserExitException('user quit')
+    if raw.lower() == 'resume':
+        # A hand-off resume that arrived late (e.g. the server wrote it while we were already back at
+        # the prompt, because the hand-off never armed). Planning a task called "resume" would be
+        # nonsense, so re-prompt instead.
+        _log.warning("Ignoring a 'resume' line at the task prompt: no teleop hand-off is in progress")
+        return _get_task_instruction()
     if raw.lower() in ROBOT_COMMANDS:
         return raw.lower()  # a robot nudge, not a task -- leave _LAST_TASK alone
     if not raw:
@@ -925,6 +1093,15 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 _log.debug("Preparing TiPToP for next run...")
                 await check_server_health(session)
 
+                # A teleop switch that was armed somewhere without a checkpoint -- during labeling,
+                # post-processing, warmup -- would otherwise sit until the NEXT rollout's first plan
+                # step, letting the arm home, re-perceive and execute before handing over. Catch it
+                # here, where nothing is in flight, so the hand-off happens when it was asked for.
+                if _consume_teleop_request():
+                    _log.info("Teleop switch requested between rollouts: handing the arm over now")
+                    _run_teleop_handoff(container)
+                    continue
+
                 # Get the task BEFORE any pre-trial robot motion so that quitting (or an empty
                 # prompt) ends the session without moving to capture + opening the gripper --
                 # which would drop whatever is currently held. Reuses the warmed container.
@@ -942,15 +1119,44 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # gripper open is skipped when the measured width already reads open. This
                 # matters most right after a force-stop abort, where the arm may be left
                 # mid-motion still gripping an object.
-                _log.info("Resetting robot for new episode: return home + open gripper (if not already)")
-                go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
-                try:
-                    _open_gripper_if_needed(container)
-                except Exception as _e:
-                    _log.exception('Gripper open/check failed: ' + str(_e))
+                #
+                # Skipped entirely when resuming from a teleop hand-off: this run is a CONTINUATION
+                # of the same task from wherever the operator left the arm, so homing would throw
+                # that away and opening the gripper would drop whatever they are holding.
+                global _skip_episode_reset
+                resuming_from_handoff = _skip_episode_reset
+                _skip_episode_reset = False
+                if resuming_from_handoff:
+                    # The move to the capture pose is skipped too, so the arm does not move AT ALL
+                    # before replanning. capture_live_observation derives world_from_cam from FK, so
+                    # the geometry is right from any pose -- what q_capture buys is a guaranteed view
+                    # of the whole table. From a hand-off pose the wrist camera sees only what it
+                    # happens to point at, so perception can come back partial (or fail outright, in
+                    # which case the rollout is abandoned and the session drops back to the prompt).
+                    _log.info(
+                        "Resuming after a teleop hand-off: not moving the arm at all -- no return "
+                        "home, no gripper open, no move to the capture pose. Perception and planning "
+                        "run from exactly where the operator left it"
+                    )
+                else:
+                    _log.info("Resetting robot for new episode: return home + open gripper (if not already)")
+                    go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                    try:
+                        _open_gripper_if_needed(container)
+                    except Exception as _e:
+                        _log.exception('Gripper open/check failed: ' + str(_e))
 
-                _log.debug("Moving robot to capture joint positions")
-                go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                    # Perception reads the WRIST camera, so the arm goes to q_capture to point it at
+                    # the scene.
+                    _log.debug("Moving robot to capture joint positions")
+                    go_to_capture(
+                        time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen
+                    )
+
+                # Set once a "switch to teleop" has been observed at one of this rollout's
+                # checkpoints (see _sigusr1_teleop_switch); drives the hand-off after the rollout
+                # has closed itself out.
+                handoff_pending = False
 
                 now = datetime.now()
                 timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1023,7 +1229,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             )
                             _log.info(f"Saved TiPToP plan to {plan_path}")
 
-                        if cutamp_plan is not None and execute_plan:
+                        # A "switch to teleop" that arrived during perception/planning: hand over
+                        # here rather than starting a plan we are about to interrupt anyway. The
+                        # arm is still parked at the capture pose, so there is nothing to finish.
+                        if _consume_teleop_request():
+                            _log.info("Teleop switch requested during perception/planning: not starting this plan")
+                            handoff_pending = True
+
+                        if cutamp_plan is not None and execute_plan and not handoff_pending:
                             _log.info("Executing plan...")
                             # Execute with optional recording
                             if container.enable_recording:
@@ -1061,8 +1274,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     JointSampler() as joint_sampler,
                                 ):
                                     with record_cameras(cameras_to_record) as rec_window:
-                                        execute_cutamp_plan(
-                                            cutamp_plan, client=container.robot, timeline=exec_timeline
+                                        # _consume_teleop_request as should_stop: the plan stops at
+                                        # the first step boundary after the button is pressed, and
+                                        # the recording below closes out around whatever ran.
+                                        handoff_pending = execute_cutamp_plan(
+                                            cutamp_plan,
+                                            client=container.robot,
+                                            timeline=exec_timeline,
+                                            should_stop=_consume_teleop_request,
                                         )
                                 # Save the raw measured gripper trace (wall_seconds, width_m) so the
                                 # open<->close shape can be inspected directly (snap vs ramp).
@@ -1101,8 +1320,13 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     _log.exception("Failed to dump raw episode")
                                 _emit_event({"event": "rollout_saved", "dir": str(save_dir), "n_frames": n_frames})
                             else:
-                                execute_cutamp_plan(cutamp_plan, client=container.robot)
-                            _log.info("Finished executing plan!")
+                                handoff_pending = execute_cutamp_plan(
+                                    cutamp_plan, client=container.robot, should_stop=_consume_teleop_request
+                                )
+                            _log.info(
+                                "Stopped the plan for a teleop hand-off" if handoff_pending
+                                else "Finished executing plan!"
+                            )
                         elif cutamp_plan is not None:
                             _log.info("Skipping cuTAMP plan execution on real robot")
                         else:
@@ -1126,7 +1350,13 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         )
                         _log.info(f"Logs, results, and visualizations saved to {save_dir}")
 
-                    if execute_plan:
+                    if execute_plan and handoff_pending:
+                        # Hand-off: the episode is already written (unlabeled, in eval/) but the
+                        # plan is only part-executed, so there is nothing to rate yet -- and the
+                        # label prompt would block the hand-off the operator is waiting on. Post-
+                        # processing is skipped for the same reason: this is not a finished rollout.
+                        _log.info(f"Teleop hand-off: leaving the partial rollout unlabeled in {save_dir}")
+                    elif execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp)
                         # Post-process this rollout (gifs + LeRobot export) in the background so
                         # the next rollout can start immediately instead of blocking on it.
@@ -1136,12 +1366,21 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # standalone "did the grasp work?" tests. For cortex we WANT
                         # to keep the object held so Haiku can decide whether to Place
                         # next. Removing the open_gripper() call here.
+                except TeleopHandoffRequested:
+                    raise  # a hand-off from the label prompt, not a failure
                 except Exception:
                     _log.exception("TiPToP run failed")
                     raise
                 finally:
                     # Always remove the file handler after the run
                     remove_file_handler(file_handler)
+
+                # Outside the rollout's try/finally: everything this rollout owned (recording,
+                # log handler) is closed, so the arm can be handed to the operator. Blocks until
+                # they hand it back, then loops round and replans the same task from there.
+                if handoff_pending:
+                    _run_teleop_handoff(container)
+                    continue
             except UserExitException:
                 _log.info("User requested exit")
                 break
@@ -1165,10 +1404,19 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # Unwind is done (the finally-blocks above ran as the exception propagated), so a
                 # new Ctrl-C should preempt the next rollout rather than be swallowed.
                 _clear_preempt()
-                global _teleop_requested
-                if _teleop_requested:
-                    _teleop_requested = False
+                # A hand-off had been requested but was preempted before it reached a checkpoint
+                # (operator pressed Switch to teleop, then Preempt). The arm is stopped and the
+                # rollout is unwound, which is exactly the hand-off precondition -- honour it here
+                # rather than leaving the request armed to fire mid-way through the NEXT rollout.
+                if _consume_teleop_request():
                     _run_teleop_handoff(container)
+                continue
+            except TeleopHandoffRequested:
+                # SIGUSR1 raised out of a stdin prompt (task or label): nothing is in flight, the
+                # arm is idle between rollouts, so hand it over directly.
+                _consume_teleop_request()
+                _log.info("Teleop switch requested at the prompt: handing the arm over from here")
+                _run_teleop_handoff(container)
                 continue
             except Exception as e:
                 # A single rollout failing (a transient Gemini/perception 503, a planning
@@ -1277,9 +1525,9 @@ def _sync_entrypoint(
     # tail of its current trajectory segment. Installed after the pool so its workers (which set
     # SIG_IGN in their own initializer) are unaffected.
     signal.signal(signal.SIGINT, _sigint_preempt)
-    # SIGUSR1 is the "switch to teleop" trigger from the data-collection UI's button: same in-flight
-    # abort as SIGINT, plus _teleop_requested routes the KeyboardInterrupt handler into the teleop
-    # hand-off (release the robot, wait for it back, auto-replan the same task). See
+    # SIGUSR1 is the "switch to teleop" trigger from the data-collection UI's button. Unlike SIGINT
+    # it aborts nothing: it arms a request that the rollout honours at its next step boundary, then
+    # hands the robot + cameras to a teleop process and waits for them back. See
     # _sigusr1_teleop_switch / _run_teleop_handoff.
     signal.signal(signal.SIGUSR1, _sigusr1_teleop_switch)
 

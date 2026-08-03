@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 
 from tiptop.utils import RobotClient, get_robot_client
 
@@ -151,15 +152,24 @@ def _join_gripper(pending: "tuple[threading.Thread, dict] | None") -> None:
 
 
 def execute_cutamp_plan(
-    cutamp_plan: list[dict], client: RobotClient | None = None, timeline: list | None = None
-) -> None:
-    """Execute the plan from cuTAMP on the real robot.
+    cutamp_plan: list[dict],
+    client: RobotClient | None = None,
+    timeline: list | None = None,
+    should_stop: "Callable[[], bool] | None" = None,
+) -> bool:
+    """Execute the plan from cuTAMP on the real robot. Returns True if it stopped early.
 
     If ``timeline`` is provided, one entry per plan step is appended to it (in order),
     each ``{"type", "label", "t_start", "t_end"}`` with wall-clock (epoch) seconds.
     The LeRobot export uses this to place each control frame on the real execution
     clock -- including the gripper-actuation pauses that the plan timeline omits -- so
     camera frames can be aligned to states by hardware timestamp.
+
+    ``should_stop`` is polled once per completed step (after any overlapped gripper command has been
+    joined, so nothing is left actuating) and stops the plan there. That is the safe place to hand
+    the arm to a human: it is parked at a plan boundary rather than mid-trajectory, which is the one
+    thing an abort cannot give you -- bamboo has no abort, so a preempt still runs out the current
+    segment and just skips the rest of the plan.
     """
     if client is None:
         client = get_robot_client()
@@ -239,9 +249,20 @@ def execute_cutamp_plan(
         action_duration = time.perf_counter() - action_start_time
         _log.debug(f"Executing {action_type} action took {action_duration:.2f}s")
 
+        if should_stop is not None and should_stop():
+            # Finish any overlapped gripper first: the arm must be fully idle before another
+            # controller can take it.
+            _join_gripper(pending_gripper)
+            _log.info(
+                f"Stopping after step {step + 1}/{len(cutamp_plan)} ({action_label}) at the caller's "
+                f"request; the remaining {len(cutamp_plan) - step - 1} step(s) will not be sent"
+            )
+            return True
+
     # A trailing overlapped gripper (rare -- plans usually end on a trajectory) must finish here.
     _join_gripper(pending_gripper)
 
     # Now we're done executing plan open-loop without any failures on the controller side
     duration = time.perf_counter() - start_time
     _log.info(f"Real robot execution took {duration:.2f}s")
+    return False

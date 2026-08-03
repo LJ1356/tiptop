@@ -119,6 +119,17 @@ def new_robot_client() -> RobotClient:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
 
+def _clear_robot_client_cache() -> None:
+    """Drop the cached RobotClient(s) so the next get_robot_client() builds a fresh connection."""
+    get_bamboo_client.cache_clear()
+    try:
+        from tiptop.ur5.ur5_client import get_ur5_client
+
+        get_ur5_client.cache_clear()
+    except ImportError:
+        pass
+
+
 def release_robot_client(client: RobotClient) -> None:
     """Best-effort graceful release of a RobotClient's connection (ZMQ sockets etc.), e.g. before
     handing the physical robot off to a different controller such as DROID's StableRobotEnv for a
@@ -126,24 +137,29 @@ def release_robot_client(client: RobotClient) -> None:
     talk to the same NUC-side polymetis server and cannot hold it at the same time.
 
     Tries the common close/disconnect method names; a client exposing none of them just gets GC'd
-    once every reference (including the get_robot_client cache) is dropped, which is not guaranteed
-    to happen immediately -- reconnect_robot_client() at least drops the cache reference.
+    once every reference is dropped, which is not guaranteed to happen immediately.
+
+    The cache is dropped either way, so a get_robot_client() call during the hand-off window builds a
+    new connection instead of handing back the closed one we just released.
     """
     log = logging.getLogger(__name__)
-    for name in ("close", "disconnect", "shutdown"):
-        fn = getattr(client, name, None)
-        if callable(fn):
-            try:
-                fn()
-                log.info(f"Released {type(client).__name__} via .{name}()")
-            except Exception:
-                log.exception(f"{type(client).__name__}.{name}() raised while releasing")
-            return
-    log.warning(
-        f"{type(client).__name__} exposes no close/disconnect/shutdown method; relying on GC to "
-        "drop its connection. If a subsequent controller (e.g. teleop) fails to take over the arm, "
-        "this is the first place to look."
-    )
+    try:
+        for name in ("close", "disconnect", "shutdown"):
+            fn = getattr(client, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    log.info(f"Released {type(client).__name__} via .{name}()")
+                except Exception:
+                    log.exception(f"{type(client).__name__}.{name}() raised while releasing")
+                return
+        log.warning(
+            f"{type(client).__name__} exposes no close/disconnect/shutdown method; relying on GC to "
+            "drop its connection. If a subsequent controller (e.g. teleop) fails to take over the arm, "
+            "this is the first place to look."
+        )
+    finally:
+        _clear_robot_client_cache()
 
 
 def wait_for_robot_stationary(
@@ -231,13 +247,7 @@ def wait_for_robot_stationary(
 def reconnect_robot_client() -> RobotClient:
     """Drop any cached RobotClient and build a fresh one. Use after release_robot_client() to hand
     the robot back from another controller (e.g. after a teleop interlude)."""
-    get_bamboo_client.cache_clear()
-    try:
-        from tiptop.ur5.ur5_client import get_ur5_client
-
-        get_ur5_client.cache_clear()
-    except ImportError:
-        pass
+    _clear_robot_client_cache()
     return get_robot_client()
 
 
