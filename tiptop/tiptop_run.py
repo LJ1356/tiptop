@@ -1686,6 +1686,7 @@ def _sync_entrypoint(
         # time_dilation_factor this is a TAMP-config knob, not a cuRobo cost weight.
         traj_length_norm=resolve_traj_length_norm(cost_overrides),
         grasp_orientation_cost=resolve_grasp_orientation_cost(cost_overrides),
+        q_home=cfg.robot.q_home,
     )
 
     global _executor_pool

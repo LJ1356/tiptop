@@ -124,6 +124,7 @@ class TiptopPlanningServer:
             time_dilation_factor=time_dilation_factor,
             traj_length_norm=resolve_traj_length_norm(self._curobo_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(self._curobo_overrides),
+            q_home=self._cfg.robot.q_home,
         )
         self._output_dir = Path("tiptop_server_outputs")
         # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2

@@ -131,6 +131,7 @@ def run_tiptop_h5(
         time_dilation_factor=cfg.robot.time_dilation_factor,
         collision_activation_distance=0.0,
         enable_visualizer=cutamp_visualize,
+        q_home=cfg.robot.q_home,
     )
 
     setup_logging(level=logging.INFO)

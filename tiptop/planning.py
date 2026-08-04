@@ -5,6 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 from curobo.wrap.reacher.ik_solver import IKSolver
@@ -58,6 +59,7 @@ def build_tamp_config(
     enable_visualizer: bool = False,
     traj_length_norm: float = 2.0,
     grasp_orientation_cost: bool = False,
+    q_home: Sequence[float] | None = None,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
@@ -94,6 +96,11 @@ def build_tamp_config(
         # Gate for the grasp orientation-change soft cost (weight set in run_planning). Enabled from
         # cfg/tamp when `grasp_pose_change_weight` is present; see resolve_grasp_orientation_cost.
         grasp_orientation_cost=grasp_orientation_cost,
+        # Where a plan parks the arm after its last operator. Pass the robot's real home (cfg/tiptop
+        # `robot.q_home`); left None, cuTAMP ends every plan back at the configuration it planned
+        # FROM, which on a rollout resuming from a teleop hand-off is wherever the human left the
+        # arm -- unreachable often enough to fail the whole plan (see cutamp motion_solver).
+        q_home=tuple(q_home) if q_home is not None else None,
     )
 
 
