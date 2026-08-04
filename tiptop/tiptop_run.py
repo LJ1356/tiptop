@@ -164,6 +164,18 @@ _pending_instruction: str | None = None
 # left the arm) and opening the gripper would drop whatever the operator is holding.
 _skip_episode_reset = False
 
+# The task plan (cuTAMP plan skeleton) behind THIS rollout's motion plan, and the one a rollout
+# resuming from a hand-off should reuse instead of searching for its own.
+#
+# Only the symbolic search is skipped: the resumed rollout re-perceives the scene and re-solves the
+# grasps, placements and trajectories, which it must, since the human moved things. What it does not
+# do is reconsider WHICH task plan to follow -- the operator handed the arm back mid-attempt at a
+# plan that was already chosen, so the arm carries on with that one rather than possibly switching
+# to a different skeleton for the same goal. Rejected automatically (and a full search run instead)
+# if the plan no longer applies to the newly perceived scene -- see planning.skeleton_reuse_rejection.
+_last_plan_skeleton = None
+_reuse_plan_skeleton = None
+
 # Hand-off lineage. One task attempt can span many legs -- tamp, teleop, tamp, ... -- and they are
 # ONE trajectory, not N episodes. Every leg is stamped with this id; collect/merge_trajectory.py
 # joins them into a single episode afterwards. A fresh rollout mints a new id; a rollout resuming
@@ -334,8 +346,10 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
       5. re-open the cameras, reconnect the RobotClient, and queue the SAME task instruction with
          _skip_episode_reset so the next loop iteration replans from the hand-off pose without
          moving the arm first -- no return to home, no gripper open, no move to the capture pose.
+         The task plan this rollout was following is queued with it (_reuse_plan_skeleton), so the
+         resumed rollout re-solves the motion for the SAME plan rather than searching for another.
     """
-    global _pending_instruction, _skip_episode_reset, _trajectory_handed_off
+    global _pending_instruction, _skip_episode_reset, _trajectory_handed_off, _reuse_plan_skeleton
     _log.info("Teleop switch: releasing the robot connection for hand-off")
     # This trajectory now spans several legs, so its export waits for the merge (see _spawn_postprocess).
     _trajectory_handed_off = True
@@ -409,6 +423,12 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
     if _LAST_TASK:
         _pending_instruction = _LAST_TASK
         _skip_episode_reset = True
+        # Whatever task plan this rollout got as far as, the resumed one carries on with. None when
+        # the hand-off came from somewhere with no plan in hand -- the prompt, between rollouts, or
+        # during perception/planning -- and then the resumed rollout plans the task normally.
+        _reuse_plan_skeleton = _last_plan_skeleton
+        if _reuse_plan_skeleton is not None:
+            _log.info(f"Resumed rollout will reuse this task plan: {[op.name for op in _reuse_plan_skeleton]}")
 
 
 class UserExitException(Exception):
@@ -1238,8 +1258,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # of the same task from wherever the operator left the arm, so homing would throw
                 # that away and opening the gripper would drop whatever they are holding.
                 global _skip_episode_reset, _trajectory_id, _trajectory_handed_off
+                global _last_plan_skeleton, _reuse_plan_skeleton
                 resuming_from_handoff = _skip_episode_reset
                 _skip_episode_reset = False
+                # The task plan to reuse is armed by the hand-off and consumed here, exactly like
+                # the reset skip -- one rollout only, so it can never leak into a later task.
+                reuse_skeleton = _reuse_plan_skeleton if resuming_from_handoff else None
+                _reuse_plan_skeleton = None
+                _last_plan_skeleton = None
                 # A resumed rollout continues the SAME trajectory as the leg that handed off; any
                 # other rollout starts a fresh one.
                 if not resuming_from_handoff:
@@ -1336,6 +1362,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         if os.environ.get("TIPTOP_DRY_RUN"):
                             raise RuntimeError("dry_run skip")
                         _log.info("Running Planning...")
+                        plan_out: dict = {}
                         cutamp_plan, planning_duration, failure_reason = run_planning(
                             env,
                             config,
@@ -1346,7 +1373,21 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             all_surfaces=all_surfaces,
                             experiment_dir=save_dir / "cutamp",
                             cost_overrides=container.cost_overrides,
+                            reuse_plan_skeleton=reuse_skeleton,
+                            plan_out=plan_out,
                         )
+                        # Remember this rollout's task plan in case it hands off to teleop, and tell
+                        # the UI whether the one we were given was actually reused (run_planning
+                        # rejects a stale plan, and falls back to a full search if it yields nothing).
+                        _last_plan_skeleton = plan_out.get("plan_skeleton")
+                        if reuse_skeleton is not None:
+                            _emit_event(
+                                {
+                                    "event": "task_plan_reuse",
+                                    "reused": bool(plan_out.get("reused")),
+                                    "plan": [op.name for op in reuse_skeleton],
+                                }
+                            )
                         _log.info(f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s")
                         if cutamp_plan is not None:
                             plan_path = save_dir / "tiptop_plan.json"

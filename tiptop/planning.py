@@ -3,6 +3,7 @@
 import json
 import logging
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -14,8 +15,11 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs import TAMPEnvironment
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
+from cutamp.tamp_domain import get_initial_state
+from cutamp.task_planning import PlanSkeleton, State
 from cutamp.task_planning.constraints import StablePlacement
 from cutamp.task_planning.costs import GraspCost
+from cutamp.task_planning.search import FABRICABLE_TYPES
 from jaxtyping import Float
 
 from tiptop.trajectory_blending import arm_joint_limits, blend_cutamp_plan, resolve_blend_config
@@ -93,6 +97,69 @@ def build_tamp_config(
     )
 
 
+def environment_initial_state(env: TAMPEnvironment) -> State:
+    """The symbolic initial state cuTAMP will derive for ``env``.
+
+    Mirrors ``TAMPWorld.initial_state``, which reads the same ``env.type_to_objects`` through
+    ``get_objects_by_type``. Reproduced here so a task plan can be checked against the environment
+    before paying for the world (and the GPU) that cuTAMP builds.
+
+    Note this state is a function of the object NAMES alone -- it says every movable has not been
+    picked up and the hand is empty, never where anything is. Two perception passes over the same
+    scene therefore give the same initial state whatever moved in between.
+    """
+    return get_initial_state(
+        movables=[obj.name for obj in env.type_to_objects.get("Movable", [])],
+        surfaces=[obj.name for obj in env.type_to_objects.get("Surface", [])],
+        sticks=[obj.name for obj in env.type_to_objects.get("Stick", [])],
+        buttons=[obj.name for obj in env.type_to_objects.get("Button", [])],
+    )
+
+
+def skeleton_reuse_rejection(skeleton: PlanSkeleton, initial_state: State, goal_state: State) -> str | None:
+    """Why ``skeleton`` cannot be reused for this problem, or None if it can be.
+
+    A ground operator carries only its lifted operator and object-name strings, so a skeleton found
+    against one perception pass is re-runnable against another -- as long as it still describes a
+    valid solution here. Checked exactly as ``breadth_first_search`` would have: every operator's
+    preconditions hold in turn, and the goal is a subset of the resulting state.
+
+    The object-name check is redundant with the precondition walk for every operator whose
+    preconditions mention all its arguments, but it is what turns "an object the skeleton needs was
+    not detected this time" into a clear rejection here rather than an index error deep inside
+    particle initialization. Configurations and trajectories (FABRICABLE_TYPES) are exempt: the
+    search invents those symbols, so they are never in the initial state -- same rule BFS applies to
+    goal literals.
+    """
+    if not skeleton:
+        return "the cached task plan is empty"
+    literals_by_type: dict[str, set[str]] = defaultdict(set)
+    for atom in initial_state:
+        for param, value in zip(atom.fluent.parameters, atom.values):
+            literals_by_type[param.type].add(value)
+    for op in skeleton:
+        missing = sorted(
+            {
+                f"{value} ({param.type})"
+                for param, value in zip(op.operator.parameters, op.values)
+                if param.type not in FABRICABLE_TYPES and value not in literals_by_type[param.type]
+            }
+        )
+        if missing:
+            return f"{op.name} refers to object(s) not in this scene: {', '.join(missing)}"
+
+    state = initial_state
+    for op in skeleton:
+        if not op.preconditions.issubset(state):
+            unmet = sorted(str(atom) for atom in op.preconditions - state)
+            return f"preconditions of {op.name} are not met: {', '.join(unmet)}"
+        state = op.apply(state)
+    if not goal_state.issubset(state):
+        unmet = sorted(str(atom) for atom in goal_state - state)
+        return f"it does not reach this goal, missing: {', '.join(unmet)}"
+    return None
+
+
 def run_planning(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
@@ -103,6 +170,8 @@ def run_planning(
     all_surfaces: list,
     experiment_dir: Path | None = None,
     cost_overrides: dict | None = None,
+    reuse_plan_skeleton: PlanSkeleton | None = None,
+    plan_out: dict | None = None,
 ) -> tuple[list | None, float, str | None]:
     """Run cuTAMP planning and return (plan, planning_time_seconds, failure_reason).
 
@@ -111,6 +180,15 @@ def run_planning(
     ``cost_overrides`` is the config's ``tamp_overrides`` dict; it is used here only to resolve the
     trajectory-blending settings (``blend_trajectory`` etc. -- see resolve_blend_config). Blending is
     off unless the config opts in.
+
+    ``reuse_plan_skeleton`` is a task plan from an earlier call (see ``plan_out``) to reuse instead
+    of searching for one: grasps, placements and trajectories are all still solved from scratch
+    against this scene, only the symbolic search is skipped. It is rejected outright if it no longer
+    solves this problem (skeleton_reuse_rejection), and if it is accepted but yields no plan, this
+    falls back to a full search rather than returning empty-handed. Either way ``elapsed`` covers
+    every cuTAMP call made.
+
+    ``plan_out``, if given, gets {"plan_skeleton": ..., "reused": bool} for the returned plan.
     """
     constraint_to_tol = default_constraint_to_tol.copy()
     constraint_to_mult = default_constraint_to_mult.copy()
@@ -131,20 +209,46 @@ def run_planning(
     cost_reducer = CostReducer(constraint_to_mult)
     constraint_checker = ConstraintChecker(constraint_to_tol)
 
+    def solve(skeleton):
+        cutamp_out: dict = {}
+        plan, _, reason = run_cutamp(
+            env,
+            config,
+            cost_reducer,
+            constraint_checker,
+            q_init=q_init,
+            ik_solver=ik_solver,
+            grasps=grasps,
+            motion_gen=motion_gen,
+            experiment_dir=experiment_dir,
+            reuse_plan_skeleton=skeleton,
+            plan_out=cutamp_out,
+        )
+        return plan, reason, cutamp_out.get("plan_skeleton")
+
     start = time.perf_counter()
-    cutamp_plan, _, failure_reason = run_cutamp(
-        env,
-        config,
-        cost_reducer,
-        constraint_checker,
-        q_init=q_init,
-        ik_solver=ik_solver,
-        grasps=grasps,
-        motion_gen=motion_gen,
-        experiment_dir=experiment_dir,
-    )
+    reused = False
+    if reuse_plan_skeleton is not None:
+        rejection = skeleton_reuse_rejection(reuse_plan_skeleton, environment_initial_state(env), env.goal_state)
+        if rejection:
+            _log.info(f"Not reusing the previous task plan ({rejection}); planning the task from scratch")
+            reuse_plan_skeleton = None
+        else:
+            _log.info(f"Reusing the previous task plan: {[op.name for op in reuse_plan_skeleton]}")
+
+    cutamp_plan, failure_reason, final_skeleton = solve(reuse_plan_skeleton)
+    if cutamp_plan is not None:
+        reused = reuse_plan_skeleton is not None
+    elif reuse_plan_skeleton is not None:
+        # The task plan still applies symbolically, but this scene admits no grasp/placement/motion
+        # for it -- the objects have moved. A different skeleton may well work, so search after all.
+        _log.warning(f"Reused task plan produced no motion plan ({failure_reason}); falling back to a full task search")
+        cutamp_plan, failure_reason, final_skeleton = solve(None)
     elapsed = time.perf_counter() - start
     _log.info(f"cuTAMP planning took: {elapsed:.2f}s")
+    if plan_out is not None:
+        plan_out["plan_skeleton"] = final_skeleton
+        plan_out["reused"] = reused
 
     if cutamp_plan is None:
         _log.error(f"cuTAMP failed to find a plan: {failure_reason}")
