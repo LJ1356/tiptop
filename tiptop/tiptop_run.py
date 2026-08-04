@@ -423,9 +423,11 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
     if _LAST_TASK:
         _pending_instruction = _LAST_TASK
         _skip_episode_reset = True
-        # Whatever task plan this rollout got as far as, the resumed one carries on with. None when
-        # the hand-off came from somewhere with no plan in hand -- the prompt, between rollouts, or
-        # during perception/planning -- and then the resumed rollout plans the task normally.
+        # Whatever task plan was last found, the resumed rollout carries on with. Handing off at the
+        # prompt or between rollouts reuses the PREVIOUS rollout's plan, which is the right one:
+        # _pending_instruction is that same task. None only when no plan has been found to reuse --
+        # a hand-off during this rollout's perception/planning (cleared at the top of every rollout),
+        # or before any rollout has planned -- and then the resumed rollout plans the task normally.
         _reuse_plan_skeleton = _last_plan_skeleton
         if _reuse_plan_skeleton is not None:
             _log.info(f"Resumed rollout will reuse this task plan: {[op.name for op in _reuse_plan_skeleton]}")
@@ -1381,11 +1383,21 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # rejects a stale plan, and falls back to a full search if it yields nothing).
                         _last_plan_skeleton = plan_out.get("plan_skeleton")
                         if reuse_skeleton is not None:
+                            reused = bool(plan_out.get("reused"))
+                            plan_str = ", ".join(op.name for op in reuse_skeleton)
+                            # `message` is what puts this in the operator's session log: the server
+                            # mirrors any event carrying one, and has no case for this event itself.
                             _emit_event(
                                 {
                                     "event": "task_plan_reuse",
-                                    "reused": bool(plan_out.get("reused")),
+                                    "reused": reused,
                                     "plan": [op.name for op in reuse_skeleton],
+                                    "message": (
+                                        f"replanned the motion for the task plan from before the hand-off ({plan_str})"
+                                        if reused
+                                        else f"could not keep the task plan from before the hand-off ({plan_str}); "
+                                        "planned the task from scratch — see the log above for why"
+                                    ),
                                 }
                             )
                         _log.info(f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s")
