@@ -677,14 +677,25 @@ async def check_server_health(session: aiohttp.ClientSession):
     _log.info("Server health checks successful!")
 
 
-def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
+def _label_rollout(save_dir: Path, output_dir: str, timestamp: str, recording_enabled: bool) -> Path | None:
     """Prompt user to label rollout as success/failure, moving it out of eval/ to
     <success|failure>/<timestamp>/. Loops on invalid input. Returns the final rollout
     directory (or the unchanged eval dir if skipped) so it can be post-processed.
 
+    A rollout that executed nothing -- planning failed, so no `_meta.json` was written -- holds no
+    episode to file. It is DELETED rather than filed, and None is returned; the label is still
+    reported first, because it is what ends the trajectory and the server merges a hand-off's legs
+    on it. Only checked when recording is on, since otherwise no rollout ever writes `_meta.json`.
+
     A "switch to teleop" (SIGUSR1) landing here raises TeleopHandoffRequested out of the prompt (see
     _at_prompt) -- the rollout stays unlabeled in eval/ and the caller hands the arm off."""
     global _at_prompt
+    nothing_recorded = recording_enabled and not (save_dir / "_meta.json").exists()
+
+    def discard() -> None:
+        shutil.rmtree(save_dir, ignore_errors=True)
+        _log.info(f"Nothing was executed in this rollout, so there is no episode to keep: removed {save_dir}")
+
     _emit_event({"event": "awaiting_label", "dir": str(save_dir)})
     try:
         while True:
@@ -695,22 +706,32 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
             _at_prompt = False
             user_input = user_input.strip().lower()
             if user_input in ("y", "n"):
-                cls = "success" if user_input == "y" else "failure"
-                dest = Path(output_dir) / cls / timestamp
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(save_dir, dest)
-                _log.info(f"Moved rollout to {cls} directory: {dest}")
+                dest = save_dir
+                if not nothing_recorded:
+                    cls = "success" if user_input == "y" else "failure"
+                    dest = Path(output_dir) / cls / timestamp
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(save_dir, dest)
+                    _log.info(f"Moved rollout to {cls} directory: {dest}")
                 # The label rates the whole task attempt, so it is also the one unambiguous signal
                 # that the trajectory has ENDED (the operator could always have handed off again).
-                # The server merges the trajectory's legs on this event.
+                # The server merges the trajectory's legs on this event, and files the merged
+                # episode under this success flag -- which is the only place the label survives
+                # when this rollout itself is discarded just below.
                 _emit_event({
                     "event": "labeled",
                     "dir": str(dest),
                     "success": user_input == "y",
                     "trajectory_id": _trajectory_id,
                 })
+                if nothing_recorded:
+                    discard()
+                    return None
                 return dest
             elif user_input == "":
+                if nothing_recorded:
+                    discard()
+                    return None
                 _log.info(f"Keeping rollout in eval directory: {save_dir}")
                 return save_dir
             else:
@@ -839,6 +860,36 @@ def _spawn_postprocess(rollout_dir: Path) -> None:
         _log.info(f"Post-processing {rollout_dir.name} in background (pid {proc.pid}) -> postprocess.log")
     except Exception:
         _log.exception("Failed to launch background post-processing")
+
+
+# Franka's ~0.855m nominal reach plus margin for the gripper's TCP, used by unreachable_goal_movable.
+MAX_MOVABLE_REACH_M = 0.9
+
+
+def unreachable_goal_movable(env: TAMPEnvironment, grounded_atoms: list[dict]) -> str | None:
+    """Reason a movable the goal names sits outside the arm's reach, or None if they are all fine.
+
+    Perception occasionally grounds a label to an object across the room; no Pick for it can ever be
+    solved, and cuTAMP would spend a whole optimization pass before reporting only "no satisfying
+    particles found". Returned as a reason rather than raised so the caller can treat it as an
+    ordinary planning failure -- the rollout then still reaches the label prompt, and that label is
+    what merges the legs of a handed-off trajectory.
+
+    Only goal-named movables are checked -- distant clutter is left alone, and so are surfaces (an
+    out-of-reach surface fails in Place instead, which this doesn't cover).
+    """
+    goal_labels = {arg for atom in grounded_atoms for arg in atom.get("args", [])}
+    for mesh in env.movables:
+        if mesh.name not in goal_labels or getattr(mesh, "pose", None) is None or len(mesh.pose) < 3:
+            continue
+        reach = float(np.linalg.norm(np.asarray(mesh.pose[:3], dtype=float)))
+        if reach > MAX_MOVABLE_REACH_M:
+            return (
+                f"Goal object '{mesh.name}' is {reach:.2f}m from the robot base, outside its "
+                f"{MAX_MOVABLE_REACH_M}m reach -- perception has most likely grounded the label to "
+                f"the wrong object (centroid {[round(float(c), 3) for c in mesh.pose[:3]]})"
+            )
+    return None
 
 
 def create_tamp_environment(
@@ -1365,24 +1416,37 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             raise RuntimeError("dry_run skip")
                         _log.info("Running Planning...")
                         plan_out: dict = {}
-                        cutamp_plan, planning_duration, failure_reason = run_planning(
-                            env,
-                            config,
-                            q_init=observation.q_init,
-                            ik_solver=container.ik_solver,
-                            grasps=processed_scene.grasps,
-                            motion_gen=container.motion_gen,
-                            all_surfaces=all_surfaces,
-                            experiment_dir=save_dir / "cutamp",
-                            cost_overrides=container.cost_overrides,
-                            reuse_plan_skeleton=reuse_skeleton,
-                            plan_out=plan_out,
-                        )
+                        # An out-of-reach goal object is unplannable, so don't spend a cuTAMP pass
+                        # discovering that. Reported as an ordinary planning failure rather than
+                        # raised: the rollout keeps going down the "no plan found" path and still
+                        # reaches the label prompt, which is what merges a handed-off trajectory.
+                        unreachable = unreachable_goal_movable(env, grounded_atoms)
+                        if unreachable:
+                            _log.error(f"Not planning: {unreachable}")
+                            cutamp_plan, planning_duration, failure_reason = None, 0.0, unreachable
+                        else:
+                            cutamp_plan, planning_duration, failure_reason = run_planning(
+                                env,
+                                config,
+                                q_init=observation.q_init,
+                                ik_solver=container.ik_solver,
+                                grasps=processed_scene.grasps,
+                                motion_gen=container.motion_gen,
+                                all_surfaces=all_surfaces,
+                                experiment_dir=save_dir / "cutamp",
+                                cost_overrides=container.cost_overrides,
+                                reuse_plan_skeleton=reuse_skeleton,
+                                plan_out=plan_out,
+                            )
                         # Remember this rollout's task plan in case it hands off to teleop, and tell
                         # the UI whether the one we were given was actually reused (run_planning
                         # rejects a stale plan, and falls back to a full search if it yields nothing).
-                        _last_plan_skeleton = plan_out.get("plan_skeleton")
-                        if reuse_skeleton is not None:
+                        # Skipped planning above -> nothing to remember and nothing to report: the
+                        # task plan we were handed was neither reused nor replaced, so leave it in
+                        # place for the next attempt rather than clearing it.
+                        if not unreachable:
+                            _last_plan_skeleton = plan_out.get("plan_skeleton")
+                        if reuse_skeleton is not None and not unreachable:
                             reused = bool(plan_out.get("reused"))
                             plan_str = ", ".join(op.name for op in reuse_skeleton)
                             # `message` is what puts this in the operator's session log: the server
@@ -1538,12 +1602,13 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # processing is skipped for the same reason: this is not a finished rollout.
                         _log.info(f"Teleop hand-off: leaving the partial rollout unlabeled in {save_dir}")
                     elif execute_plan:
-                        final_dir = _label_rollout(save_dir, output_dir, timestamp)
+                        final_dir = _label_rollout(save_dir, output_dir, timestamp, container.enable_recording)
                         # Post-process this rollout (gifs + LeRobot export) in the background so
                         # the next rollout can start immediately instead of blocking on it. Skipped
                         # for a multi-leg trajectory: this dir is only its LAST leg, and exporting
                         # it would produce a fragment. merge_trajectory.py joins the legs first.
-                        if not _trajectory_handed_off:
+                        # final_dir is None when the rollout executed nothing and was discarded.
+                        if final_dir is not None and not _trajectory_handed_off:
                             _spawn_postprocess(final_dir)
                         # PATCH (cortex v3): DO NOT auto-open the gripper after Pick.
                         # The original tiptop demo opened the gripper post-pick for
