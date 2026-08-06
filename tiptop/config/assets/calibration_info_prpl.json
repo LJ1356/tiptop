@@ -20,6 +20,18 @@
       -2.486228089521667
     ],
     "timestamp": 1783991597.6599455,
-    "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448)"
+    "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448). Stale: the side-view unit was swapped to 34032889, which is what TIPTOP_EXTERNAL_CAMERA_ID now points at"
+  },
+  "34032889": {
+    "pose": [
+      0.5877215643313519,
+      -0.5618717014110421,
+      0.38444434375752135,
+      -1.8288150846264206,
+      -0.011133731117020984,
+      0.48218657675667864
+    ],
+    "timestamp": 1786037073.9511013,
+    "source": "copied verbatim from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1), recalibrated 2026-08-06. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from"
   }
 }
