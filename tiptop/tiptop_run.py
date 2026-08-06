@@ -892,12 +892,43 @@ def unreachable_goal_movable(env: TAMPEnvironment, grounded_atoms: list[dict]) -
     return None
 
 
+# Words that name the table. Gemini is told not to detect the table (perception/prompts/
+# detect_and_translate.txt), so it has no detected label to build a predicate from and reaches for a
+# synonym instead -- 'desktop', 'wooden_table' and 'table_surface' have all been observed on the same
+# scene. The fitted plane is always called 'table', so those are folded onto it rather than failing a
+# goal that is otherwise perfectly well formed.
+_TABLE_WORDS = frozenset(
+    {"table", "tabletop", "desk", "desktop", "counter", "countertop", "worktop", "workbench", "surface"}
+)
+
+
+def resolve_table_aliases(grounded_atoms: list[dict], known_labels: set[str], table_name: str) -> None:
+    """Rewrite table synonyms in the surface slot of on(...) goals to the fitted plane's name, in place.
+
+    An arg is treated as a synonym only when it is NOT itself a detected object and one of its
+    underscore-separated words names a table. That keeps 'wooden_table' and 'table_surface' while
+    leaving a genuinely wrong surface such as 'snack_box' to fail the unknown-object check -- and
+    leaving a table Gemini did detect (against instructions) bound to its own mesh, as before.
+
+    Only the surface slot is rewritten: the table is never a movable, so a table word in the first
+    arg is a mistranslation, not a naming slip, and should still be rejected.
+    """
+    for atom in grounded_atoms:
+        args = atom.get("args", [])
+        if atom.get("predicate") != "on" or len(args) != 2 or args[1] in known_labels:
+            continue
+        if _TABLE_WORDS & set(args[1].lower().replace(" ", "_").split("_")):
+            _log.warning(f"Goal names the table '{args[1]}'; resolving it to the fitted plane '{table_name}'")
+            args[1] = table_name
+
+
 def create_tamp_environment(
     object_meshes: dict[str, Mesh], table_cuboid: Cuboid, grounded_atoms: list[dict], include_workspace: bool
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
     # Reject goals that reference objects not present in the perceived scene.
     # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
     known_labels = set(object_meshes.keys()) | {table_cuboid.name}
+    resolve_table_aliases(grounded_atoms, known_labels, table_cuboid.name)
     for atom in grounded_atoms:
         for arg in atom.get("args", []):
             if arg not in known_labels:
