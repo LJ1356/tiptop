@@ -324,8 +324,18 @@ def _reacquire_cameras(container: "_DemoContainer", *, had_external_cam_2: bool)
     object.__setattr__(container, "external_cam_2", external_cam_2)
 
 
-def _run_teleop_handoff(container: "_DemoContainer") -> None:
+def _run_teleop_handoff(container: "_DemoContainer", can_finish: bool = False) -> bool:
     """Hand the physical arm off to a human teleop session, then block until it's handed back.
+
+    Returns True when the operator ended the trajectory from teleop ("resume_finish") rather than
+    handing it back to be replanned: their demonstration finished the task, so the caller closes the
+    trajectory out instead of queueing another rollout. Returns False for a plain "resume", which is
+    the unchanged behaviour -- replan the same task from the hand-off pose.
+
+    `can_finish` says whether the caller HAS a partial rollout to close out. Only the mid-rollout
+    hand-off does; the ones taken at a prompt or after a preempt have no leg to label and no
+    trajectory to end, so they advertise `can_finish: false` and downgrade a "resume_finish" to a
+    plain resume rather than stranding the operator.
 
     Called at a rollout checkpoint (see _sigusr1_teleop_switch), so the current plan step has already
     finished and this rollout's partial episode is already on disk. From here:
@@ -348,6 +358,8 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
          moving the arm first -- no return to home, no gripper open, no move to the capture pose.
          The task plan this rollout was following is queued with it (_reuse_plan_skeleton), so the
          resumed rollout re-solves the motion for the SAME plan rather than searching for another.
+         Skipped entirely when the operator chose to finish: nothing is queued, and the caller
+         labels the partial leg instead.
     """
     global _pending_instruction, _skip_episode_reset, _trajectory_handed_off, _reuse_plan_skeleton
     _log.info("Teleop switch: releasing the robot connection for hand-off")
@@ -386,11 +398,14 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
 
     # trajectory_id rides along so the server can stamp the teleop leg it is about to spawn with the
     # same id, making the human's demonstration a segment of this trajectory rather than its own episode.
-    _emit_event({"event": "awaiting_teleop_resume", "trajectory_id": _trajectory_id})
+    # can_finish tells the server whether to offer "hand back and finish" alongside the plain
+    # hand-back, so the UI never shows a button this hand-off cannot honour.
+    _emit_event({"event": "awaiting_teleop_resume", "trajectory_id": _trajectory_id, "can_finish": can_finish})
     _log.info(
         "Robot and cameras released; waiting for 'resume' on stdin (sent once the operator hands "
         "control back and the teleop process has exited) before reconnecting and replanning..."
     )
+    finish = False
     try:
         while True:
             raw = input().strip()
@@ -402,6 +417,16 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
             except ValueError:
                 pass
             if cmd.lower() == "resume":
+                break
+            if cmd.lower() == "resume_finish":
+                # Downgraded rather than refused: the arm and cameras have already been released and
+                # the operator is waiting, so an unhonourable finish must still hand control back.
+                finish = can_finish
+                if not finish:
+                    _log.warning(
+                        "'resume_finish' received for a hand-off with no rollout to close out "
+                        "(taken at a prompt, or after a preempt); resuming normally instead"
+                    )
                 break
             _log.warning(f"Ignoring unexpected input while awaiting teleop resume: {raw!r}")
     except EOFError:
@@ -420,6 +445,13 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
     _restart_save_pool()
     _emit_event({"event": "teleop_handoff_done"})
 
+    if finish:
+        # The operator's demonstration finished the task, so there is nothing to replan. Queue
+        # nothing: the caller labels the partial leg, and that `labeled` event is what ends the
+        # trajectory and has the server merge the tamp and teleop legs into one episode.
+        _log.info("Teleop finished the task: closing the trajectory out instead of replanning")
+        return True
+
     if _LAST_TASK:
         _pending_instruction = _LAST_TASK
         _skip_episode_reset = True
@@ -431,6 +463,7 @@ def _run_teleop_handoff(container: "_DemoContainer") -> None:
         _reuse_plan_skeleton = _last_plan_skeleton
         if _reuse_plan_skeleton is not None:
             _log.info(f"Resumed rollout will reuse this task plan: {[op.name for op in _reuse_plan_skeleton]}")
+    return False
 
 
 class UserExitException(Exception):
@@ -1658,8 +1691,16 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # Outside the rollout's try/finally: everything this rollout owned (recording,
                 # log handler) is closed, so the arm can be handed to the operator. Blocks until
                 # they hand it back, then loops round and replans the same task from there.
+                #
+                # Unless they hand it back with "finish": the demonstration completed the task, so
+                # this leg is labeled here instead. That is the ONLY thing the trajectory still
+                # needs -- `labeled` is what ends it, and the server merges the tamp and teleop legs
+                # on that event (see sessions.js _trackTrajectory). No _spawn_postprocess for the
+                # same reason the normal path skips it on a handed-off trajectory: this dir is one
+                # leg, and the merge post-processes the joined episode.
                 if handoff_pending:
-                    _run_teleop_handoff(container)
+                    if _run_teleop_handoff(container, can_finish=True):
+                        _label_rollout(save_dir, output_dir, timestamp, container.enable_recording)
                     continue
             except UserExitException:
                 _log.info("User requested exit")
