@@ -1615,7 +1615,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                         timeline=exec_timeline,
                                         joint_samples=joint_sampler.samples,
                                         gripper_samples=gripper_sampler.samples,
-                                        instruction=task_instruction,
+                                        # _meta.json's instruction is the LANGUAGE LABEL the dataset
+                                        # trains on, which is not always the goal we planned: a task
+                                        # whose teleop leg does something the on()/holding() goal
+                                        # language cannot express is launched with a reduced
+                                        # TIPTOP_TASK while TIPTOP_INSTRUCTION still describes the
+                                        # whole demonstration. Absent (tiptop-run started directly),
+                                        # they are the same thing.
+                                        instruction=os.environ.get("TIPTOP_INSTRUCTION") or task_instruction,
                                         cameras=lerobot_cameras,
                                         fps=LEROBOT_FPS,
                                         config_id=os.environ.get("TIPTOP_CONFIG_ID"),
