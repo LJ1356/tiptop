@@ -24,14 +24,14 @@
   },
   "34032889": {
     "pose": [
-      0.5877215643313519,
-      -0.5618717014110421,
-      0.38444434375752135,
-      -1.8288150846264206,
-      -0.011133731117020984,
-      0.48218657675667864
+      0.5777921840348561,
+      -0.5694681285265875,
+      0.38490267573878834,
+      -1.8267029344492502,
+      0.020478510428575847,
+      0.5678903500705192
     ],
-    "timestamp": 1786037073.9511013,
-    "source": "copied verbatim from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1), recalibrated 2026-08-06. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from"
+    "timestamp": 1786406044.2170005,
+    "source": "copied verbatim from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1), recalibrated 2026-08-10 19:54 -- the third run that evening (17:41, 18:10, 19:54). The three agree to <1.5deg in rotation but spread ~23mm in x, so trust the rotation more than the x offset here. All supersede 2026-08-07, before the mount shifted. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from"
   }
 }
