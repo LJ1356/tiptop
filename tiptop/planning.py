@@ -195,6 +195,9 @@ def run_planning(
     falls back to a full search rather than returning empty-handed. Either way ``elapsed`` covers
     every cuTAMP call made.
 
+    ``experiment_dir`` holds one `attempt_N` subdirectory per cuTAMP call (see attempt_dir), so the
+    reuse attempt and the fallback search each get their own logs instead of colliding.
+
     ``plan_out``, if given, gets {"plan_skeleton": ..., "reused": bool} for the returned plan.
     """
     constraint_to_tol = default_constraint_to_tol.copy()
@@ -216,6 +219,21 @@ def run_planning(
     cost_reducer = CostReducer(constraint_to_mult)
     constraint_checker = ConstraintChecker(constraint_to_tol)
 
+    def attempt_dir() -> Path | None:
+        """Pick this cuTAMP call's own `attempt_N` subdirectory of ``experiment_dir``.
+
+        cuTAMP's ExperimentLogger refuses to overwrite anything it has already written, so two calls
+        sharing one directory die on the second one's `optimization/opt_0001.json` (each call
+        restarts its own optimization counter). Picking the first free N off disk, rather than
+        counting in memory, also keeps two runs that land on the same directory apart.
+        """
+        if experiment_dir is None:
+            return None  # let cuTAMP name the experiment itself
+        n = 0
+        while (experiment_dir / f"attempt_{n}").exists():
+            n += 1
+        return experiment_dir / f"attempt_{n}"
+
     def solve(skeleton):
         cutamp_out: dict = {}
         plan, _, reason = run_cutamp(
@@ -227,7 +245,7 @@ def run_planning(
             ik_solver=ik_solver,
             grasps=grasps,
             motion_gen=motion_gen,
-            experiment_dir=experiment_dir,
+            experiment_dir=attempt_dir(),
             reuse_plan_skeleton=skeleton,
             plan_out=cutamp_out,
         )

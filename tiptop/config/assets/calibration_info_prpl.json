@@ -20,6 +20,18 @@
       -2.486228089521667
     ],
     "timestamp": 1783991597.6599455,
-    "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448)"
+    "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448). Stale: the side-view unit was swapped to 34032889, which is what TIPTOP_EXTERNAL_CAMERA_ID now points at"
+  },
+  "34032889": {
+    "pose": [
+      0.5777921840348561,
+      -0.5694681285265875,
+      0.38490267573878834,
+      -1.8267029344492502,
+      0.020478510428575847,
+      0.5678903500705192
+    ],
+    "timestamp": 1786406044.2170005,
+    "source": "copied verbatim from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1), recalibrated 2026-08-10 19:54 -- the third run that evening (17:41, 18:10, 19:54). The three agree to <1.5deg in rotation but spread ~23mm in x, so trust the rotation more than the x offset here. All supersede 2026-08-07, before the mount shifted. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from"
   }
 }
