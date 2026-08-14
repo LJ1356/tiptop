@@ -13,6 +13,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import aiohttp
 import numpy as np
@@ -163,6 +164,14 @@ _pending_instruction: str | None = None
 # gripper reset. Homing would undo the hand-off (the whole point is to replan from where the human
 # left the arm) and opening the gripper would drop whatever the operator is holding.
 _skip_episode_reset = False
+
+# Set alongside it, but a SEPARATE thing: the next rollout is another leg of the SAME trajectory, so
+# it keeps _trajectory_id and its episode merges with the legs before it. The two used to be one flag,
+# which was wrong as soon as a leg wanted the arm reset without starting a new trajectory -- a
+# human-in-the-loop phase does exactly that (the human opened a box; the robot holds nothing, and the
+# next phase needs the capture pose for perception). Clearing the reset flag then silently minted a
+# new trajectory id, which both lost the HITL plan mid-task and split the episode's legs apart.
+_continue_trajectory = False
 
 # The task plan (cuTAMP plan skeleton) behind THIS rollout's motion plan, and the one a rollout
 # resuming from a hand-off should reuse instead of searching for its own.
@@ -362,6 +371,7 @@ def _run_teleop_handoff(container: "_DemoContainer", can_finish: bool = False) -
          labels the partial leg instead.
     """
     global _pending_instruction, _skip_episode_reset, _trajectory_handed_off, _reuse_plan_skeleton
+    global _continue_trajectory
     _log.info("Teleop switch: releasing the robot connection for hand-off")
     # This trajectory now spans several legs, so its export waits for the merge (see _spawn_postprocess).
     _trajectory_handed_off = True
@@ -455,6 +465,7 @@ def _run_teleop_handoff(container: "_DemoContainer", can_finish: bool = False) -
     if _LAST_TASK:
         _pending_instruction = _LAST_TASK
         _skip_episode_reset = True
+        _continue_trajectory = True
         # Whatever task plan was last found, the resumed rollout carries on with. Handing off at the
         # prompt or between rollouts reuses the PREVIOUS rollout's plan, which is the right one:
         # _pending_instruction is that same task. None only when no plan has been found to reuse --
@@ -875,6 +886,263 @@ def _get_task_instruction() -> str:
     return raw
 
 
+# --- Human-in-the-loop planning -------------------------------------------------------------------
+#
+# Opt-in (`hitl.enabled` in the task's cfg/tamp config, passed as --hitl-config). With it off, none of
+# this runs and the `tiptop.hitl` package is never even imported, so a problem in it cannot affect an
+# ordinary session.
+#
+# A HITL task spans SEVERAL rollouts of the loop below: the VLM breaks the instruction into an
+# ordered list of PHASES, each robot phase is one rollout aimed at that phase's sub-goal, and each
+# human phase -- something only a person can do, like opening a box -- is one teleop leg. The plan
+# therefore has to outlive a hand-off, which is what _hitl_session is for. Legs share a trajectory_id exactly as an ordinary hand-off's do, so the
+# episode the operator ends up with is the whole task, merged by collect/merge_trajectory.py.
+_hitl_cfg = None  # HITLConfig, resolved once at startup
+_hitl_session = None  # tiptop.hitl.session.HITLSession for the task in progress
+
+
+def _hitl_enabled() -> bool:
+    return _hitl_cfg is not None and _hitl_cfg.enabled
+
+
+def _hitl_reset_session(reason: str = "") -> None:
+    """Drop the session, so the next rollout re-proposes and re-plans from scratch."""
+    global _hitl_session
+    if _hitl_session is not None and reason:
+        _log.info(f"HITL: ending the session ({reason})")
+    _hitl_session = None
+
+
+def _hitl_arm_recorder(save_dir: Path) -> None:
+    """Point the VLM audit trail at this rollout's directory (no-op when HITL is off)."""
+    if not _hitl_enabled():
+        return
+    from tiptop.hitl.record import set_recorder
+
+    set_recorder(save_dir / "vlm" if _hitl_cfg.save_vlm_io else None)
+
+
+def _hitl_verification_image(container: "_DemoContainer"):
+    """A frame to check the human's work in, preferring a camera that sees the whole workspace.
+
+    After a hand-off the arm is wherever the operator left it, and the episode reset that would
+    normally return it to the capture pose is deliberately skipped. A wrist camera therefore points
+    somewhere arbitrary, so a third-person view is used when the rig has one.
+    """
+    from tiptop.hitl.grounding import to_pil
+
+    cam = container.external_cam if container.external_cam is not None else perception_camera(container)
+    return to_pil(cam.read_camera().rgb)
+
+
+def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
+    """Build the callback run_perception uses to aim this rollout at one segment of the outer plan.
+
+    ``state`` is filled in for the rollout body: ``human`` is the phase to hand over when the plan's
+    next phase is a person's, and ``failure`` is why there is no goal to plan for.
+
+    Nothing here raises. An exception out of run_perception would be swallowed by the rollout's own
+    ``finally``, which saves ``env`` and ``processed_scene`` -- names that a failure here leaves
+    unbound, so the real reason would be replaced by a NameError. Reporting a reason instead also
+    keeps the rollout on the ordinary "no plan found" path, which still reaches the label prompt --
+    and that label is what ends a handed-off trajectory and merges its legs.
+    """
+    from tiptop.hitl.grounding import to_pil
+    from tiptop.hitl.planning import match_drifted_names
+    from tiptop.hitl.session import build_session
+
+    async def resolve(object_names: list[str], table_name: str) -> tuple[list[dict], set[str] | None]:
+        global _hitl_session
+        session = _hitl_session
+        if session is not None and not session.matches(task_instruction, _trajectory_id):
+            _hitl_reset_session("a new task or trajectory started")
+            session = None
+        if session is not None:
+            # Gemini names objects afresh every pass and the names drift ("toy" and "box" one pass,
+            # "blue_toy" and "cardboard_box" the next). A plan naming an object this pass did not
+            # produce would die in create_tamp_environment's unknown-object check, so re-bind it to
+            # this pass's labels where that can be done unambiguously. Throwing the plan away instead
+            # -- which is what used to happen -- re-planned the whole task from a scene already half
+            # rearranged, and asked the human to redo the phase they had just finished.
+            missing = sorted(session.objects_named() - set(object_names) - {table_name})
+            if missing:
+                mapping = match_drifted_names(missing, sorted(set(object_names) - session.objects_named()))
+                if mapping is None:
+                    _hitl_reset_session(f"perception no longer detects {', '.join(missing)}")
+                    session = None
+                else:
+                    session.rebind(mapping)
+        if session is None:
+            try:
+                session, reason = await build_session(
+                    to_pil(rgb), task_instruction, object_names, table_name, _hitl_cfg, _trajectory_id
+                )
+            except Exception as exc:
+                _log.exception("HITL: could not propose a plan for this task")
+                state["failure"] = f"HITL proposal failed ({type(exc).__name__}: {exc})"
+                return [], None
+            if session is None:
+                state["failure"] = reason
+                return [], None
+            if session.spec.unrepresented:
+                # The plan covers less than the instruction asked for. Surfaced as an event as well
+                # as printed, so it is visible in the data-collection UI rather than only in the log.
+                _emit_event({
+                    "event": "hitl_instruction_not_fully_represented",
+                    "instruction": task_instruction,
+                    "unrepresented": [dict(u) for u in session.spec.unrepresented],
+                    "detected_objects": sorted(object_names),
+                })
+            _hitl_session = session
+
+        state["session"] = session
+        phase = session.current
+        if phase is None:
+            # Every phase is done, so there is nothing left to aim this rollout at. Only reachable if
+            # a finished session outlived the rollout that finished it.
+            state["failure"] = "the human-in-the-loop plan is already complete"
+            return [], set(session.spec.scene_types.surfaces)
+        if phase.is_human:
+            # Nothing for the robot to do before the human acts. An empty goal keeps cuTAMP out of it
+            # entirely (see the `human` branch before run_planning).
+            state["human"] = phase
+            return [], set(session.spec.scene_types.surfaces)
+        return session.goal_dicts(), set(session.spec.scene_types.surfaces)
+
+    return resolve
+
+
+def _await_human_phase(message: str) -> str:
+    """Show the human what to do and block until they say how they did it.
+
+    Returns 'done' (they did it by hand, without the teleop rig) or 'abort'. Pressing "Switch to
+    teleop" in the data-collection UI raises TeleopHandoffRequested out of the input() below --
+    _at_prompt is what makes SIGUSR1 do that rather than wait for a rollout checkpoint that will
+    never come here -- and the caller runs the hand-off from there.
+    """
+    global _at_prompt
+    print(message, flush=True)
+    while True:
+        try:
+            _at_prompt = True
+            raw = input("Waiting for the human phase ('done' when finished by hand, 'abort' to give up): ")
+            _at_prompt = False
+        except EOFError:
+            raise UserExitException("EOF while awaiting a human phase")
+        finally:
+            _at_prompt = False
+        answer = raw.strip().lower()
+        if answer in ("done", "y", "yes"):
+            return "done"
+        if answer in ("abort", "skip", "n", "no"):
+            return "abort"
+        if answer in ("q", "exit", "quit"):
+            raise UserExitException("user quit at a human phase")
+        if answer in ("resume", "resume_finish"):
+            # A hand-off resume that arrived after the hand-off had already finished -- the server
+            # writes one when the teleop child exits, and it lands here if we are back at a prompt.
+            # Same treatment as at the task prompt: say so plainly and keep waiting.
+            _log.warning(
+                f"Ignoring a {raw.strip()!r} line at the human-phase prompt: the hand-off it belongs "
+                "to has already finished. Press 'Switch to teleop' again for THIS phase, or type 'done'"
+            )
+            continue
+        _log.warning(f"Ignoring {raw!r}: type 'done' or 'abort', or press 'Switch to teleop' in the UI")
+
+
+async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool) -> bool:
+    """Hand one human phase over, then check from a fresh image that it happened.
+
+    Returns True when this rollout should be labeled and the trajectory closed out: either the
+    operator ended it from teleop ("return & finish"), or this was the task's LAST phase, so there is
+    nothing left to plan. Both are the same thing to the caller -- a `labeled` event, which is what
+    ends the trajectory and has the server merge its legs. Returning False leaves the trajectory open,
+    which is what lets a robot phase AFTER a human one still happen.
+
+    A failed check is not silently accepted: the operator is told what is still missing and given
+    another go (``verify_retries``). Continuing on a false belief is the one outcome worth avoiding,
+    since every later phase is planned against it -- but so is throwing away a demonstration a human
+    just gave because one classifier call went the wrong way, hence the retry rather than an
+    immediate failure.
+    """
+    from tiptop.hitl.grounding import missing_statements, verify_phase
+    from tiptop.hitl.session import handoff_message, phase_summary, retry_message
+
+    session = _hitl_session
+    assert session is not None
+    attempts_left = _hitl_cfg.verify_retries
+    finished_from_teleop = False
+
+    while True:
+        _emit_event({
+            "event": "awaiting_human_phase",
+            "instructions": phase.instructions,
+            **phase_summary(phase),
+        })
+        try:
+            answer = _await_human_phase(handoff_message(session, phase))
+        except TeleopHandoffRequested:
+            # "Switch to teleop" was pressed. Consume the request here so the hand-off we are about
+            # to run satisfies it, rather than leaving it armed to fire again in the next rollout.
+            _consume_teleop_request()
+            _log.info("HITL: handing the arm over for the human phase")
+            finished_from_teleop = _run_teleop_handoff(container, can_finish=can_finish)
+            answer = "done"
+        if answer == "abort":
+            _hitl_reset_session("the operator abandoned the human phase")
+            return finished_from_teleop
+
+        try:
+            ok, verdicts = await verify_phase(
+                _hitl_verification_image(container), phase, session.spec.invented, _hitl_cfg
+            )
+        except Exception:
+            # A classifier that cannot be reached must not cost the operator their demonstration.
+            _log.exception("HITL: could not verify the human step; accepting it unchecked")
+            ok, verdicts = True, []
+        session.verdicts.extend(verdicts)
+        _emit_event({
+            "event": "human_phase_verified",
+            "description": phase.description,
+            "ok": ok,
+            "verdicts": [v.summary() for v in verdicts],
+        })
+        if ok or not _hitl_cfg.verify_enforced:
+            if not ok:
+                _log.warning("HITL: the human step did not verify, but verify_enforced is off; continuing")
+            session.advance()
+            if session.finished:
+                # That was the last phase of the task; nothing remains to plan or execute.
+                _log.info("HITL: every phase of the task is done")
+                _hitl_reset_session("every phase of the task is done")
+                return True
+            _log.info(
+                f"HITL: {len(session.phases) - session.index} phase(s) still to go; the robot "
+                "carries on once the arm is handed back"
+            )
+            if finished_from_teleop:
+                # Phases remain, but the operator chose "return & finish": their demonstration
+                # ended the task their own way, so the trajectory closes out here. The session has
+                # to go with it -- leaving it live would have the next attempt resume midway through
+                # a plan for a scene the operator has since rearranged.
+                _hitl_reset_session("the operator ended the trajectory from teleop")
+                return True
+            return False
+
+        missing = missing_statements(verdicts)
+        _log.warning(f"HITL: the human phase did not verify. Still expected: {missing}")
+        if attempts_left <= 0:
+            print(retry_message(missing, 0), flush=True)
+            _hitl_reset_session("the human phase could not be verified")
+            return finished_from_teleop
+        attempts_left -= 1
+        print(retry_message(missing, attempts_left + 1), flush=True)
+        if finished_from_teleop:
+            # They already ended the trajectory; there is no leg left to hand off again.
+            _hitl_reset_session("the human phase could not be verified")
+            return finished_from_teleop
+
+
 def _spawn_postprocess(rollout_dir: Path) -> None:
     """Fire-and-forget background post-processing (gifs + LeRobot export) for one finished
     rollout, so the next rollout can start immediately. No-op if the launcher didn't set
@@ -956,8 +1224,20 @@ def resolve_table_aliases(grounded_atoms: list[dict], known_labels: set[str], ta
 
 
 def create_tamp_environment(
-    object_meshes: dict[str, Mesh], table_cuboid: Cuboid, grounded_atoms: list[dict], include_workspace: bool
+    object_meshes: dict[str, Mesh],
+    table_cuboid: Cuboid,
+    grounded_atoms: list[dict],
+    include_workspace: bool,
+    surface_labels: set[str] | None = None,
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
+    """Build the cuTAMP environment and goal for one rollout.
+
+    ``surface_labels`` overrides which objects count as surfaces. Left None it is inferred from this
+    rollout's own goal, which is the only behaviour an ordinary rollout ever sees. A human-in-the-loop
+    task passes it because its goal changes between segments: inferring per segment would make the
+    cloth a Surface (and therefore a static obstacle) while the toy is placed on it, then a Movable
+    once the goal no longer mentions it -- the world geometry would change mid-task.
+    """
     # Reject goals that reference objects not present in the perceived scene.
     # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
     known_labels = set(object_meshes.keys()) | {table_cuboid.name}
@@ -971,10 +1251,11 @@ def create_tamp_environment(
                 )
 
     # Identify which objects are used as surfaces (second arg in on(x, y))
-    surface_labels = set()
-    for atom in grounded_atoms:
-        if atom["predicate"] == "on" and len(atom["args"]) == 2:
-            surface_labels.add(atom["args"][1])
+    if surface_labels is None:
+        surface_labels = set()
+        for atom in grounded_atoms:
+            if atom["predicate"] == "on" and len(atom["args"]) == 2:
+                surface_labels.add(atom["args"][1])
 
     # Separate movables and surfaces
     movables = []
@@ -1200,7 +1481,15 @@ async def run_perception(
     depth_estimator: DepthEstimator | None = None,
     include_workspace: bool = True,
     log_to_rerun: bool = True,
+    resolve_goal: Callable[[list[str], str], Awaitable[tuple[list[dict], set[str] | None]]] | None = None,
 ) -> tuple[TAMPEnvironment, list, ProcessedScene, list[dict]]:
+    """Perceive the scene and build the cuTAMP environment and goal for it.
+
+    ``resolve_goal`` replaces the goal Gemini translated the instruction into, given the object labels
+    this pass detected and the fitted table's name; it returns (grounded_atoms, surface_labels). Only
+    the human-in-the-loop path passes it, to aim this rollout at one segment of a longer plan. Object
+    DETECTION is left alone either way -- it is driven by the full instruction, which is what makes
+    Gemini name things in terms relevant to the task."""
     start_time = time.perf_counter()
 
     frame = observation.frame
@@ -1321,15 +1610,26 @@ async def run_perception(
     if _os_detect.environ.get("TIPTOP_DETECT_ONLY"):
         raise UserExitException("TIPTOP_DETECT_ONLY: perception complete; skipping planning/motion")
 
+    grounded_atoms = detection_results["grounded_atoms"]
+    surface_labels = None
+    if resolve_goal is not None:
+        # The labels only exist now, which is why this is a callback rather than a value the caller
+        # could have passed in: on the first rollout of a HITL task the whole proposal stage runs
+        # here, against the objects this pass actually detected.
+        grounded_atoms, surface_labels = await resolve_goal(
+            sorted(processed_scene.object_meshes), processed_scene.table_cuboid.name
+        )
+
     env, all_surfaces = create_tamp_environment(
         processed_scene.object_meshes,
         processed_scene.table_cuboid,
-        detection_results["grounded_atoms"],
+        grounded_atoms,
         include_workspace,
+        surface_labels=surface_labels,
     )
     _log.info(f"Processing scene and perception results took {time.perf_counter() - proc_st:.2f}s")
     _log.info(f"Perception pipeline completed, took {time.perf_counter() - start_time:.2f}s")
-    return env, all_surfaces, processed_scene, detection_results["grounded_atoms"]
+    return env, all_surfaces, processed_scene, grounded_atoms
 
 
 async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration, output_dir: str, execute_plan: bool):
@@ -1375,17 +1675,21 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # of the same task from wherever the operator left the arm, so homing would throw
                 # that away and opening the gripper would drop whatever they are holding.
                 global _skip_episode_reset, _trajectory_id, _trajectory_handed_off
-                global _last_plan_skeleton, _reuse_plan_skeleton
+                global _last_plan_skeleton, _reuse_plan_skeleton, _continue_trajectory
                 resuming_from_handoff = _skip_episode_reset
                 _skip_episode_reset = False
+                continuing_trajectory = _continue_trajectory
+                _continue_trajectory = False
                 # The task plan to reuse is armed by the hand-off and consumed here, exactly like
                 # the reset skip -- one rollout only, so it can never leak into a later task.
                 reuse_skeleton = _reuse_plan_skeleton if resuming_from_handoff else None
                 _reuse_plan_skeleton = None
                 _last_plan_skeleton = None
                 # A resumed rollout continues the SAME trajectory as the leg that handed off; any
-                # other rollout starts a fresh one.
-                if not resuming_from_handoff:
+                # other rollout starts a fresh one. Deliberately keyed on continuing_trajectory rather
+                # than on the motion-reset flag: a HITL phase resumes the trajectory while still
+                # wanting its arm reset.
+                if not continuing_trajectory:
                     _trajectory_id = uuid.uuid4().hex[:16]
                     _trajectory_handed_off = False
                 if resuming_from_handoff:
@@ -1429,6 +1733,11 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # has closed itself out.
                 handoff_pending = False
 
+                # Filled in by the HITL goal resolver during perception (empty when HITL is off):
+                # "session" is the task's plan, "human" the phase to hand over when the plan's next
+                # phase is a person's rather than robot work.
+                hitl_state: dict = {}
+
                 now = datetime.now()
                 timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
                 iso_timestamp = now.isoformat(timespec="seconds")
@@ -1441,6 +1750,12 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 save_dir = Path(output_dir) / "eval" / timestamp
                 _log.info(f"Saving logs, results, and visualizations to {save_dir}")
                 _emit_event({"event": "rollout_start", "dir": str(save_dir)})
+
+                # Every image sent to the VLM this rollout, and what it answered, land in
+                # <save_dir>/vlm. Armed here rather than inside the HITL code so the verification
+                # queries -- which run after the rollout has closed itself out -- are still filed
+                # against the rollout that asked for them.
+                _hitl_arm_recorder(save_dir)
 
                 # Add log file handler for this run
                 file_handler = add_file_handler(save_dir / "tiptop_run.log")
@@ -1464,6 +1779,11 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         task_instruction,
                         save_dir,
                         depth_estimator=container.depth_estimator,
+                        resolve_goal=(
+                            _hitl_goal_resolver(task_instruction, observation.frame.rgb, hitl_state)
+                            if _hitl_enabled()
+                            else None
+                        ),
                     )
                     perception_duration = time.perf_counter() - perception_start
 
@@ -1485,10 +1805,26 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # raised: the rollout keeps going down the "no plan found" path and still
                         # reaches the label prompt, which is what merges a handed-off trajectory.
                         unreachable = unreachable_goal_movable(env, grounded_atoms)
-                        if unreachable:
+                        planned = False
+                        if hitl_state.get("failure"):
+                            # The proposal or the outer plan did not come off. Reported as an
+                            # ordinary planning failure, so the rollout still reaches the label
+                            # prompt rather than unwinding past it.
+                            _log.error(f"Not planning: {hitl_state['failure']}")
+                            cutamp_plan, planning_duration = None, 0.0
+                            failure_reason = hitl_state["failure"]
+                            _hitl_reset_session("the plan could not be built")
+                        elif hitl_state.get("human") is not None:
+                            # The plan's next phase is the human's, not the robot's. There is no goal
+                            # for cuTAMP to solve, so skip it -- reported the same way an unplannable
+                            # goal is, so this rollout still walks the usual path to the hand-off.
+                            _log.info("HITL: this phase is the human's; not running cuTAMP")
+                            cutamp_plan, planning_duration, failure_reason = None, 0.0, "awaiting a human step"
+                        elif unreachable:
                             _log.error(f"Not planning: {unreachable}")
                             cutamp_plan, planning_duration, failure_reason = None, 0.0, unreachable
                         else:
+                            planned = True
                             cutamp_plan, planning_duration, failure_reason = run_planning(
                                 env,
                                 config,
@@ -1508,9 +1844,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # Skipped planning above -> nothing to remember and nothing to report: the
                         # task plan we were handed was neither reused nor replaced, so leave it in
                         # place for the next attempt rather than clearing it.
-                        if not unreachable:
+                        if planned:
                             _last_plan_skeleton = plan_out.get("plan_skeleton")
-                        if reuse_skeleton is not None and not unreachable:
+                        if reuse_skeleton is not None and planned:
                             reused = bool(plan_out.get("reused"))
                             plan_str = ", ".join(op.name for op in reuse_skeleton)
                             # `message` is what puts this in the operator's session log: the server
@@ -1666,6 +2002,29 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         )
                         _log.info(f"Logs, results, and visualizations saved to {save_dir}")
 
+                    # HITL bookkeeping, outside the rollout's own try/finally but before the label
+                    # decision: a task whose next step is a human's must NOT be labeled or exported
+                    # here, because this rollout is one leg of it rather than a finished episode.
+                    # Setting handoff_pending is what routes it down the branch that already knows
+                    # that (the same one an operator-initiated hand-off takes).
+                    hitl_session = hitl_state.get("session")
+                    if hitl_session is not None:
+                        human_phase = hitl_state.get("human")
+                        if human_phase is None and execute_plan and cutamp_plan is not None and not handoff_pending:
+                            # This rollout executed a robot phase to completion. Record the task plan
+                            # cuTAMP found for it BEFORE advancing: the phase only said what had to
+                            # be established, cuTAMP decided how.
+                            hitl_session.record_tamp_plan(hitl_session.index, plan_out)
+                            hitl_session.advance()
+                            nxt = hitl_session.current
+                            human_phase = nxt if (nxt is not None and nxt.is_human) else None
+                        hitl_state["human"] = human_phase
+                        if human_phase is not None:
+                            handoff_pending = True
+                        (save_dir / "hitl.json").write_text(json.dumps(hitl_session.to_json(), indent=2))
+                        if human_phase is None and hitl_session.finished:
+                            _hitl_reset_session("every phase of the task is done")
+
                     if execute_plan and handoff_pending:
                         # Hand-off: the episode is already written (unlabeled, in eval/) but the
                         # plan is only part-executed, so there is nothing to rate yet -- and the
@@ -1706,7 +2065,45 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # same reason the normal path skips it on a handed-off trajectory: this dir is one
                 # leg, and the merge post-processes the joined episode.
                 if handoff_pending:
-                    if _run_teleop_handoff(container, can_finish=True):
+                    human_phase = hitl_state.get("human")
+                    if human_phase is not None:
+                        # A planner-initiated hand-off: the human is told WHAT to do and what will be
+                        # checked afterwards, instead of being handed a bare arm. The hand-off itself
+                        # is still the operator's to start (the same "Switch to teleop" button), so
+                        # nothing takes the arm out from under them.
+                        global _pending_instruction
+                        finished = await _hitl_human_phase(container, human_phase, can_finish=True)
+                        if finished:
+                            # The task is over. _run_teleop_handoff queues the same instruction for
+                            # the next iteration on a plain "resume", which would start the WHOLE
+                            # task again from a fresh proposal; drop it and go back to the prompt.
+                            _pending_instruction = None
+                        # The next phase has a different goal, so the plan this rollout followed is
+                        # the wrong one to resume with -- and _run_teleop_handoff queues it
+                        # unconditionally. Left set, skeleton_reuse_rejection accepts it whenever the
+                        # next segment's goal is a subset of what it already achieves (HandEmpty
+                        # alone, say), and the arm silently repeats the chunk it has just done.
+                        _reuse_plan_skeleton = None
+                        # Likewise the reset: after a hand-off for a human phase the robot is holding
+                        # nothing and the arm is wherever the human left it, so the next phase wants
+                        # its normal reset -- including the move to the capture pose, without which
+                        # perception looks wherever the operator happened to leave the wrist.
+                        # _continue_trajectory is deliberately LEFT set: this is still the same
+                        # trajectory, and clearing both (as one flag once did) minted a new
+                        # trajectory id, which dropped the plan mid-task and split the episode.
+                        _skip_episode_reset = False
+                        # Re-write the audit record: the verification verdicts only exist now, and
+                        # for the LAST human step of a task there is no later rollout to record them.
+                        # Read from hitl_state, NOT the module global: completing the task drops the
+                        # session, and guarding on the global here meant the one rollout whose record
+                        # mattered most -- the finished task, with its verdicts -- kept the stale copy
+                        # written before the human acted.
+                        record_session = hitl_state.get("session")
+                        if record_session is not None:
+                            (save_dir / "hitl.json").write_text(json.dumps(record_session.to_json(), indent=2))
+                    else:
+                        finished = _run_teleop_handoff(container, can_finish=True)
+                    if finished:
                         _label_rollout(save_dir, output_dir, timestamp, container.enable_recording)
                     continue
             except UserExitException:
@@ -1729,6 +2126,10 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     "Keeping session warm, returning to task prompt"
                 )
                 _emit_event({"event": "rollout_aborted"})
+                # A half-walked HITL plan must not survive a preempt: the operator's next Enter
+                # repeats the task, and resuming at segment 2 of a plan whose segment 1 was aborted
+                # would run the wrong work against the wrong scene.
+                _hitl_reset_session("the rollout was preempted")
                 # Unwind is done (the finally-blocks above ran as the exception propagated), so a
                 # new Ctrl-C should preempt the next rollout rather than be swallowed.
                 _clear_preempt()
@@ -1753,6 +2154,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # a full re-warm. Log it (the traceback streams to the data-collection UI),
                 # then loop back to the task prompt so the user can just retry.
                 _log.exception(f"Rollout failed ({type(e).__name__}: {e}); keeping session warm, returning to task prompt")
+                # Same reasoning as the preempt path: a plan cannot be resumed halfway through when
+                # the rollout that was meant to advance it unwound instead.
+                _hitl_reset_session("the rollout failed")
                 continue
 
 
@@ -1765,6 +2169,7 @@ def _sync_entrypoint(
     num_particles: int = 256,
     enable_recording: bool = False,
     curobo_overrides: str | None = None,
+    hitl_config: str | None = None,
 ):
     """
     TiPToP live robot runner. Runs continuously on the real robot.
@@ -1779,6 +2184,10 @@ def _sync_entrypoint(
         enable_recording: Whether to record external camera video during execution.
         curobo_overrides: cuRobo cost overrides as a JSON file path OR inline JSON (the cfg/tamp/*.yml
             cost knobs, e.g. vae_manifold_weight); applied at solver build time so every plan uses them.
+        hitl_config: the cfg/tamp/*.yml `hitl` block as a JSON file path OR inline JSON. With
+            `enabled: true`, a goal TiPToP cannot express (folding a cloth) is planned as robot work
+            plus human steps, and each human step is handed over as a teleop leg -- see tiptop.hitl.
+            Absent or disabled, the run behaves exactly as it always has.
     """
     assert max_planning_time > 0
     assert opt_steps_per_skeleton > 0
@@ -1792,6 +2201,18 @@ def _sync_entrypoint(
     from tiptop.tiptop_websocket_server import _load_curobo_overrides
 
     cost_overrides = _load_curobo_overrides(curobo_overrides)
+    # Same file-or-inline-JSON spelling as curobo_overrides. Imported here rather than at module
+    # scope so that an ordinary session never loads the package at all.
+    global _hitl_cfg
+    if hitl_config:
+        from tiptop.hitl.config import load_hitl_config
+
+        _hitl_cfg = load_hitl_config(hitl_config)
+        if _hitl_cfg.enabled:
+            _log.info(
+                f"Human-in-the-loop planning is ON (proposal: {_hitl_cfg.proposal_model}, "
+                f"grounding: {_hitl_cfg.vlm_model})"
+            )
     # num_particles / opt_steps_per_skeleton may be set from the cfg/tamp yml (tamp_overrides) so a
     # data-gen config controls solver effort without CLI flags; an override wins over the CLI default.
     # (These key names are also echoed by summarize_curobo_config.)
