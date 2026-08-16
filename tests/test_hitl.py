@@ -299,6 +299,164 @@ def test_the_session_is_dropped_when_the_trajectory_changes():
     assert not session.matches("a different task", "traj-1")
 
 
+# The second running example: two ROBOT phases back to back, then a human one. The running example
+# above always separates its robot phases with a human phase, which is exactly why the rollout loop
+# could ship for months only knowing how to continue a trajectory across a robot->human boundary --
+# a robot->robot boundary ended the episode, and the arm sorted one toy and stopped.
+SORT_OBJECTS = ["blue_bowl", "blue_cloth", "blue_toy", "green_bowl", "green_toy"]
+SORT_RESPONSE = {
+    "new_predicates": [
+        {"name": "AreCoveredBy", "instructions": "the {2} is draped over both {0} and {1}"}
+    ],
+    "phases": [
+        {
+            "executor": "robot",
+            "description": "put the blue toy in the blue bowl",
+            "atoms": [{"predicate": "On", "args": ["blue_toy", "blue_bowl"]}],
+        },
+        {
+            "executor": "robot",
+            "description": "put the green toy in the green bowl",
+            "atoms": [{"predicate": "On", "args": ["green_toy", "green_bowl"]}],
+        },
+        {
+            "executor": "human",
+            "description": "cover both bowls with the cloth",
+            "instructions": "Drape the blue_cloth over both bowls.",
+            "atoms": [{"predicate": "AreCoveredBy", "args": ["blue_bowl", "green_bowl", "blue_cloth"]}],
+        },
+    ],
+}
+
+
+def _sort_session():
+    spec = parse(SORT_RESPONSE, objects=SORT_OBJECTS, instruction="sort the toys into same color bowls")
+    return HITLSession(
+        cfg=CFG,
+        instruction=spec.instruction,
+        trajectory_id="traj-1",
+        spec=spec,
+        initial_state=initial_state_for(spec.scene_types),
+    )
+
+
+def test_consecutive_robot_phases_are_planned_and_run_as_one_goal():
+    # Both toys are sorted by ONE cuTAMP plan and one continuous motion, which is what the non-HITL
+    # path does with the same two-clause instruction. Planning them separately worked, but the arm
+    # stopped between them to re-perceive and re-plan -- and that second perception pass is where the
+    # object labels drift.
+    session = _sort_session()
+    assert check_robot_phases(session.spec, session.initial_state) is None
+
+    assert [p.description for p in session.robot_run()] == [
+        "put the blue toy in the blue bowl",
+        "put the green toy in the green bowl",
+    ], "the human phase ends the run"
+    assert session.goal_dicts() == [
+        {"predicate": "on", "args": ["blue_toy", "blue_bowl"]},
+        {"predicate": "on", "args": ["green_toy", "green_bowl"]},
+    ]
+
+    session.record_tamp_plan(0, {"plan_skeleton": [], "reused": False})
+    session.advance()
+    assert session.index == 2, "one leg covered both robot phases"
+    assert session.next_is_human()
+
+    record = session.to_json()
+    assert [p["executor"] for p in record["phases"]] == ["robot", "robot", "human"]
+    # Both phases record the skeleton, and say they shared it -- otherwise the audit trail reads as
+    # though each had been solved on its own.
+    for phase in record["phases"][:2]:
+        assert phase["cutamp_skeleton"] == []
+        assert phase["cutamp_skeleton_covers_phases"] == [0, 1]
+
+
+def test_a_run_stops_at_a_phase_moving_an_object_the_run_already_moved():
+    # cuTAMP's Pick requires and deletes HasNotPickedUp(obj), so one plan picks each object once:
+    # On(blue_toy, table) and On(blue_toy, white_box) at once is unsatisfiable, not slow. Phases like
+    # these are genuinely sequential and stay separate legs -- which is what the robot->robot
+    # continuation in the rollout loop exists to carry.
+    spec = parse(_phases(
+        {
+            "executor": "robot",
+            "description": "take the toy off the box",
+            "atoms": [{"predicate": "On", "args": ["blue_toy", "table"]}],
+        },
+        {
+            "executor": "robot",
+            "description": "put the toy back on the box",
+            "atoms": [{"predicate": "On", "args": ["blue_toy", "white_box"]}],
+        },
+    ))
+    session = HITLSession(
+        cfg=CFG,
+        instruction=spec.instruction,
+        trajectory_id="traj-1",
+        spec=spec,
+        initial_state=initial_state_for(spec.scene_types),
+    )
+    assert len(session.robot_run()) == 1, "the second phase moves blue_toy again"
+    assert session.goal_dicts() == [{"predicate": "on", "args": ["blue_toy", "table"]}]
+
+    session.record_tamp_plan(0, {"plan_skeleton": [], "reused": False})
+    session.advance()
+    assert session.index == 1 and not session.finished and not session.next_is_human()
+    assert session.goal_dicts() == [{"predicate": "on", "args": ["blue_toy", "white_box"]}]
+    # Planned on its own, so no shared-skeleton marker.
+    assert "cutamp_skeleton_covers_phases" not in session.to_json()["phases"][0]
+
+
+def test_a_leg_is_not_gated_on_an_object_only_a_later_human_phase_names():
+    # objects_named() spans every remaining phase, so it includes the cloth -- which no robot phase
+    # names. Perception missing the cloth used to destroy the whole plan before cuTAMP was ever
+    # called, and the operator's next attempt re-sorted the toys from the start.
+    session = _sort_session()
+
+    assert "blue_cloth" in session.objects_named()
+    assert "blue_cloth" not in session.objects_needed_now()
+    # What the leg genuinely cannot proceed without: every object in the run it is about to plan,
+    # plus the surfaces, which are pinned for the whole task and would otherwise turn into movables
+    # mid-plan. The table is in there like any other surface; the caller subtracts it, exactly as it
+    # does for objects_named().
+    assert session.objects_needed_now() == {
+        "blue_toy", "blue_bowl", "green_toy", "green_bowl", "table",
+    }
+
+    # The human phase's own leg does need the cloth -- the relaxation is per-leg, not permanent.
+    session.advance()
+    assert "blue_cloth" in session.objects_needed_now()
+
+
+def test_a_name_the_plan_already_owns_is_never_a_re_binding_candidate():
+    # The re-binding pool is `detected - spec.scene_types.all_names`, NOT `detected -
+    # objects_named()`. objects_named() covers only the phases still to come, so an object named
+    # solely by a COMPLETED phase drops out of it while remaining a plan object -- and offering it as
+    # a target lets match_drifted_names fold two spec objects into one (SceneTypes.rebind merges them
+    # inside a frozenset), pointing this leg at the thing the robot has already put away.
+    session = _sort_session()
+    session.advance()  # both robot phases done; only the human phase remains
+
+    owned = session.spec.scene_types.all_names
+    assert {"blue_toy", "green_toy"} <= owned, "the sorted toys are still the plan's objects"
+    assert not ({"blue_toy", "green_toy"} & session.objects_named()), "but no remaining phase names them"
+
+    # So they must not survive into the pool. Only a label the plan does not already own can be a
+    # drifted spelling of one it does -- here, everything perception re-detected is already a plan
+    # object, and the one genuinely new label is the only candidate.
+    detected = {"blue_toy", "green_toy", "blue_bowl", "green_bowl", "table", "red_ball"}
+    assert sorted(detected - owned) == ["red_ball"]
+    # The rule the guard rests on: a nested pair would otherwise match.
+    assert match_drifted_names(["green_toy"], ["toy"]) == {"green_toy": "toy"}
+
+
+def test_a_finished_session_still_reports_its_pinned_surfaces():
+    # objects_needed_now() is read on any leg, including one that finds the plan already complete.
+    session = _sort_session()
+    while not session.finished:
+        session.advance()
+    assert session.objects_needed_now() == {"blue_bowl", "green_bowl", "table"}
+
+
 def test_hitl_json_records_the_plan_and_what_tiptop_was_handed():
     session = _session()
     session.record_tamp_plan(0, {"plan_skeleton": [], "reused": False})

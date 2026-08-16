@@ -78,16 +78,68 @@ class HITLSession:
         """Whether the phase the rollout now running is followed by belongs to a human."""
         return self.current is not None and self.current.is_human
 
+    def robot_run(self) -> tuple[Phase, ...]:
+        """The consecutive robot phases this leg plans and executes as ONE cuTAMP goal.
+
+        Empty when the plan is finished or the next phase is a human's.
+
+        A phase only ever says what must be TRUE at its end, and cuTAMP's initial state carries no
+        ``On`` atom at all (see planning.initial_state_for) -- every robot phase is planned from the
+        same clean state, so nothing symbolic ever enforced the proposer's ordering BETWEEN two robot
+        phases. Conjoining them is the same problem stated once, and it is exactly what the non-HITL
+        path already does with a two-clause instruction: one plan, one continuous motion, and no
+        re-perception in the middle for the object labels to drift across.
+
+        The run STOPS at a phase that moves an object an earlier phase in the run already moved.
+        cuTAMP's Pick requires and deletes ``HasNotPickedUp(obj)`` (tamp_domain.py), so a single plan
+        picks each object at most once: asking for On(toy, table) and On(toy, shelf) at once is
+        unsatisfiable rather than merely slow. Phases like that are genuinely sequential -- "take the
+        toy off the box ... put the toy back in" -- and stay separate legs, which is what the
+        robot->robot continuation in tiptop_run's rollout loop carries.
+        """
+        run: list[Phase] = []
+        claimed: set[str] = set()
+        for phase in self.phases[self.index :]:
+            if phase.is_human:
+                break
+            moved = phase_objects(phase) & self.spec.scene_types.movables
+            if run and moved & claimed:
+                break
+            run.append(phase)
+            claimed |= moved
+        return tuple(run)
+
     def goal_dicts(self) -> list[dict]:
-        """The current robot phase's sub-goal, in the form create_tamp_environment consumes."""
-        phase = self.current
-        assert phase is not None and not phase.is_human, "goal_dicts is only for a robot phase"
-        return goal_atoms_to_dicts(phase.atoms)
+        """This leg's goal, in the form create_tamp_environment consumes.
+
+        Every phase in robot_run(), conjoined -- create_tamp_environment turns each ``on(...)`` into
+        its own goal atom and cuTAMP satisfies the set, so two pick-and-places are one plan.
+        """
+        run = self.robot_run()
+        assert run, "goal_dicts is only for a robot phase"
+        atoms: frozenset[Atom] = frozenset().union(*(p.atoms for p in run))
+        return goal_atoms_to_dicts(atoms)
 
     def objects_named(self) -> set[str]:
         """Every object the remaining phases refer to, for the label-drift check."""
         names: set[str] = set()
         for phase in self.phases[self.index :]:
+            names.update(phase_objects(phase))
+        return names & self.spec.scene_types.all_names
+
+    def objects_needed_now(self) -> set[str]:
+        """The subset of objects_named() this leg cannot proceed without.
+
+        The difference is the whole point. objects_named() spans every phase still to come, human
+        ones included, so a task whose LAST phase asks a person to cover the bowls with a cloth names
+        that cloth on every leg before it -- and a robot phase that never mentions the cloth would be
+        abandoned mid-task just because perception missed it once. What a leg actually needs is the
+        phase it is about to carry out, plus the surfaces: those are pinned once for the whole task
+        (create_tamp_environment's surface_labels) and a surface that drifted away un-rebound would
+        quietly become a movable, changing the world geometry between phases.
+        """
+        names = set(self.spec.scene_types.surfaces)
+        for phase in self.robot_run() or ([self.current] if self.current is not None else []):
             names.update(phase_objects(phase))
         return names & self.spec.scene_types.all_names
 
@@ -98,19 +150,35 @@ class HITLSession:
         self.initial_state = initial_state_for(self.spec.scene_types, self.initially_true)
 
     def advance(self) -> Phase | None:
-        """Move past the current phase and return the one just completed."""
+        """Move past the work this leg carried out, and return the phase it started at.
+
+        A human phase is one step. A robot leg is the whole robot_run() its single cuTAMP goal
+        covered, so the plan does not stop between phases that were planned and executed together.
+        """
         phase = self.current
         if phase is not None:
-            self.index += 1
+            self.index += max(1, len(self.robot_run()))
         return phase
 
     def record_tamp_plan(self, index: int, plan_out: dict) -> None:
-        """Note the task plan cuTAMP actually found for a robot phase, once it has run."""
+        """Note the task plan cuTAMP actually found, against every phase this leg carried out.
+
+        One skeleton can cover several phases (robot_run), so each of them records it, and any phase
+        sharing a skeleton also records which ones it was planned with -- otherwise hitl.json reads
+        as though each phase had been solved on its own.
+        """
         skeleton = (plan_out or {}).get("plan_skeleton") or []
-        self.tamp_plans[index] = {
+        covered = [index]
+        if index == self.index:
+            covered = [index + offset for offset in range(max(1, len(self.robot_run())))]
+        record = {
             "cutamp_skeleton": [op.name for op in skeleton],
             "cutamp_skeleton_reused": bool((plan_out or {}).get("reused")),
         }
+        if len(covered) > 1:
+            record["cutamp_skeleton_covers_phases"] = covered
+        for i in covered:
+            self.tamp_plans[i] = dict(record)
 
     def phase_record(self, index: int) -> dict:
         """One phase, with exactly what was handed to whoever carried it out."""

@@ -193,9 +193,14 @@ _reuse_plan_skeleton = None
 # the merge sorts legs by their camera record_start, which needs no agreement between processes.
 _trajectory_id: str | None = None
 
-# True once the CURRENT trajectory has been handed off at least once, i.e. it spans several legs.
-# Such a trajectory is post-processed by collect/merge_trajectory.py after the legs are joined;
-# exporting the final leg on its own here would export a fragment of the episode.
+# True once the CURRENT trajectory is known to span several legs. Such a trajectory is post-processed
+# by collect/merge_trajectory.py after the legs are joined; exporting the final leg on its own here
+# would export a fragment of the episode.
+#
+# Set from TWO places, despite the name: _run_teleop_handoff, and the robot->robot continuation at
+# the end of the rollout loop -- a human-in-the-loop plan whose next phase is another ROBOT phase
+# spans several legs without teleop ever being involved. Grepping for _run_teleop_handoff alone will
+# tell you this cannot be true on a robot-only trajectory, and that is wrong.
 _trajectory_handed_off = False
 
 # True only while the driver is blocked in input() at a stdin prompt. There, no rollout checkpoint
@@ -966,11 +971,35 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
             # rearranged, and asked the human to redo the phase they had just finished.
             missing = sorted(session.objects_named() - set(object_names) - {table_name})
             if missing:
-                mapping = match_drifted_names(missing, sorted(set(object_names) - session.objects_named()))
+                # Candidates are this pass's labels that the plan does not ALREADY own. Subtracting
+                # all_names rather than objects_named(): a name only the COMPLETED phases used is
+                # still a plan object, and offering it as a re-binding target lets one spec object
+                # be folded into another -- SceneTypes.rebind merges them inside a frozenset, and
+                # the leg then aims at the thing the robot has already put away. Nothing downstream
+                # re-validates, so this is the only place to refuse it.
+                pool = sorted(set(object_names) - set(session.spec.scene_types.all_names))
+                mapping = match_drifted_names(missing, pool)
+                if mapping is None:
+                    # Not every drifted name has to be re-bindable for THIS leg to run. `missing`
+                    # spans every phase still to come, so a plan ending in "cover the bowls with the
+                    # cloth" gates the robot's next pick-and-place on the cloth -- an object no robot
+                    # phase names, and one a single missed detection is enough to lose. Try again
+                    # over just what this leg needs; anything else can drift until the phase that
+                    # actually names it comes round.
+                    needed = sorted(set(missing) & session.objects_needed_now())
+                    if needed != missing:
+                        mapping = match_drifted_names(needed, pool)
+                        if mapping is not None:
+                            unbound = ", ".join(sorted(set(missing) - set(mapping)))
+                            _log.warning(
+                                f"HITL: carrying on without re-binding {unbound} -- not needed by the "
+                                f"phase about to run. A later phase naming them will fail if they are "
+                                f"still undetected then"
+                            )
                 if mapping is None:
                     _hitl_reset_session(f"perception no longer detects {', '.join(missing)}")
                     session = None
-                else:
+                elif mapping:
                     session.rebind(mapping)
         if session is None:
             try:
@@ -1007,6 +1036,14 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
             # entirely (see the `human` branch before run_planning).
             state["human"] = phase
             return [], set(session.spec.scene_types.surfaces)
+        run = session.robot_run()
+        if len(run) > 1:
+            # Worth saying out loud: the operator sees ONE plan cover several of the phases the
+            # proposal stage just listed, and the arm runs them without stopping in between.
+            _log.info(
+                f"HITL: planning {len(run)} consecutive robot phases as a single cuTAMP goal -- "
+                + "; ".join(p.description for p in run)
+            )
         return session.goal_dicts(), set(session.spec.scene_types.surfaces)
 
     return resolve
@@ -1733,6 +1770,19 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # has closed itself out.
                 handoff_pending = False
 
+                # Set when this rollout finished a HITL robot leg and the plan's NEXT phase is STILL
+                # the robot's, so the loop carries straight on with it instead of closing the
+                # trajectory out. Consecutive robot phases are normally coalesced into this leg's
+                # single goal (HITLSession.robot_run), so what reaches here is the case that cannot
+                # be: a phase moving an object this leg already moved, which one cuTAMP plan cannot
+                # express (Pick deletes HasNotPickedUp).
+                #
+                # Deliberately NOT handoff_pending: that flag means "a human is taking the arm", and
+                # the branch it drives releases the robot connection and every camera and then blocks
+                # on stdin for a 'resume' nobody was asked to send. This continuation hands nothing
+                # over.
+                next_robot_phase = False
+
                 # Filled in by the HITL goal resolver during perception (empty when HITL is off):
                 # "session" is the task's plan, "human" the phase to hand over when the plan's next
                 # phase is a person's rather than robot work.
@@ -2018,6 +2068,12 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             hitl_session.advance()
                             nxt = hitl_session.current
                             human_phase = nxt if (nxt is not None and nxt.is_human) else None
+                            # ... and if the next phase is STILL the robot's -- a phase advance()
+                            # could not fold into this leg's goal -- this leg is not the end of
+                            # anything either: the loop carries on with it below. False when nxt is
+                            # None, so the last phase of an all-robot plan still falls through to
+                            # the label prompt and still ends the session.
+                            next_robot_phase = nxt is not None and not nxt.is_human
                         hitl_state["human"] = human_phase
                         if human_phase is not None:
                             handoff_pending = True
@@ -2025,12 +2081,23 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         if human_phase is None and hitl_session.finished:
                             _hitl_reset_session("every phase of the task is done")
 
-                    if execute_plan and handoff_pending:
-                        # Hand-off: the episode is already written (unlabeled, in eval/) but the
-                        # plan is only part-executed, so there is nothing to rate yet -- and the
-                        # label prompt would block the hand-off the operator is waiting on. Post-
-                        # processing is skipped for the same reason: this is not a finished rollout.
-                        _log.info(f"Teleop hand-off: leaving the partial rollout unlabeled in {save_dir}")
+                    if execute_plan and (handoff_pending or next_robot_phase):
+                        # Neither of these is a finished task attempt, so neither is labeled here:
+                        # the label is what ENDS a trajectory and merges its legs, and rating a leg
+                        # that is only part of the work would end it early. Post-processing is
+                        # skipped for the same reason -- this directory is one leg, and exporting it
+                        # alone would produce a fragment.
+                        #
+                        #   handoff_pending  -- the arm is about to go to a human, and the label
+                        #                       prompt would block the hand-off they are waiting on.
+                        #   next_robot_phase -- the HITL plan's next phase is the robot's too, so
+                        #                       the loop replans and executes it below.
+                        _log.info(
+                            f"HITL: robot phase done and another robot phase follows; leaving this "
+                            f"leg unlabeled in {save_dir}"
+                            if next_robot_phase
+                            else f"Teleop hand-off: leaving the partial rollout unlabeled in {save_dir}"
+                        )
                     elif execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp, container.enable_recording)
                         # Post-process this rollout (gifs + LeRobot export) in the background so
@@ -2105,6 +2172,47 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         finished = _run_teleop_handoff(container, can_finish=True)
                     if finished:
                         _label_rollout(save_dir, output_dir, timestamp, container.enable_recording)
+                    continue
+
+                # The HITL plan's next phase is the robot's too. A sibling `if`, not an `elif`: the
+                # branch above always `continue`s, and the two are different kinds of continuation --
+                # that one waits on a person, this one just goes round again. Nothing is handed over,
+                # so _run_teleop_handoff is deliberately NOT called: it would release the robot
+                # connection and every camera and then block on stdin for a resume nobody sent.
+                #
+                # Placed AFTER the rollout's own try/finally so a leg that threw arms nothing: the
+                # next rollout then mints a fresh trajectory id, HITLSession.matches() fails, and the
+                # half-walked plan is correctly dropped rather than resumed against a stale scene.
+                if next_robot_phase:
+                    # Re-enter the loop without prompting the operator -- and so without emitting
+                    # `awaiting_task`, the one state in which the data-collection server would let
+                    # someone home the arm or start another rollout midway through this trajectory.
+                    # task_instruction, not _LAST_TASK: this is the exact string HITLSession.matches()
+                    # compares against, and a nudge ('home'/'open') never reaches here anyway.
+                    _pending_instruction = task_instruction
+                    # Same trajectory, so the id survives (see the guard at the top of the loop) and
+                    # the session is still recognised as the plan we are midway through.
+                    _continue_trajectory = True
+                    # Several legs, so the export waits for collect/merge_trajectory.py rather than
+                    # exporting this one on its own -- which would be a fragment of the attempt.
+                    _trajectory_handed_off = True
+                    # _skip_episode_reset is deliberately NOT set: the robot holds nothing after a
+                    # Place, and the next phase wants its ordinary reset (home + gripper open + the
+                    # capture pose). That also leaves reuse_skeleton unset for the next rollout,
+                    # which is right -- the next phase has a different goal, and a stale skeleton is
+                    # accepted whenever the new goal is a subset of what it already achieves, so the
+                    # arm would silently repeat the chunk it has just done.
+                    _emit_event({
+                        "event": "hitl_phase_complete",
+                        "trajectory_id": _trajectory_id,
+                        "dir": str(save_dir),
+                        "phase_index": hitl_session.index,
+                        "n_phases": len(hitl_session.phases),
+                        "message": (
+                            f"HITL phase {hitl_session.index} of {len(hitl_session.phases)} done; "
+                            f"the robot carries on with the next one in the same trajectory"
+                        ),
+                    })
                     continue
             except UserExitException:
                 _log.info("User requested exit")
