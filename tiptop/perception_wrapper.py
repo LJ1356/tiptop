@@ -157,6 +157,10 @@ async def predict_depth_and_grasps(
         scene_xyz=xyz_downsampled,
         scene_rgb=rgb_downsampled,
         apply_bounds=cfg.perception.m2t2.apply_bounds,
+        # Read from config rather than left at generate_grasps' default, so cfg/tamp can retune how
+        # many candidates each object gets. See motion_planning._PERCEPTION_OVERRIDE_KEYS.
+        grasp_threshold=cfg.perception.m2t2.get("grasp_threshold", 0.035),
+        num_runs=cfg.perception.m2t2.get("num_runs", 5),
     )
 
     return {

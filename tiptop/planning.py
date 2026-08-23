@@ -54,9 +54,12 @@ def build_tamp_config(
     enable_visualizer: bool = False,
     traj_length_norm: float = 2.0,
     grasp_orientation_cost: bool = False,
+    grasp_center_cost: bool = False,
     arm_mode: str = "single",
     dual_task: str = "parallel",
     max_motion_refine_attempts: int | None = 32,
+    transit_apex_height: float = 0.0,
+    transit_apex_min_dist: float = 0.10,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
@@ -99,6 +102,15 @@ def build_tamp_config(
         # Gate for the grasp orientation-change soft cost (weight set in run_planning). Enabled from
         # cfg/tamp when `grasp_pose_change_weight` is present; see resolve_grasp_orientation_cost.
         grasp_orientation_cost=grasp_orientation_cost,
+        # Gate for the off-center grasp soft cost (weight set in run_planning). Enabled from cfg/tamp
+        # when `grasp_center_weight` is present; see resolve_grasp_center_cost.
+        grasp_center_cost=grasp_center_cost,
+        # Explicit apex waypoint in each Pick/Place free-space transit: planned as
+        # retract -> apex -> pre-grasp so the end-effector lifts, traverses and descends instead of
+        # sweeping low across the table. Off (0.0) unless a cfg/tamp yml sets `transit_apex_height`
+        # in tamp_overrides; see resolve_transit_apex and cuTAMP's TAMPConfiguration.
+        transit_apex_height=transit_apex_height,
+        transit_apex_min_dist=transit_apex_min_dist,
     )
 
 
@@ -138,10 +150,26 @@ def run_planning(
     # initial EE orientation, steering the planner toward grasps that reorient the wrist least. Absent
     # / zero -> the multiplier is never set, so the reducer drops the (still-cheap) computed value and
     # cuTAMP behavior is unchanged. Assigned as a fresh dict so we don't mutate the shared default.
+    # `grasp_center_weight` works the same way for the off-center grasp cost: grasp_center_offset is
+    # the horizontal distance in METERS from the object's centroid to the grasp TCP, so it needs a much
+    # larger weight than grasp_rot_change (radians, <= pi) to matter. 20-50 is a starting range, not a
+    # calibration: measured over saved runs the candidate grasps on one object span roughly 3-5 cm, so
+    # w=30 separates them by ~1 cost unit, the order traj_length varies over. What settles it is one
+    # real run -- the per-term weighted values in `best_cost_breakdown`
+    # (<exp_dir>/optimization/opt_*.json). An order of magnitude below the other terms means raise it;
+    # the largest term means lower it. Note the charge is raw meters, so one weight is a tiebreaker on
+    # a small object and decisive on a large one.
+    grasp_weights = {}
     grasp_weight = (cost_overrides or {}).get("grasp_pose_change_weight")
     if grasp_weight:
-        constraint_to_mult[GraspCost.type] = {"grasp_rot_change": float(grasp_weight)}
-        _log.info(f"Grasp orientation-change cost active: grasp_rot_change weight={float(grasp_weight)}")
+        grasp_weights["grasp_rot_change"] = float(grasp_weight)
+    center_weight = (cost_overrides or {}).get("grasp_center_weight")
+    if center_weight:
+        grasp_weights["grasp_center_offset"] = float(center_weight)
+    if grasp_weights:
+        # Fresh dict: default_constraint_to_mult.copy() is shallow, so mutating the inner dict leaks.
+        constraint_to_mult[GraspCost.type] = grasp_weights
+        _log.info("Grasp soft costs active: " + ", ".join(f"{k} weight={v}" for k, v in grasp_weights.items()))
     cost_reducer = CostReducer(constraint_to_mult)
     constraint_checker = ConstraintChecker(constraint_to_tol)
 

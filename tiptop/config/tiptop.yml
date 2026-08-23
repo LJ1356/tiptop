@@ -75,6 +75,17 @@ perception:
     # at their own M2T2 server; defaults to 8123 (single-instance / full_eval). See datagen launcher.
     url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
     apply_bounds: true
+    # Confidence floor M2T2 applies when emitting grasps (its `mask_thresh`). 0.035 is M2T2's own
+    # default and what tiptop used before this was configurable. Lowering it yields several times
+    # more candidates per object -- which is what gives cuTAMP's grasp costs something to choose
+    # between -- at the price of admitting grasps M2T2 is less confident in. Settable per data-gen
+    # config via `grasp_threshold` in cfg/tamp tamp_overrides.
+    grasp_threshold: 0.035
+    # How many stochastic M2T2 passes are pooled into one grasp set. 5 is M2T2's own default. This
+    # is the strongest lever on how many candidates each object gets and, unlike grasp_threshold, it
+    # is quality-neutral -- more samples of the same distribution, not a lower bar. Costs linear
+    # wall-clock (~0.9 s at 5, ~3.2 s at 20). Settable per data-gen config via `m2t2_num_runs`.
+    num_runs: 5
 
   sam:
     mode: "local"

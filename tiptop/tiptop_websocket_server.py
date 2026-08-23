@@ -33,10 +33,13 @@ from tiptop.config import tiptop_cfg
 from tiptop.goal_clearing import resolve_clear_goal_surfaces
 from tiptop.motion_planning import (
     build_curobo_solvers,
+    apply_perception_overrides,
+    resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
     resolve_time_dilation_factor,
     resolve_traj_length_norm,
+    resolve_transit_apex,
     resolve_trace_cfg,
 )
 from tiptop.perception.cameras import Frame
@@ -98,6 +101,10 @@ class TiptopPlanningServer:
         # cuRobo cost/tamp-parameter overrides (empty by default -> stock gradient_trajopt.yml +
         # tiptop.yml behavior). Applied at solver build time so every plan uses these tamp params.
         self._curobo_overrides = _load_curobo_overrides(curobo_overrides)
+        # Perception knobs travel in the same dict; applied before any perception so the grasp
+        # candidates cuTAMP receives reflect them. See apply_perception_overrides.
+        for _key, (_old, _new) in apply_perception_overrides(self._cfg, self._curobo_overrides).items():
+            _log.info(f"Perception override: {_key} {_old} -> {_new}")
         time_dilation_factor = resolve_time_dilation_factor(
             self._curobo_overrides, self._cfg.robot.time_dilation_factor
         )
@@ -118,6 +125,9 @@ class TiptopPlanningServer:
         self._ik_solver: IKSolver | None = None
         self._motion_gen: MotionGen | None = None
         self._initial_world_cfg: WorldConfig | None = None
+        _apex_height, _apex_min_dist = resolve_transit_apex(self._curobo_overrides)
+        if _apex_height > 0:
+            _log.info(f"Transit apex active: {_apex_height}m (min transit distance {_apex_min_dist}m)")
         self._config = build_tamp_config(
             num_particles=num_particles,
             max_planning_time=max_planning_time,
@@ -126,11 +136,16 @@ class TiptopPlanningServer:
             time_dilation_factor=time_dilation_factor,
             traj_length_norm=resolve_traj_length_norm(self._curobo_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(self._curobo_overrides),
+            grasp_center_cost=resolve_grasp_center_cost(self._curobo_overrides),
             # Only meaningful for robot_type == "bimanual_yam_dual" (see tiptop_yam_dual.yml); every
             # other config leaves robot.arm_mode/dual_task unset and gets cuTAMP's single-arm defaults.
             arm_mode=self._cfg.robot.get("arm_mode", "single"),
             dual_task=self._cfg.robot.get("dual_task", "parallel"),
             max_motion_refine_attempts=resolve_max_motion_refine_attempts(self._curobo_overrides),
+            # Apex waypoint in each Pick/Place transit (0 = off), a TAMP-config knob like
+            # traj_length_norm rather than a cuRobo cost weight. See resolve_transit_apex.
+            transit_apex_height=_apex_height,
+            transit_apex_min_dist=_apex_min_dist,
         )
         self._output_dir = Path("tiptop_server_outputs")
         # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2

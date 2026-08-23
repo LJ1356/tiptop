@@ -52,11 +52,14 @@ from tiptop.motion_planning import (
     go_to_capture,
     go_to_dual_home,
     go_to_home,
+    apply_perception_overrides,
+    resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
     resolve_time_dilation_factor,
     resolve_trace_cfg,
     resolve_traj_length_norm,
+    resolve_transit_apex,
     summarize_curobo_config,
 )
 from tiptop.perception.cameras import (
@@ -2422,6 +2425,11 @@ def _sync_entrypoint(
         )
     _log.info(f"Solver effort: num_particles={num_particles}, opt_steps_per_skeleton={opt_steps_per_skeleton}")
     cfg = tiptop_cfg()
+    # Perception knobs from the same tamp_overrides dict. Applied HERE -- before the entrypoint runs
+    # any perception -- because they change the grasp candidates cuTAMP is given, and no downstream
+    # cost can select a grasp perception never handed over. See apply_perception_overrides.
+    for _key, (_old, _new) in apply_perception_overrides(cfg, cost_overrides).items():
+        _log.info(f"Perception override: {_key} {_old} -> {_new}")
     # time_dilation_factor[_literal] is a plan-time knob (not a cuRobo cost weight), so it is NOT
     # handled by build_curobo_solvers/apply_cost_overrides — resolve it here and thread it into the
     # TAMP config, mirroring tiptop_websocket_server. Without this, cfg/tamp/{tdf,vae_tdf}.yml's
@@ -2439,6 +2447,9 @@ def _sync_entrypoint(
     # every other robot yields a single entry, identical to before. `arm_mode`/`dual_task` only
     # apply to the `bimanual_yam_dual` embodiment (_planning_robot_types() yields exactly one entry
     # for it), and default to cuTAMP's own single-arm defaults everywhere else.
+    apex_height, apex_min_dist = resolve_transit_apex(cost_overrides)
+    if apex_height > 0:
+        _log.info(f"Transit apex active: {apex_height}m (min transit distance {apex_min_dist}m)")
     tamp_configs = {
         robot_type: build_tamp_config(
             num_particles=num_particles,
@@ -2452,9 +2463,14 @@ def _sync_entrypoint(
             # time_dilation_factor this is a TAMP-config knob, not a cuRobo cost weight.
             traj_length_norm=resolve_traj_length_norm(cost_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(cost_overrides),
+            grasp_center_cost=resolve_grasp_center_cost(cost_overrides),
             arm_mode=cfg.robot.get("arm_mode", "single"),
             dual_task=cfg.robot.get("dual_task", "parallel"),
             max_motion_refine_attempts=resolve_max_motion_refine_attempts(cost_overrides),
+            # Apex waypoint in each Pick/Place transit (0 = off); a TAMP-config knob, not a
+            # cuRobo cost weight. See resolve_transit_apex.
+            transit_apex_height=apex_height,
+            transit_apex_min_dist=apex_min_dist,
         )
         for robot_type in _planning_robot_types()
     }
