@@ -368,6 +368,8 @@ def resolve_posture_selection(overrides: dict | None) -> dict:
         return out
     if ov.get("posture_ref") is not None:
         out["posture_ref"] = str(ov["posture_ref"])
+    if ov.get("posture_grasp_roll") is not None:
+        out["posture_grasp_roll"] = bool(ov["posture_grasp_roll"])
     for tol in ("posture_pos_tol", "posture_rot_tol"):
         if ov.get(tol) is not None:
             out[tol] = float(ov[tol])
