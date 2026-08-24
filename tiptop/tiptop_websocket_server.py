@@ -31,12 +31,14 @@ from curobo.wrap.reacher.motion_gen import MotionGen
 
 from tiptop.config import tiptop_cfg
 from tiptop.goal_clearing import resolve_clear_goal_surfaces
+from cutamp.posture_prior import posture_ref_summary
 from tiptop.motion_planning import (
     build_curobo_solvers,
     apply_perception_overrides,
     resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
+    resolve_posture_selection,
     resolve_time_dilation_factor,
     resolve_traj_length_norm,
     resolve_transit_apex,
@@ -128,6 +130,13 @@ class TiptopPlanningServer:
         _apex_height, _apex_min_dist = resolve_transit_apex(self._curobo_overrides)
         if _apex_height > 0:
             _log.info(f"Transit apex active: {_apex_height}m (min transit distance {_apex_min_dist}m)")
+        _posture_selection = resolve_posture_selection(self._curobo_overrides)
+        if _posture_selection.get("posture_selection_seeds", 0) > 1:
+            _log.info(
+                "Teleop-posture IK branch selection active: %s seeds | prior: %s",
+                _posture_selection["posture_selection_seeds"],
+                posture_ref_summary(_posture_selection.get("posture_ref")),
+            )
         self._config = build_tamp_config(
             num_particles=num_particles,
             max_planning_time=max_planning_time,
@@ -146,6 +155,9 @@ class TiptopPlanningServer:
             # traj_length_norm rather than a cuRobo cost weight. See resolve_transit_apex.
             transit_apex_height=_apex_height,
             transit_apex_min_dist=_apex_min_dist,
+            # IK branch selection by teleop posture (off unless the cfg sets
+            # posture_selection_seeds). See resolve_posture_selection.
+            posture_selection=_posture_selection,
         )
         self._output_dir = Path("tiptop_server_outputs")
         # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2

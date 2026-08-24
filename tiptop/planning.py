@@ -60,6 +60,7 @@ def build_tamp_config(
     max_motion_refine_attempts: int | None = 32,
     transit_apex_height: float = 0.0,
     transit_apex_min_dist: float = 0.10,
+    posture_selection: dict | None = None,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
@@ -111,6 +112,11 @@ def build_tamp_config(
         # in tamp_overrides; see resolve_transit_apex and cuTAMP's TAMPConfiguration.
         transit_apex_height=transit_apex_height,
         transit_apex_min_dist=transit_apex_min_dist,
+        # Teleop-posture IK branch selection: solve each endpoint's IK with return_seeds=k and keep
+        # the branch whose q1 - q3 (the FR3 shoulder null-space coordinate) best fits this lab's
+        # teleop band, instead of cuRobo's top seed. Off unless a cfg/tamp yml sets
+        # `posture_selection_seeds`; see resolve_posture_selection and cuTAMP's TAMPConfiguration.
+        **(posture_selection or {}),
     )
 
 

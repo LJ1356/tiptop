@@ -39,27 +39,36 @@ from tiptop.workspace import workspace_cuboids
 _log = logging.getLogger(__name__)
 
 
-def get_ik_solver(world_cfg: WorldConfig, num_particles: int, warmup_iters: int = 8):
-    """Get the IKSolver and warm it up."""
+def get_ik_solver(
+    world_cfg: WorldConfig, num_particles: int, warmup_iters: int = 8, num_seeds: int | None = None
+):
+    """Get the IKSolver and warm it up.
+
+    ``num_seeds`` overrides how many seeds cuRobo optimizes per IK problem (its own per-robot
+    default otherwise). Configs that turn on teleop-posture branch selection need it raised, since
+    ``return_seeds`` cannot exceed it and branch diversity thins as the two converge -- see
+    ``resolve_ik_num_seeds``.
+    """
     if warmup_iters < 0:
         raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
+    seed_kw = {} if num_seeds is None else {"num_seeds": num_seeds}
 
     cfg = tiptop_cfg()
     with patch_log_level("curobo", logging.ERROR):
         if cfg.robot.type == "fr3_robotiq":
-            ik_solver = get_fr3_robotiq_ik_solver(world_cfg)
+            ik_solver = get_fr3_robotiq_ik_solver(world_cfg, **seed_kw)
             container = load_fr3_robotiq_container(TensorDeviceType())
         elif cfg.robot.type == "fr3":
-            ik_solver = get_fr3_franka_ik_solver(world_cfg)
+            ik_solver = get_fr3_franka_ik_solver(world_cfg, **seed_kw)
             container = load_fr3_robotiq_container(TensorDeviceType())
         elif cfg.robot.type == "panda_robotiq":
-            ik_solver = get_panda_robotiq_ik_solver(world_cfg)
+            ik_solver = get_panda_robotiq_ik_solver(world_cfg, **seed_kw)
             container = load_panda_robotiq_container(TensorDeviceType())
         elif cfg.robot.type == "panda":
-            ik_solver = get_franka_ik_solver(world_cfg)
+            ik_solver = get_franka_ik_solver(world_cfg, **seed_kw)
             container = load_panda_container(TensorDeviceType())
         elif cfg.robot.type == "ur5":
-            ik_solver = get_ur5_ik_solver(world_cfg)
+            ik_solver = get_ur5_ik_solver(world_cfg, **seed_kw)
             container = load_ur5_container(TensorDeviceType())
         elif cfg.robot.type in YAM_ROBOT_TYPES:
             # The bimanual YAM is registered once per arm; the suffix picks which arm plans and
@@ -332,6 +341,58 @@ def resolve_transit_apex(overrides: dict | None) -> tuple[float, float]:
     return height, min_dist
 
 
+def resolve_posture_selection(overrides: dict | None) -> dict:
+    """Teleop-posture IK branch selection, from cfg/tamp ``tamp_overrides``.
+
+    Every plan endpoint comes from ``ik_solver.solve_batch(..., seed_config=None)`` with cuRobo's
+    default ``return_seeds=1``, and cuRobo ranks its seeds by ``pose_error + null_space_error`` with
+    ``null_space_cfg.weight`` at 0.001 against a generic home retract -- so the redundant arm's
+    branch is picked by pose error alone, independently at every endpoint. That between-endpoint
+    scatter is 80-90% of why TAMP visits joint configurations teleoperation never does, and being
+    between-segment it is exactly the part no cuRobo trajopt cost can reach with pinned endpoints
+    (which is why ``joint_density_weight`` never moved it).
+
+    ``posture_selection_seeds: k`` makes each endpoint's IK return k branches and keeps the one with
+    the lowest posture penalty. The penalty itself is fully data-derived and has nothing to tune:
+    cuTAMP's baked ``posture_ref.npz`` holds a per-joint-pair human band (5-95 of q_i - q_j over
+    DROID) weighted by how much that pair's direction lies in the Jacobian null space, so pairs that
+    would fight the pose goal contribute ~nothing. Re-bake it with
+    ``cutamp/scripts/bake_posture_ref.py`` for a different robot or corpus.
+
+    ``posture_ref`` optionally points at a different baked file. 0 or 1 (the default) is off.
+    """
+    ov = overrides or {}
+    seeds = int(ov.get("posture_selection_seeds") or 0)
+    out: dict = {"posture_selection_seeds": seeds}
+    if seeds <= 1:
+        return out
+    if ov.get("posture_ref") is not None:
+        out["posture_ref"] = str(ov["posture_ref"])
+    for tol in ("posture_pos_tol", "posture_rot_tol"):
+        if ov.get(tol) is not None:
+            out[tol] = float(ov[tol])
+    return out
+
+
+def resolve_ik_num_seeds(overrides: dict | None) -> int | None:
+    """How many seeds the IKSolver optimizes per problem.
+
+    cuRobo's ``return_seeds`` cannot exceed the solver's ``num_seeds``, and branch diversity dries
+    up as the two converge, so a config that turns on posture selection needs headroom. Measured at
+    512 particles: num_seeds 24 / return_seeds 8 costs 31.7 ms per solve against 38.9 ms for the
+    stock 12 / 1, i.e. the extra seeds are free at the batch sizes cuTAMP actually uses.
+
+    Returns None when posture selection is off, so every robot keeps its own factory default
+    (12 for the Franka/UR5 solvers, 24 for the bimanual YAM) and this change is a no-op for every
+    existing config.
+    """
+    ov = overrides or {}
+    if ov.get("ik_num_seeds") is not None:
+        return int(ov["ik_num_seeds"])
+    seeds = int(ov.get("posture_selection_seeds") or 0)
+    return max(12, 3 * seeds) if seeds > 1 else None
+
+
 def resolve_max_motion_refine_attempts(overrides: dict | None, default: int | None = 32) -> int | None:
     """Effective cap on how many satisfying particles cuTAMP tries motion refinement on.
 
@@ -501,6 +562,10 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             # the record shows the guard distance a config that set only the height actually got.
             "transit_apex_height": resolve_transit_apex(ov)[0],
             "transit_apex_min_dist": resolve_transit_apex(ov)[1],
+            # Teleop-posture IK branch selection (cuTAMP-side endpoint choice, not a cuRobo cost) --
+            # resolved rather than echoed so the record shows the band/seed count actually used.
+            **resolve_posture_selection(ov),
+            "ik_num_seeds": resolve_ik_num_seeds(ov),
         },
         "plan_overrides": {"enable_finetune_trajopt": False, "time_dilation_factor": time_dilation_factor},
     }
@@ -649,7 +714,9 @@ def build_curobo_solvers(
         Cuboid(name="table", dims=[0.01, 0.01, 0.01], pose=[99.9, 99.9, 99.9, 1.0, 0.0, 0.0, 0.0]),
     ]
     world_cfg = WorldConfig(cuboid=cuboids)
-    ik_solver = get_ik_solver(world_cfg, num_particles)
+    # Extra IK seeds when a config turns on teleop-posture branch selection: return_seeds cannot
+    # exceed num_seeds and branch diversity thins as they converge. See resolve_ik_num_seeds.
+    ik_solver = get_ik_solver(world_cfg, num_particles, num_seeds=resolve_ik_num_seeds(cost_overrides))
     # use_cuda_graph=False: MotionGen is built with a minimal world (1 placeholder cuboid when
     # include_workspace=False), so update_world() must be able to GROW the collision cache when
     # the real scene (table + surfaces + movables) is loaded. CUDA graphs pin the cache size

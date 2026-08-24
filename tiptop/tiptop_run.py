@@ -56,12 +56,14 @@ from tiptop.motion_planning import (
     resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
+    resolve_posture_selection,
     resolve_time_dilation_factor,
     resolve_trace_cfg,
     resolve_traj_length_norm,
     resolve_transit_apex,
     summarize_curobo_config,
 )
+from cutamp.posture_prior import posture_ref_summary
 from tiptop.perception.cameras import (
     Camera,
     DepthEstimator,
@@ -2450,6 +2452,13 @@ def _sync_entrypoint(
     apex_height, apex_min_dist = resolve_transit_apex(cost_overrides)
     if apex_height > 0:
         _log.info(f"Transit apex active: {apex_height}m (min transit distance {apex_min_dist}m)")
+    posture_selection = resolve_posture_selection(cost_overrides)
+    if posture_selection.get("posture_selection_seeds", 0) > 1:
+        _log.info(
+            "Teleop-posture IK branch selection active: %s seeds | prior: %s",
+            posture_selection["posture_selection_seeds"],
+            posture_ref_summary(posture_selection.get("posture_ref")),
+        )
     tamp_configs = {
         robot_type: build_tamp_config(
             num_particles=num_particles,
@@ -2471,6 +2480,9 @@ def _sync_entrypoint(
             # cuRobo cost weight. See resolve_transit_apex.
             transit_apex_height=apex_height,
             transit_apex_min_dist=apex_min_dist,
+            # IK branch selection by teleop posture (off unless the cfg sets
+            # posture_selection_seeds). See resolve_posture_selection.
+            posture_selection=posture_selection,
         )
         for robot_type in _planning_robot_types()
     }
