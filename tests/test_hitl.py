@@ -7,6 +7,7 @@ with the JSON directly. The running example is the task that forced the phase mo
 
 import asyncio
 import json
+import re
 from unittest import mock
 
 import pytest
@@ -15,15 +16,26 @@ from tiptop.hitl import grounding, llm
 from tiptop.hitl.config import HITLConfig, load_hitl_config, resolve_hitl_config
 from tiptop.hitl.grounding import Verdict
 from tiptop.hitl.planning import (
+    ObjectGeometry,
+    bind_deferred_object,
+    bind_deferred_objects,
     match_drifted_names,
     check_robot_phases,
     goal_atoms_to_dicts,
     initial_state_for,
+    objects_resting_on,
     unachievable_atoms,
 )
+from tiptop.hitl.prompts import plan_prompt
 from tiptop.hitl.proposal import parse_plan_response
 from tiptop.hitl.session import HITLSession, handoff_message
-from tiptop.hitl.structs import HITLProposalError, describe_atom, display_atom, display_name
+from tiptop.hitl.structs import (
+    DeferredObject,
+    HITLProposalError,
+    describe_atom,
+    display_atom,
+    display_name,
+)
 
 OBJECTS = ["blue_toy", "white_box"]
 TABLE = "table"
@@ -247,6 +259,33 @@ def _session(spec=None, trajectory_id="traj-1"):
         spec=spec,
         initial_state=initial_state_for(spec.scene_types),
     )
+
+
+def test_only_the_last_leg_of_a_task_ends_by_driving_the_arm_home():
+    # cuTAMP ends every plan at q_home. That is right for a plan that IS the episode and wrong for a
+    # leg of one: the bug this guards had the arm drive home after the robot phase of
+    # "place the bread on the plate, then open the box and place the bread in the box" -- a return to
+    # home recorded into the middle of the demonstration, with the human then handed an arm parked at
+    # home rather than where the plan stopped. is_last_leg is what tiptop_run passes to run_planning
+    # as return_home.
+    session = _session()  # robot, human, robot
+    assert not session.is_last_leg(), "two phases still follow this one"
+    session.advance()
+    assert not session.is_last_leg(), "the human phase is followed by a robot one"
+    session.advance()
+    assert session.is_last_leg(), "the final robot phase parks the arm"
+    session.advance()
+    assert session.finished and session.is_last_leg(), "a finished session answers conservatively"
+
+
+def test_the_last_leg_is_the_whole_run_of_robot_phases_it_covers():
+    # A leg can cover several phases (robot_run), so "is this the last phase" is the wrong question:
+    # the run below covers phases 0 and 1 of 3, and only the leg after it ends the task.
+    session = _sort_session()  # robot, robot, human
+    assert len(session.robot_run()) == 2
+    assert not session.is_last_leg(), "the human phase still follows the pair"
+    session.advance()
+    assert session.index == 2 and session.is_last_leg()
 
 
 def test_the_session_walks_the_phases_in_order():
@@ -579,3 +618,413 @@ def test_the_shipped_hitl_configs_resolve():
     assert shipped, "at least one shipped config should carry an hitl block"
     for path in shipped:
         assert resolve_hitl_config(yaml.safe_load(path.read_text())["hitl"]).enabled, path.name
+
+
+# --- Deferred objects: naming something a human phase has yet to create ---------------------------
+#
+# The task that forced these: "remove a block from the jenga tower using the screwdriver onto the
+# white paper, and then place the block on top of the jenga tower". At plan time the loose block is
+# still a brick inside the tower, so no detected label refers to it -- and the proposer's only legal
+# move was to invent a predicate, which forces the phase to be a human one. The second clause is a
+# plain pick-and-place, so it was teleoperated when the robot should have done it.
+
+# Straight out of the run this was written for -- runs/.../eval/2026-08-17_15-20-59/scene_objects.json.
+# The loose block IS on the paper in the image and was NOT detected; `top_jenga_block` is the brick
+# still on top of the tower.
+JENGA_GEOMETRY = {
+    "jenga_tower": ObjectGeometry((0.5392619834, 0.0840336195, 0.0880103576), (0.0893346521, 0.0782887562, 0.1548677220)),
+    "screwdriver": ObjectGeometry((0.3708415167, 0.2350496005, -0.0070450752), (0.1020133699, 0.0353481902, 0.0269756437)),
+    "white_paper": ObjectGeometry((0.5365092176, -0.0787286520, -0.0139531689), (0.2941993016, 0.2041751835, 0.0075770352)),
+    "top_jenga_block": ObjectGeometry((0.5355900793, 0.0936445544, 0.1298197908), (0.0849671634, 0.0704825390, 0.0303186096)),
+}
+
+LOOSE_BLOCK = DeferredObject(name="loose_block", created_by_phase=0, anchor="white_paper")
+
+
+def test_the_towers_own_top_block_is_never_bound_to_the_loose_one():
+    # The whole point of binding on geometry. `top_jenga_block` is block-shaped, block-named, and
+    # wrong: it sits at the tower's y, 7cm outside the paper's footprint. Binding it would have the
+    # robot lift the tower's top block and place it back on the tower -- a no-op reported as success.
+    assert bind_deferred_object(LOOSE_BLOCK, JENGA_GEOMETRY, ["top_jenga_block"]) is None
+    # Not even when perception gives it the very name the plan is looking for.
+    geometry = {**JENGA_GEOMETRY, "loose_block": JENGA_GEOMETRY["top_jenga_block"]}
+    assert bind_deferred_object(LOOSE_BLOCK, geometry, ["loose_block"]) is None
+
+
+def test_a_block_that_really_is_on_the_paper_binds():
+    geometry = {**JENGA_GEOMETRY, "wooden_block": ObjectGeometry((0.55, -0.06, 0.0045), (0.075, 0.025, 0.015))}
+    assert bind_deferred_object(LOOSE_BLOCK, geometry, ["wooden_block"]) == "wooden_block"
+
+
+def test_two_candidates_on_the_anchor_refuse_to_bind():
+    # Same discipline as match_drifted_names: there is no safe way to guess which one was meant.
+    geometry = {
+        **JENGA_GEOMETRY,
+        "block_a": ObjectGeometry((0.55, -0.06, 0.0045), (0.075, 0.025, 0.015)),
+        "block_b": ObjectGeometry((0.50, -0.10, 0.0045), (0.075, 0.025, 0.015)),
+    }
+    assert bind_deferred_object(LOOSE_BLOCK, geometry, ["block_a", "block_b"]) is None
+
+
+def test_an_anchor_with_no_geometry_refuses_to_bind():
+    assert bind_deferred_object(LOOSE_BLOCK, {}, ["wooden_block"]) is None
+
+
+JENGA_OBJECTS = ["jenga_tower", "screwdriver", "white_paper"]
+
+# What the proposer should now answer for the jenga task. Before deferred objects existed it had no
+# name for the loose block, so it invented a predicate instead -- and an invented predicate forces a
+# human phase, so phase 1 was teleoperated.
+JENGA_PLAN = {
+    "new_objects": [
+        {
+            "name": "loose_block",
+            "created_by_phase": 0,
+            "description": "the single wooden block the human pushes out of the tower",
+        }
+    ],
+    "phases": [
+        {
+            "executor": "human",
+            "description": "push a block out of the tower onto the paper",
+            "instructions": "Use the screwdriver to push one block out of the jenga_tower and put it on the white_paper.",
+            "atoms": [{"predicate": "On", "args": ["loose_block", "white_paper"]}],
+        },
+        {
+            "executor": "robot",
+            "description": "put the block on top of the tower",
+            "atoms": [{"predicate": "On", "args": ["loose_block", "jenga_tower"]}],
+        },
+    ],
+}
+
+
+def _jenga(**changes):
+    return {**JENGA_PLAN, **changes}
+
+
+def parse_jenga(response=None):
+    return parse_plan_response(
+        response or JENGA_PLAN, "remove a block and put it on top", JENGA_OBJECTS, TABLE, 1
+    )
+
+
+def test_a_pick_and_place_of_a_not_yet_existing_object_stays_a_robot_phase():
+    # The bug this fixes: with no name to bind the loose block to, the proposer's only legal move was
+    # an invented predicate, which forces a human phase -- so a plain pick-and-place was teleoperated.
+    spec = parse_jenga()
+    assert [p.executor for p in spec.phases] == ["human", "robot"]
+    assert goal_atoms_to_dicts(spec.phases[1].atoms) == [
+        {"predicate": "on", "args": ["loose_block", "jenga_tower"]}
+    ]
+    assert not spec.invented, "nothing needs inventing once the object can be named"
+    # Typed like any other movable, so the phase validates and cuTAMP can be aimed at it...
+    assert "loose_block" in spec.scene_types.movables
+    assert check_robot_phases(spec, initial_state_for(spec.scene_types)) is None
+    # ...but held apart, because perception has not produced it yet.
+    assert spec.scene_types.deferred == frozenset({"loose_block"})
+    assert "loose_block" not in spec.scene_types.detected
+    deferred = spec.deferred[0]
+    assert (deferred.name, deferred.created_by_phase, deferred.anchor) == ("loose_block", 0, "white_paper")
+
+
+def test_the_first_leg_is_not_abandoned_because_the_new_object_is_not_detected_yet():
+    # The drift check runs before anything else and treats a name perception did not produce as a
+    # plan that can no longer be executed. An object a human phase has yet to create is missing on
+    # purpose, so counting it would re-plan the whole task on its very first leg.
+    session = _session(spec=parse_jenga())
+    assert "loose_block" not in session.objects_named()
+    assert "loose_block" not in session.objects_needed_now()
+    assert not (session.objects_named() - set(JENGA_OBJECTS) - {TABLE}), "nothing looks missing yet"
+
+
+def test_the_robot_leg_refuses_to_run_until_the_new_object_is_found():
+    session = _session(spec=parse_jenga())
+    session.advance()  # the human has done phase 0
+    assert session.unbound_needed_now() == ["loose_block"]
+    # Nothing on the paper: binding refuses, and the leg has no goal it could honestly plan.
+    session.bind_new_objects(JENGA_GEOMETRY, ["top_jenga_block"])
+    assert session.unbound_needed_now() == ["loose_block"]
+
+
+def test_once_the_block_is_on_the_paper_the_robot_leg_aims_at_it():
+    session = _session(spec=parse_jenga())
+    session.advance()
+    geometry = {**JENGA_GEOMETRY, "wooden_block": ObjectGeometry((0.55, -0.06, 0.0045), (0.075, 0.025, 0.015))}
+    session.bind_new_objects(geometry, [*JENGA_OBJECTS, "wooden_block"])
+    assert session.unbound_needed_now() == []
+    assert session.goal_dicts() == [{"predicate": "on", "args": ["wooden_block", "jenga_tower"]}]
+    # Bound means bound: it is an ordinary object now, so a later pass losing it IS a real problem.
+    assert "wooden_block" in session.objects_named()
+
+
+def test_the_humans_screwdriver_is_never_something_the_robot_picks_up():
+    # Observed on the rig, 9_pp_screwdriver_jenga: perception detects the screwdriver because the
+    # INSTRUCTION names it ("remove a block ... using the screwdriver"), every non-surface detection
+    # is a Movable, and so three of the four skeletons cuTAMP enumerated for "put the block back on
+    # the tower" opened with Pick(screwdriver) -- one of them placing it on the tower. No robot phase
+    # ever mentions it: it is the human's tool, and the plan already says so.
+    session = _session(spec=parse_jenga())
+    session.advance()
+    geometry = {**JENGA_GEOMETRY, "wooden_block": ObjectGeometry((0.55, -0.06, 0.0045), (0.075, 0.025, 0.015))}
+    session.bind_new_objects(geometry, [*JENGA_OBJECTS, "wooden_block"])
+    assert session.robot_movables() == {"wooden_block"}
+    assert "screwdriver" in session.spec.scene_types.movables, "still a Movable to the SPEC..."
+
+
+def test_an_object_no_pass_ever_detected_is_not_offered_as_a_movable():
+    # The proposer may name a movable that perception never produces -- this task's own spec carried
+    # a `top_block`. create_tamp_environment rejects a label it has no mesh for, so the set handed to
+    # it has to be the detected ones only.
+    session = _session(spec=parse_jenga())
+    assert "loose_block" not in session.robot_movables(), "still deferred -- no mesh exists for it"
+    assert session.robot_movables() == set()
+
+
+def test_the_movables_the_robot_may_pick_are_the_only_ones_cutamp_is_given():
+    # The other half of the same fix: the session decides WHICH, create_tamp_environment is what
+    # acts on it. Everything excluded stays in the scene as a static, so the arm still avoids it.
+    pytest.importorskip("curobo")
+    from curobo.geom.types import Cuboid, Mesh
+
+    from tiptop.tiptop_run import create_tamp_environment
+
+    def mesh(name):
+        return Mesh(name=name, pose=[0, 0, 0, 1, 0, 0, 0], vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
+
+    meshes = {n: mesh(n) for n in ["loose_block", "screwdriver", "jenga_tower", "white_paper"]}
+    table = Cuboid(name=TABLE, pose=[0, 0, 0, 1, 0, 0, 0], dims=[1, 1, 0.02])
+    goal = [{"predicate": "on", "args": ["loose_block", "jenga_tower"]}]
+    surfaces = {"jenga_tower", "white_paper", TABLE}
+
+    env, _ = create_tamp_environment(meshes, table, goal, False, surface_labels=surfaces)
+    assert {m.name for m in env.movables} == {"loose_block", "screwdriver"}, "the old behaviour"
+
+    env, _ = create_tamp_environment(
+        meshes, table, goal, False, surface_labels=surfaces, movable_labels={"loose_block"}
+    )
+    assert {m.name for m in env.movables} == {"loose_block"}
+    assert "screwdriver" in {s.name for s in env.statics}, "avoided, not ignored"
+
+
+def test_the_object_the_goal_moves_stays_pickable_whatever_the_caller_said():
+    # A goal over something typed out of Movable is not a worse plan, it is an unplannable one, so
+    # the goal's own object is added back rather than trusted to be in the set.
+    pytest.importorskip("curobo")
+    from curobo.geom.types import Cuboid, Mesh
+
+    from tiptop.tiptop_run import create_tamp_environment
+
+    def mesh(name):
+        return Mesh(name=name, pose=[0, 0, 0, 1, 0, 0, 0], vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
+
+    meshes = {n: mesh(n) for n in ["loose_block", "screwdriver"]}
+    table = Cuboid(name=TABLE, pose=[0, 0, 0, 1, 0, 0, 0], dims=[1, 1, 0.02])
+    goal = [{"predicate": "on", "args": ["loose_block", TABLE]}]
+
+    env, _ = create_tamp_environment(meshes, table, goal, False, surface_labels={TABLE}, movable_labels=set())
+    assert {m.name for m in env.movables} == {"loose_block"}
+
+
+def test_binding_never_steals_a_label_the_plan_already_owns():
+    # Same discipline as the drift path: folding two plan objects into one would aim the leg at
+    # something the robot has already dealt with.
+    spec = parse_jenga()
+    geometry = {**JENGA_GEOMETRY, "screwdriver": ObjectGeometry((0.55, -0.06, 0.0045), (0.075, 0.025, 0.015))}
+    assert bind_deferred_objects(spec, geometry, [*JENGA_OBJECTS], 1) == {}
+
+
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        (
+            _jenga(new_objects=[{"name": "loose_block", "created_by_phase": 1, "description": "d"}]),
+            "which is a ROBOT phase",
+        ),
+        (
+            # Used by a phase that runs before it exists.
+            {
+                "new_objects": [{"name": "loose_block", "created_by_phase": 1, "description": "d"}],
+                "phases": [
+                    {"executor": "robot", "description": "early", "atoms": [{"predicate": "On", "args": ["loose_block", "table"]}]},
+                    {"executor": "human", "description": "make it", "instructions": "do it",
+                     "atoms": [{"predicate": "On", "args": ["loose_block", "white_paper"]}]},
+                ],
+            },
+            "comes before phase 1 where it is created",
+        ),
+        (
+            # The creating phase never says where it ends up, so nothing could ever find it.
+            {
+                "new_objects": [{"name": "loose_block", "created_by_phase": 0, "description": "d"}],
+                "phases": [
+                    {"executor": "human", "description": "make it", "instructions": "do it",
+                     "atoms": [{"predicate": "On", "args": ["screwdriver", "white_paper"]}]},
+                    {"executor": "robot", "description": "move it",
+                     "atoms": [{"predicate": "On", "args": ["loose_block", "jenga_tower"]}]},
+                ],
+            },
+            "exactly one On(loose_block, <a real object>) atom",
+        ),
+        (
+            _jenga(new_objects=[{"name": "screwdriver", "created_by_phase": 0, "description": "d"}]),
+            "already an object in the scene",
+        ),
+        (
+            _jenga(new_objects=[{"name": "loose_block", "created_by_phase": 7, "description": "d"}]),
+            "there are only 2 phase(s)",
+        ),
+        (
+            # A new object used as a surface: it would become static world geometry for a task whose
+            # first half it does not exist in.
+            {
+                "new_objects": [{"name": "loose_block", "created_by_phase": 0, "description": "d"}],
+                "phases": [
+                    {"executor": "human", "description": "make it", "instructions": "do it",
+                     "atoms": [{"predicate": "On", "args": ["loose_block", "white_paper"]}]},
+                    {"executor": "robot", "description": "stack on it",
+                     "atoms": [{"predicate": "On", "args": ["screwdriver", "loose_block"]}]},
+                ],
+            },
+            "cannot be used as a surface",
+        ),
+    ],
+)
+def test_new_object_rejections(response, expected):
+    with pytest.raises(HITLProposalError, match=re.escape(expected)):
+        parse_jenga(response)
+
+
+def test_the_prompt_offers_new_objects_without_the_old_absolutes_forbidding_them():
+    # The prompt's "no others" / "do not invent objects" lines are stated far more forcefully than any
+    # new section, so they have to be scoped or they suppress the field outright.
+    prompt = plan_prompt("remove a block and put it back", JENGA_OBJECTS)
+    assert "new_objects" in prompt and "NEW OBJECTS" in prompt
+    assert "exactly these objects RIGHT NOW" in prompt
+    assert "or one you declared in `new_objects`" in prompt
+    # The worked example has to survive the f-string as real JSON, not doubled braces.
+    assert '[{"name": "loose_block", "created_by_phase": 0,' in prompt
+    assert "}]" in prompt and "{{" not in prompt
+
+
+def test_the_detection_hint_is_empty_until_a_plan_is_waiting_on_something():
+    from tiptop.perception.gemini import extra_objects_section
+
+    assert extra_objects_section(()) == ""
+    section = extra_objects_section(["loose_block: a wooden block (should be on the white_paper)"])
+    assert "loose_block" in section and "EXACTLY the name given here" in section
+
+
+def test_nothing_binds_before_the_human_phase_that_creates_it_has_run():
+    # A distractor already on the anchor -- a drawing on the paper, say -- must not be taken for the
+    # object the human has not produced yet, which would aim the later leg at the wrong thing.
+    session = _session(spec=parse_jenga())
+    geometry = {**JENGA_GEOMETRY, "printed_diagram": ObjectGeometry((0.55, -0.06, -0.008), (0.09, 0.06, 0.001))}
+    session.bind_new_objects(geometry, [*JENGA_OBJECTS, "printed_diagram"])
+    assert session.spec.scene_types.deferred == frozenset({"loose_block"}), "still unbound at phase 0"
+    session.advance()  # now the human has actually done it
+    session.bind_new_objects(geometry, [*JENGA_OBJECTS, "printed_diagram"])
+    assert session.spec.scene_types.deferred == frozenset()
+
+
+def test_the_detector_returning_the_plans_own_name_still_has_to_pass_the_geometry():
+    # The hint asks for the object BY NAME, so the label often comes back exactly as the plan spells
+    # it. That must neither be refused out of hand (the object really is there) nor trusted on the
+    # strength of the name (perception applies block-ish names to the wrong block).
+    session = _session(spec=parse_jenga())
+    session.advance()
+    on_the_paper = {**JENGA_GEOMETRY, "loose_block": ObjectGeometry((0.55, -0.06, 0.0045), (0.075, 0.025, 0.015))}
+    session.bind_new_objects(on_the_paper, [*JENGA_OBJECTS, "loose_block"])
+    assert session.unbound_needed_now() == [], "the right object, correctly named, binds"
+    assert session.goal_dicts() == [{"predicate": "on", "args": ["loose_block", "jenga_tower"]}]
+
+    # Same name, but it is the brick still on top of the tower: refused.
+    other = _session(spec=parse_jenga())
+    other.advance()
+    on_the_tower = {**JENGA_GEOMETRY, "loose_block": JENGA_GEOMETRY["top_jenga_block"]}
+    other.bind_new_objects(on_the_tower, [*JENGA_OBJECTS, "loose_block"])
+    assert other.unbound_needed_now() == ["loose_block"]
+
+
+# --------------------------------------------------------------------------------------------
+# The pre-rollout reset (tiptop_run._episode_reset_actions)
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_leg_after_a_human_phase_keeps_the_arm_where_the_human_left_it():
+    # The bug this guards: a HITL human phase used to hand back with the FULL reset re-armed, so the
+    # robot drove home before replanning -- throwing away the continuation the trajectory is for and
+    # making the next phase plan from q_home instead of the hand-off pose.
+    from tiptop.tiptop_run import _episode_reset_actions
+
+    for cam in ("external", "hand"):
+        do_home, do_gripper, do_capture = _episode_reset_actions(
+            resuming_from_handoff=False,
+            resuming_after_human_phase=True,
+            continuing_trajectory=True,
+            perception_cam_key=cam,
+        )
+        assert not do_home, f"no homing after a human phase ({cam})"
+        assert not do_capture, f"no drive to the capture pose after a human phase ({cam})"
+        # Kept, unlike a plain hand-off resume: a person may leave the fingers closed, and cuTAMP
+        # plans the next phase from a HandEmpty initial state either way.
+        assert do_gripper, f"the gripper check still runs after a human phase ({cam})"
+
+
+def test_a_teleop_handoff_resume_still_moves_the_arm_not_at_all():
+    from tiptop.tiptop_run import _episode_reset_actions
+
+    for cam in ("external", "hand"):
+        assert _episode_reset_actions(
+            resuming_from_handoff=True,
+            resuming_after_human_phase=False,
+            continuing_trajectory=True,
+            perception_cam_key=cam,
+        ) == (False, False, False), cam
+    # A hand-off taken DURING a human phase is still a hand-off: the operator may be holding
+    # something, so the full skip wins over the narrower one.
+    assert _episode_reset_actions(
+        resuming_from_handoff=True,
+        resuming_after_human_phase=True,
+        continuing_trajectory=True,
+        perception_cam_key="external",
+    ) == (False, False, False)
+
+
+def test_a_robot_to_robot_continuation_does_not_drive_the_arm_home_either():
+    # The HITL robot->robot leg used to take the FULL reset, so a task split into two cuTAMP goals
+    # drove the arm home between them -- a return to home recorded into the middle of one episode,
+    # with the second leg then planning from home rather than from the retract it was handed.
+    from tiptop.tiptop_run import _episode_reset_actions
+
+    for cam in ("external", "hand"):
+        do_home, do_gripper, do_capture = _episode_reset_actions(
+            resuming_from_handoff=False,
+            resuming_after_human_phase=False,
+            continuing_trajectory=True,
+            perception_cam_key=cam,
+        )
+        assert not do_home, f"no homing between two legs of one trajectory ({cam})"
+        # Unlike a human phase, this one DOES take the capture pose under wrist perception: that
+        # move buys a guaranteed view of the table, and nothing about it is a reset.
+        assert do_capture == (cam == "hand"), cam
+        assert do_gripper, cam
+
+
+def test_an_ordinary_rollout_still_gets_the_whole_reset():
+    from tiptop.tiptop_run import _episode_reset_actions
+
+    assert _episode_reset_actions(
+        resuming_from_handoff=False,
+        resuming_after_human_phase=False,
+        continuing_trajectory=False,
+        perception_cam_key="hand",
+    ) == (True, True, True), "wrist perception drives to the capture pose"
+    # A third-person camera is perceived from home instead -- an arm in frame lands in the point
+    # cloud, the RANSAC table fit and the grasps.
+    assert _episode_reset_actions(
+        resuming_from_handoff=False,
+        resuming_after_human_phase=False,
+        continuing_trajectory=False,
+        perception_cam_key="external",
+    ) == (True, True, False)

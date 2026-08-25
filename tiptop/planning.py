@@ -1,5 +1,6 @@
 """Shared planning utilities used by tiptop_run, websocket_server, and tiptop_h5_run."""
 
+import dataclasses
 import json
 import logging
 import time
@@ -179,6 +180,7 @@ def run_planning(
     cost_overrides: dict | None = None,
     reuse_plan_skeleton: PlanSkeleton | None = None,
     plan_out: dict | None = None,
+    return_home: bool = True,
 ) -> tuple[list | None, float, str | None]:
     """Run cuTAMP planning and return (plan, planning_time_seconds, failure_reason).
 
@@ -199,7 +201,17 @@ def run_planning(
     reuse attempt and the fallback search each get their own logs instead of colliding.
 
     ``plan_out``, if given, gets {"plan_skeleton": ..., "reused": bool} for the returned plan.
+
+    ``return_home`` is False for a plan that is one LEG of a longer episode -- a HITL phase with more
+    phases to come, say. cuTAMP then leaves off the final drive back to ``q_home``, so the arm stops
+    at the retract above whatever it just placed and the next leg (or the human taking over) carries
+    on from there instead of from home. See TAMPConfiguration.return_home.
     """
+    if not return_home:
+        # `config` is built once per session and shared, so this leg gets its own copy rather than
+        # mutating the one every other leg is about to plan with. TAMPConfiguration is frozen, and
+        # everything expensive (motion_gen, ik_solver) is passed in separately -- nothing is rebuilt.
+        config = dataclasses.replace(config, return_home=False)
     constraint_to_tol = default_constraint_to_tol.copy()
     constraint_to_mult = default_constraint_to_mult.copy()
     # Loosen tolerances slightly to enable finding a plan practically

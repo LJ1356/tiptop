@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import warnings
+from typing import Sequence
 
 import aiohttp
 import numpy as np
@@ -49,8 +50,14 @@ async def _estimate_smoothed_depth(
     return fused
 
 
-async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: str) -> dict:
-    """Run VLM detection and SAM2 segmentation pipeline."""
+async def detect_and_segment(
+    rgb: UInt8[np.ndarray, "h w 3"], task_instruction: str, extra_objects: Sequence[str] = ()
+) -> dict:
+    """Run VLM detection and SAM2 segmentation pipeline.
+
+    ``extra_objects`` names things a multi-step plan is waiting on that the instruction alone would
+    not make salient; see gemini.extra_objects_section.
+    """
     rgb_pil = Image.fromarray(rgb)
     rgb_pil_resized = rgb_pil.resize((800, int(800 * rgb_pil.size[1] / rgb_pil.size[0])), Image.Resampling.LANCZOS)
     _log.info(
@@ -62,7 +69,9 @@ async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: 
 
         _log.info(f"Starting Gemini object detection")
         _st = time.perf_counter()
-        _bboxes, _grounded_atoms = await detect_and_translate_async(rgb_pil_resized, task_instruction)
+        _bboxes, _grounded_atoms = await detect_and_translate_async(
+            rgb_pil_resized, task_instruction, extra_objects=extra_objects
+        )
         _dur = time.perf_counter() - _st
         _log.info(f"Gemini detection took {_dur:.2f}s ({len(_bboxes)} objects, {len(_grounded_atoms)} atoms)")
         return _bboxes, _grounded_atoms

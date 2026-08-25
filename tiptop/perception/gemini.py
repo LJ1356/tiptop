@@ -2,6 +2,7 @@ import json
 import logging
 from functools import cache
 from pathlib import Path
+from typing import Sequence
 
 from PIL import Image
 from google import genai
@@ -39,6 +40,26 @@ def load_json(response_text: str) -> list | dict:
     return results
 
 
+def extra_objects_section(extra_objects: Sequence[str]) -> str:
+    """The prompt block asking for objects a plan in progress is waiting for, or nothing.
+
+    Purely additive: detection is otherwise driven by the task instruction alone. It exists because
+    an object that only appears part-way through a task -- a block prised out of a jenga tower, say --
+    reads as scenery to a detector working from the original instruction, and gets missed on exactly
+    the pass that needs it. Naming what to look for is a hint, not an assertion that it is there; a
+    detection that comes back is still checked against where it was supposed to end up before
+    anything binds to it.
+    """
+    wanted = [o for o in extra_objects if o]
+    if not wanted:
+        return ""
+    items = "\n".join(f"- {o}" for o in wanted)
+    return (
+        "\nA step of this task has already been carried out, and it should have left the following "
+        "behind. Look for each one and, if you can see it, use EXACTLY the name given here. If one is "
+        "not visible, leave it out -- do not label something else with its name.\n" + items + "\n"
+    )
+
 def _parse_response(response_text: str) -> tuple[list, list]:
     """Parse Gemini response text into bboxes and grounded atoms."""
     try:
@@ -60,6 +81,7 @@ def detect_and_translate(
     client: genai.Client | None = None,
     model_id: str = "gemini-robotics-er-1.6-preview",
     temperature: float | None = None,
+    extra_objects: Sequence[str] = (),
 ) -> tuple[list[dict], list[dict]]:
     """Detect objects and translate task in a single Gemini API call.
 
@@ -76,7 +98,9 @@ def detect_and_translate(
         - grounded_atoms: List of predicate specifications
     """
     client = client or gemini_client()
-    prompt = load_prompt("detect_and_translate").format(task_instruction=task_instruction)
+    prompt = load_prompt("detect_and_translate").format(
+        task_instruction=task_instruction, extra_objects=extra_objects_section(extra_objects)
+    )
     response = client.models.generate_content(
         model=model_id,
         contents=[image, prompt],
@@ -93,6 +117,7 @@ async def detect_and_translate_async(
     client: genai.Client | None = None,
     model_id: str = "gemini-robotics-er-1.6-preview",
     temperature: float | None = None,
+    extra_objects: Sequence[str] = (),
 ) -> tuple[list[dict], list[dict]]:
     """Asynchronously detect objects and translate task in a single Gemini API call.
 
@@ -109,7 +134,9 @@ async def detect_and_translate_async(
         - grounded_atoms: List of predicate specifications.
     """
     client = client or gemini_client()
-    prompt = load_prompt("detect_and_translate").format(task_instruction=task_instruction)
+    prompt = load_prompt("detect_and_translate").format(
+        task_instruction=task_instruction, extra_objects=extra_objects_section(extra_objects)
+    )
     response = await client.aio.models.generate_content(
         model=model_id,
         contents=[image, prompt],

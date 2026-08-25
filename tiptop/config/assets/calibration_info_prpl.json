@@ -24,14 +24,14 @@
   },
   "34032889": {
     "pose": [
-      0.5692872333872196,
-      -0.5515242575492293,
-      0.37494721747803583,
-      -1.8218005906340848,
-      0.046845638554643854,
-      0.586737186097219
+      0.5715553058907807,
+      -0.5216883035555564,
+      0.3754473415379318,
+      -1.836974307016746,
+      0.05710652072728606,
+      0.5503912520472307
     ],
-    "timestamp": 1786578132.566384,
-    "source": "copied verbatim from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1), recalibrated 2026-08-12 19:42. Supersedes 2026-08-10 19:54, which it agrees with to ~1.9deg in rotation and ~22mm in translation (dx -8.5, dy +17.9, dz -10.0 mm). world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from"
+    "timestamp": 1787535030.49543,
+    "source": "copied verbatim from droid 34032889_left (the run writes to /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json, not ~/droid -- the robot env's editable `droid` points at the tamp-vla checkout), recalibrated 2026-08-23 21:30. Supersedes 2026-08-19 10:59, which it agrees with to 2.0deg in rotation and 20.8mm in translation (dx -4.7, dy +20.0, dz +3.2 mm). world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
   }
 }

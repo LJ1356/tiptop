@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Sequence
 
 import aiohttp
 import numpy as np
@@ -164,6 +164,19 @@ _pending_instruction: str | None = None
 # gripper reset. Homing would undo the hand-off (the whole point is to replan from where the human
 # left the arm) and opening the gripper would drop whatever the operator is holding.
 _skip_episode_reset = False
+
+# The narrower half of that skip, for a leg that follows a HUMAN-IN-THE-LOOP phase rather than an
+# operator-initiated hand-off: suppress the arm MOTION (return home, move to the capture pose) while
+# still running the ordinary gripper-open check. A HITL human phase leaves the arm wherever the
+# person put it and the robot holding nothing, so homing is pure wasted motion -- the next phase is a
+# continuation of the same trajectory and should plan from the pose the human left, not from q_home.
+# The gripper check is kept because nothing during a human phase guarantees the fingers are open, and
+# cuTAMP plans every phase from a HandEmpty initial state regardless (see planning.environment_initial_state).
+#
+# The cost, accepted deliberately: with `cameras.perception: external` the arm no longer clears the
+# third-person camera's view, so it can land in the point cloud, the RANSAC table fit and the grasps.
+# That is the same bargain the operator-initiated hand-off has always made (_skip_episode_reset).
+_skip_episode_arm_motion = False
 
 # Set alongside it, but a SEPARATE thing: the next rollout is another leg of the SAME trajectory, so
 # it keeps _trajectory_id and its episode merges with the legs before it. The two used to be one flag,
@@ -940,6 +953,64 @@ def _hitl_verification_image(container: "_DemoContainer"):
     return to_pil(cam.read_camera().rgb)
 
 
+def _episode_reset_actions(
+    *,
+    resuming_from_handoff: bool,
+    resuming_after_human_phase: bool,
+    continuing_trajectory: bool,
+    perception_cam_key: str,
+) -> tuple[bool, bool, bool]:
+    """What the pre-rollout reset should do: ``(go_home, open_gripper, go_to_capture)``.
+
+    Pulled out of the rollout loop because it is the one decision here that has been got wrong more
+    than once (see the flag definitions and the HITL hand-off branch), and it is pure -- four
+    booleans in, three out -- so it can be tested without a robot.
+
+    * An ordinary rollout resets fully: home, open the gripper, and (wrist perception only) drive to
+      the capture pose. A rollout left mid-motion still gripping something starts clean.
+    * A **teleop hand-off resume** moves the arm not at all and touches nothing: homing would undo
+      the hand-off, and opening the gripper would drop whatever the operator is holding.
+    * A leg resuming after a **HITL human phase** skips only the MOTION. The next phase continues the
+      same trajectory and should plan from the pose the human left, but nothing about a person
+      handling the arm guarantees the fingers are open -- and cuTAMP plans every phase from a
+      HandEmpty initial state regardless -- so the gripper check stays.
+    * A leg **continuing the same trajectory** without either of those -- the HITL robot->robot
+      continuation -- does not home either, for the same reason: home is the one pose the task never
+      asked the arm to be in, and driving there between two legs of one episode records a return to
+      home into the middle of the demonstration. It DOES keep the capture pose when perception reads
+      the wrist camera, since that move buys a guaranteed view of the table rather than a reset.
+
+    Skipping the capture pose costs a guaranteed view: perception is geometrically correct from any
+    pose (capture_live_observation recomputes a wrist camera's world_from_cam by FK, and a
+    third-person camera does not move with the arm), but the arm no longer clears the shot.
+    """
+    if resuming_from_handoff:
+        return False, False, False
+    if resuming_after_human_phase:
+        return False, True, False
+    if continuing_trajectory:
+        return False, True, perception_cam_key == "hand"
+    return True, True, perception_cam_key == "hand"
+
+
+def _hitl_detect_hint(task_instruction: str) -> list[str]:
+    """Objects a plan already in progress is waiting for, to be named to the detector.
+
+    Only the ones a human phase was supposed to have created and that nothing has bound yet. They are
+    the detections most easily missed -- a block prised out of a tower is scenery to a detector
+    working from the original instruction -- and the pass that misses one is the pass that needs it.
+    Empty for a fresh task, so the first plan is still made against whatever the instruction alone
+    turns up.
+    """
+    session = _hitl_session
+    if session is None or not session.matches(task_instruction, _trajectory_id):
+        return []
+    return [
+        f"{d.name}: {d.description} (should be on the {d.anchor})" if d.description else d.name
+        for d in session.spec.unbound_deferred
+    ]
+
+
 def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
     """Build the callback run_perception uses to aim this rollout at one segment of the outer plan.
 
@@ -956,13 +1027,18 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
     from tiptop.hitl.planning import match_drifted_names
     from tiptop.hitl.session import build_session
 
-    async def resolve(object_names: list[str], table_name: str) -> tuple[list[dict], set[str] | None]:
+    async def resolve(
+        object_names: list[str], table_name: str, geometry: dict | None = None
+    ) -> tuple[list[dict], set[str] | None, set[str] | None]:
         global _hitl_session
         session = _hitl_session
         if session is not None and not session.matches(task_instruction, _trajectory_id):
             _hitl_reset_session("a new task or trajectory started")
             session = None
         if session is not None:
+            # An object a human phase was supposed to create may exist now. Bind it BEFORE the drift
+            # check, so a name that has just become real is checked like any other from here on.
+            session.bind_new_objects(geometry or {}, object_names)
             # Gemini names objects afresh every pass and the names drift ("toy" and "box" one pass,
             # "blue_toy" and "cardboard_box" the next). A plan naming an object this pass did not
             # produce would die in create_tamp_environment's unknown-object check, so re-bind it to
@@ -1009,10 +1085,10 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
             except Exception as exc:
                 _log.exception("HITL: could not propose a plan for this task")
                 state["failure"] = f"HITL proposal failed ({type(exc).__name__}: {exc})"
-                return [], None
+                return [], None, None
             if session is None:
                 state["failure"] = reason
-                return [], None
+                return [], None, None
             if session.spec.unrepresented:
                 # The plan covers less than the instruction asked for. Surfaced as an event as well
                 # as printed, so it is visible in the data-collection UI rather than only in the log.
@@ -1030,12 +1106,32 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
             # Every phase is done, so there is nothing left to aim this rollout at. Only reachable if
             # a finished session outlived the rollout that finished it.
             state["failure"] = "the human-in-the-loop plan is already complete"
-            return [], set(session.spec.scene_types.surfaces)
+            return [], set(session.spec.scene_types.surfaces), session.robot_movables()
         if phase.is_human:
             # Nothing for the robot to do before the human acts. An empty goal keeps cuTAMP out of it
             # entirely (see the `human` branch before run_planning).
             state["human"] = phase
-            return [], set(session.spec.scene_types.surfaces)
+            return [], set(session.spec.scene_types.surfaces), session.robot_movables()
+        unbound = session.unbound_needed_now()
+        if unbound:
+            # The human phase ran and was verified, but nothing in this pass looks like the object it
+            # was supposed to leave behind. Refusing here is the point: the goal would otherwise name
+            # an object create_tamp_environment has never heard of, and the alternative -- binding to
+            # whatever carries a similar name -- is how the robot ends up moving the wrong block.
+            where = {d.name: d.anchor for d in session.spec.deferred}
+            state["failure"] = (
+                "; ".join(
+                    f"the human step was to leave {name} on {where.get(name, 'the anchor')}, but "
+                    f"nothing detected there matches it"
+                    for name in unbound
+                )
+                # The session is NOT reset here: the human's phase is done and verified, and its
+                # progress is worth keeping. Re-running the task re-perceives and tries to bind again,
+                # so say so -- otherwise the operator's reasonable reading is that the task is lost.
+                + ". The human step is still recorded as done, so re-run this task to try again; "
+                "moving it clear of anything else on that surface helps it be seen."
+            )
+            return [], set(session.spec.scene_types.surfaces), session.robot_movables()
         run = session.robot_run()
         if len(run) > 1:
             # Worth saying out loud: the operator sees ONE plan cover several of the phases the
@@ -1044,7 +1140,7 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
                 f"HITL: planning {len(run)} consecutive robot phases as a single cuTAMP goal -- "
                 + "; ".join(p.description for p in run)
             )
-        return session.goal_dicts(), set(session.spec.scene_types.surfaces)
+        return session.goal_dicts(), set(session.spec.scene_types.surfaces), session.robot_movables()
 
     return resolve
 
@@ -1266,6 +1362,7 @@ def create_tamp_environment(
     grounded_atoms: list[dict],
     include_workspace: bool,
     surface_labels: set[str] | None = None,
+    movable_labels: set[str] | None = None,
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
     """Build the cuTAMP environment and goal for one rollout.
 
@@ -1274,6 +1371,15 @@ def create_tamp_environment(
     task passes it because its goal changes between segments: inferring per segment would make the
     cloth a Surface (and therefore a static obstacle) while the toy is placed on it, then a Movable
     once the goal no longer mentions it -- the world geometry would change mid-task.
+
+    ``movable_labels`` restricts what the robot may PICK. Left None every non-surface detection is a
+    Movable, which is right for an ordinary rollout: cuTAMP's search is free to shift whatever is in
+    the way. A human-in-the-loop task passes it because a scene shared with a person contains the
+    person's things -- the screwdriver they push the jenga block out with is detected, so three of
+    the four skeletons cuTAMP enumerated for "put the block back on the tower" began by picking the
+    screwdriver up and one of them placed it on the tower. Anything excluded is still perceived and
+    still collision-checked; it just moves from Movable into ``statics``, so the arm routes around it
+    instead of grasping it.
     """
     # Reject goals that reference objects not present in the perceived scene.
     # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
@@ -1294,16 +1400,31 @@ def create_tamp_environment(
             if atom["predicate"] == "on" and len(atom["args"]) == 2:
                 surface_labels.add(atom["args"][1])
 
-    # Separate movables and surfaces
+    # Whatever the caller excluded, the object this rollout's goal is ABOUT stays a Movable: cuTAMP
+    # validates goal literals against the parameter types, so a goal over something typed out of
+    # Movable is not a worse plan, it is an unplannable one.
+    if movable_labels is not None:
+        movable_labels = set(movable_labels)
+        for atom in grounded_atoms:
+            if atom["predicate"] in ("on", "holding") and atom.get("args"):
+                movable_labels.add(atom["args"][0])
+
+    # Separate movables, surfaces, and -- when the caller named the movables -- the rest, which stay
+    # in the scene as obstacles rather than as things the search may pick up.
     movables = []
     surfaces = []
+    obstacles = []
     for label, mesh in object_meshes.items():
         if label in surface_labels:
             surfaces.append(mesh)
+        elif movable_labels is not None and label not in movable_labels:
+            obstacles.append(mesh)
         else:
             movables.append(mesh)
     _log.info(f"Movables: {[m.name for m in movables]}")
     _log.info(f"Surfaces: {[s.name for s in surfaces]}")
+    if obstacles:
+        _log.info(f"Obstacles (perceived and avoided, never picked): {[o.name for o in obstacles]}")
 
     # Create goal state from grounded atoms
     goal_state: set = set()
@@ -1326,6 +1447,7 @@ def create_tamp_environment(
     statics = list(workspace_cuboids()) if include_workspace else []
     for surface in all_surfaces:
         statics.append(surface)
+    statics.extend(obstacles)
 
     # Create TAMP environment
     env = TAMPEnvironment(
@@ -1335,7 +1457,10 @@ def create_tamp_environment(
         type_to_objects={"Movable": movables, "Surface": all_surfaces},
         goal_state=frozenset(goal_state),
     )
-    _log.info(f"Created TAMP environment with {len(movables)} movables, {len(all_surfaces)} surfaces")
+    _log.info(
+        f"Created TAMP environment with {len(movables)} movables, {len(all_surfaces)} surfaces"
+        + (f", {len(obstacles)} unpickable obstacles" if obstacles else "")
+    )
     return env, all_surfaces
 
 
@@ -1518,15 +1643,19 @@ async def run_perception(
     depth_estimator: DepthEstimator | None = None,
     include_workspace: bool = True,
     log_to_rerun: bool = True,
-    resolve_goal: Callable[[list[str], str], Awaitable[tuple[list[dict], set[str] | None]]] | None = None,
+    resolve_goal: (
+        Callable[[list[str], str, dict], Awaitable[tuple[list[dict], set[str] | None, set[str] | None]]] | None
+    ) = None,
+    detect_hint: Sequence[str] = (),
 ) -> tuple[TAMPEnvironment, list, ProcessedScene, list[dict]]:
     """Perceive the scene and build the cuTAMP environment and goal for it.
 
     ``resolve_goal`` replaces the goal Gemini translated the instruction into, given the object labels
-    this pass detected and the fitted table's name; it returns (grounded_atoms, surface_labels). Only
-    the human-in-the-loop path passes it, to aim this rollout at one segment of a longer plan. Object
-    DETECTION is left alone either way -- it is driven by the full instruction, which is what makes
-    Gemini name things in terms relevant to the task."""
+    this pass detected, the fitted table's name, and where each detection is; it returns
+    (grounded_atoms, surface_labels, movable_labels). Only the human-in-the-loop path passes it, to
+    aim this rollout at one segment of a longer plan. Object DETECTION is driven by the full instruction, which is what
+    makes Gemini name things in terms relevant to the task; ``detect_hint`` only adds objects a plan
+    already in progress is waiting for, and never takes any away."""
     start_time = time.perf_counter()
 
     frame = observation.frame
@@ -1545,7 +1674,7 @@ async def run_perception(
             robot_mask=observation.robot_mask,
             depth_frames=observation.depth_frames,
         ),
-        detect_and_segment(rgb, task_instruction),
+        detect_and_segment(rgb, task_instruction, extra_objects=detect_hint),
     )
     _log.info(f"Capturing observation and running perception APIs took {time.perf_counter() - start_time:.2f}s")
 
@@ -1649,12 +1778,21 @@ async def run_perception(
 
     grounded_atoms = detection_results["grounded_atoms"]
     surface_labels = None
+    movable_labels = None
     if resolve_goal is not None:
         # The labels only exist now, which is why this is a callback rather than a value the caller
         # could have passed in: on the first rollout of a HITL task the whole proposal stage runs
         # here, against the objects this pass actually detected.
-        grounded_atoms, surface_labels = await resolve_goal(
-            sorted(processed_scene.object_meshes), processed_scene.table_cuboid.name
+        # The geometry goes with the labels: a HITL plan can name an object that did not exist when
+        # it was made, and where a detection IS decides which one that name refers to. Imported here
+        # rather than at module scope for the reason every other tiptop.hitl import is: with the
+        # feature off, the package is never loaded, so a problem in it cannot affect an ordinary run.
+        from tiptop.hitl.planning import scene_geometry
+
+        grounded_atoms, surface_labels, movable_labels = await resolve_goal(
+            sorted(processed_scene.object_meshes),
+            processed_scene.table_cuboid.name,
+            scene_geometry(processed_scene.object_meshes),
         )
 
     env, all_surfaces = create_tamp_environment(
@@ -1663,6 +1801,7 @@ async def run_perception(
         grounded_atoms,
         include_workspace,
         surface_labels=surface_labels,
+        movable_labels=movable_labels,
     )
     _log.info(f"Processing scene and perception results took {time.perf_counter() - proc_st:.2f}s")
     _log.info(f"Perception pipeline completed, took {time.perf_counter() - start_time:.2f}s")
@@ -1710,11 +1849,18 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 #
                 # Skipped entirely when resuming from a teleop hand-off: this run is a CONTINUATION
                 # of the same task from wherever the operator left the arm, so homing would throw
-                # that away and opening the gripper would drop whatever they are holding.
+                # that away and opening the gripper would drop whatever they are holding. Skipped in
+                # PART -- the motion but not the gripper -- for a leg following a HITL human phase.
+                # _episode_reset_actions holds the whole decision.
                 global _skip_episode_reset, _trajectory_id, _trajectory_handed_off
                 global _last_plan_skeleton, _reuse_plan_skeleton, _continue_trajectory
+                global _skip_episode_arm_motion
                 resuming_from_handoff = _skip_episode_reset
                 _skip_episode_reset = False
+                # Consumed exactly like the flag above -- one rollout only, so a motion skip armed by
+                # a human phase can never leak into a later task typed at the prompt.
+                resuming_after_human_phase = _skip_episode_arm_motion
+                _skip_episode_arm_motion = False
                 continuing_trajectory = _continue_trajectory
                 _continue_trajectory = False
                 # The task plan to reuse is armed by the hand-off and consumed here, exactly like
@@ -1724,46 +1870,67 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 _last_plan_skeleton = None
                 # A resumed rollout continues the SAME trajectory as the leg that handed off; any
                 # other rollout starts a fresh one. Deliberately keyed on continuing_trajectory rather
-                # than on the motion-reset flag: a HITL phase resumes the trajectory while still
-                # wanting its arm reset.
+                # than on either reset-skip flag: a HITL robot->robot continuation resumes the
+                # trajectory while still wanting its arm reset, so the two are not the same question.
                 if not continuing_trajectory:
                     _trajectory_id = uuid.uuid4().hex[:16]
                     _trajectory_handed_off = False
+                do_home, do_gripper, do_capture = _episode_reset_actions(
+                    resuming_from_handoff=resuming_from_handoff,
+                    resuming_after_human_phase=resuming_after_human_phase,
+                    continuing_trajectory=continuing_trajectory,
+                    perception_cam_key=container.perception_cam_key,
+                )
                 if resuming_from_handoff:
-                    # The move to the capture pose is skipped too, so the arm does not move AT ALL
-                    # before replanning. The geometry is right from any pose either way
-                    # (capture_live_observation tracks the wrist camera by FK, and a third-person
-                    # camera does not move with the arm) -- what q_capture buys the WRIST camera is a
-                    # guaranteed view of the whole table. From a hand-off pose it sees only what it
-                    # happens to point at, so perception can come back partial (or fail outright, in
-                    # which case the rollout is abandoned and the session drops back to the prompt).
-                    # A third-person camera keeps its view, but the arm sits wherever the operator
-                    # left it, possibly in frame.
                     _log.info(
                         "Resuming after a teleop hand-off: not moving the arm at all -- no return "
                         "home, no gripper open, no move to the capture pose. Perception and planning "
                         "run from exactly where the operator left it"
                     )
-                else:
+                elif do_home:
                     _log.info("Resetting robot for new episode: return home + open gripper (if not already)")
                     go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                elif resuming_after_human_phase:
+                    # A leg resuming after a HITL human phase: the arm stays put like a hand-off
+                    # resume, but the gripper check below still runs. See _episode_reset_actions.
+                    _log.info(
+                        "Resuming after a HITL human phase: not homing the arm and not moving to the "
+                        "capture pose -- this phase is a continuation of the same trajectory and "
+                        "plans from the pose the human left. Only the gripper check runs"
+                    )
+                else:
+                    # A robot->robot continuation of the same trajectory. Same reasoning: the arm is
+                    # already parked at the previous leg's retract, and homing between two legs of one
+                    # episode is a return to home recorded into the middle of the demonstration.
+                    _log.info(
+                        "Continuing the same trajectory: not homing the arm -- this leg plans from "
+                        "where the previous one stopped. The gripper check still runs"
+                    )
+                if do_gripper:
                     try:
                         _open_gripper_if_needed(container)
                     except Exception as _e:
                         _log.exception('Gripper open/check failed: ' + str(_e))
 
-                    if container.perception_cam_key == "hand":
-                        # Perception reads the WRIST camera, so the arm goes to q_capture to point it
-                        # at the scene.
-                        _log.debug("Moving robot to capture joint positions")
-                        go_to_capture(
-                            time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen
-                        )
-                    else:
-                        # A third-person camera already sees the scene, and q_capture would only put
-                        # the arm in front of it -- an arm in frame ends up in the point cloud, the
-                        # RANSAC table fit and the grasps. Perceive from home instead.
-                        _log.debug("Perception reads a third-person camera; staying at home instead of q_capture")
+                if do_capture:
+                    # Perception reads the WRIST camera, so the arm goes to q_capture to point it at
+                    # the scene.
+                    _log.debug("Moving robot to capture joint positions")
+                    go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                elif container.perception_cam_key == "hand":
+                    # Wrist perception, but the arm is deliberately left where the last leg or the
+                    # human put it. What q_capture buys is a guaranteed view of the whole table; from
+                    # a hand-off pose the camera sees only what it happens to point at, so perception
+                    # can come back partial (or fail outright, in which case the rollout is abandoned
+                    # and the session drops back to the prompt).
+                    _log.debug("Continuing a trajectory; leaving the wrist camera where it is")
+                else:
+                    # A third-person camera already sees the scene, and q_capture would only put the
+                    # arm in front of it -- an arm in frame ends up in the point cloud, the RANSAC
+                    # table fit and the grasps. Perceive from wherever the arm already is. When that
+                    # is a hand-off pose rather than home, the arm may be in frame regardless; that
+                    # is the cost of continuing rather than resetting.
+                    _log.debug("Perception reads a third-person camera; not moving to q_capture")
 
                 # Set once a "switch to teleop" has been observed at one of this rollout's
                 # checkpoints (see _sigusr1_teleop_switch); drives the hand-off after the rollout
@@ -1834,6 +2001,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             if _hitl_enabled()
                             else None
                         ),
+                        detect_hint=_hitl_detect_hint(task_instruction),
                     )
                     perception_duration = time.perf_counter() - perception_start
 
@@ -1875,6 +2043,20 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             cutamp_plan, planning_duration, failure_reason = None, 0.0, unreachable
                         else:
                             planned = True
+                            # cuTAMP ends a plan by driving the arm back to q_home. That is right for
+                            # a plan that IS the episode, and wrong for one that is a leg of a longer
+                            # one: a HITL task with phases still to come continues from where this leg
+                            # stops, so a return home in between is motion the task never asked for,
+                            # recorded into the middle of the demonstration -- and the next leg then
+                            # plans from home instead of from the pose it was handed. Ask for it only
+                            # on the last leg; a non-HITL rollout has no session and always gets it.
+                            hitl_session_now = hitl_state.get("session")
+                            plan_return_home = hitl_session_now is None or hitl_session_now.is_last_leg()
+                            if not plan_return_home:
+                                _log.info(
+                                    "HITL: more phases follow this one, so the plan will stop at the "
+                                    "retract instead of driving the arm home"
+                                )
                             cutamp_plan, planning_duration, failure_reason = run_planning(
                                 env,
                                 config,
@@ -1887,6 +2069,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                 cost_overrides=container.cost_overrides,
                                 reuse_plan_skeleton=reuse_skeleton,
                                 plan_out=plan_out,
+                                return_home=plan_return_home,
                             )
                         # Remember this rollout's task plan in case it hands off to teleop, and tell
                         # the UI whether the one we were given was actually reused (run_planning
@@ -2151,14 +2334,32 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # next segment's goal is a subset of what it already achieves (HandEmpty
                         # alone, say), and the arm silently repeats the chunk it has just done.
                         _reuse_plan_skeleton = None
-                        # Likewise the reset: after a hand-off for a human phase the robot is holding
-                        # nothing and the arm is wherever the human left it, so the next phase wants
-                        # its normal reset -- including the move to the capture pose, without which
-                        # perception looks wherever the operator happened to leave the wrist.
+                        # The reset, however, is only HALF dropped. _run_teleop_handoff armed the
+                        # full skip (no homing, no gripper open); a human phase wants the gripper
+                        # check back -- nothing about a person driving the arm guarantees the fingers
+                        # are open, and cuTAMP plans the next phase from a HandEmpty initial state
+                        # either way -- but it does NOT want the arm driven home first. Homing is a
+                        # continuation of the same trajectory thrown away: the next phase should plan
+                        # from the pose the human left, exactly as an operator hand-off does. (This
+                        # once set the full reset, on the reasoning that the capture pose was needed
+                        # "without which perception looks wherever the operator happened to leave the
+                        # wrist" -- which does not apply under `cameras.perception: external`, the
+                        # deployed setting, where the arm never drives to q_capture at all.)
                         # _continue_trajectory is deliberately LEFT set: this is still the same
                         # trajectory, and clearing both (as one flag once did) minted a new
                         # trajectory id, which dropped the plan mid-task and split the episode.
                         _skip_episode_reset = False
+                        # Armed only when the loop goes STRAIGHT back into this task, which is
+                        # exactly what a queued _pending_instruction means (_get_task_instruction
+                        # consumes it without blocking on stdin). The narrow condition matters: three
+                        # ways out of _hitl_human_phase reach here without one -- the task finished,
+                        # the operator abandoned the phase, or they did it by hand and never pressed
+                        # "Switch to teleop", so _run_teleop_handoff never queued anything. All three
+                        # drop to the bare prompt, and a motion skip left standing there would
+                        # suppress the homing of the NEXT, unrelated task typed into it. This mirrors
+                        # _skip_episode_reset's own arming, which is likewise inside the branch that
+                        # queues the instruction.
+                        _skip_episode_arm_motion = not finished and _pending_instruction is not None
                         # Re-write the audit record: the verification verdicts only exist now, and
                         # for the LAST human step of a task there is no later rollout to record them.
                         # Read from hitl_state, NOT the module global: completing the task drops the
@@ -2197,11 +2398,15 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     # exporting this one on its own -- which would be a fragment of the attempt.
                     _trajectory_handed_off = True
                     # _skip_episode_reset is deliberately NOT set: the robot holds nothing after a
-                    # Place, and the next phase wants its ordinary reset (home + gripper open + the
-                    # capture pose). That also leaves reuse_skeleton unset for the next rollout,
-                    # which is right -- the next phase has a different goal, and a stale skeleton is
-                    # accepted whenever the new goal is a subset of what it already achieves, so the
-                    # arm would silently repeat the chunk it has just done.
+                    # Place, so the next phase still runs its gripper check (and, under wrist
+                    # perception, still drives to the capture pose). What it does NOT do any more is
+                    # home first -- _continue_trajectory above is what tells _episode_reset_actions
+                    # this leg continues an episode already in progress, and homing between two legs
+                    # of one episode records a return to home into the middle of the demonstration.
+                    # Leaving _skip_episode_reset clear also leaves reuse_skeleton unset for the next
+                    # rollout, which is right -- the next phase has a different goal, and a stale
+                    # skeleton is accepted whenever the new goal is a subset of what it already
+                    # achieves, so the arm would silently repeat the chunk it has just done.
                     _emit_event({
                         "event": "hitl_phase_complete",
                         "trajectory_id": _trajectory_id,

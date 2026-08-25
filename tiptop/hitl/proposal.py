@@ -20,6 +20,7 @@ from tiptop.hitl.config import HITLConfig
 from tiptop.hitl.llm import query_json
 from tiptop.hitl.prompts import PLAN_SCHEMA, plan_prompt
 from tiptop.hitl.structs import (
+    DeferredObject,
     HITLProposalError,
     Phase,
     SceneTypes,
@@ -102,20 +103,102 @@ def _scene_types(
     phases: Sequence[tuple[str, str, list[tuple[str, list[str]]], str]],
     objects: Sequence[str],
     table_name: str,
+    deferred: Sequence[str] = (),
 ) -> SceneTypes:
     """Split the perceived objects into surfaces and movables, from EVERY phase's atoms.
 
     Mirrors what create_tamp_environment infers (``on(x, y)`` makes y a surface), but computed once
     across the whole plan rather than per phase, so an object does not change type -- and with it,
     whether cuTAMP treats it as a static obstacle -- between two phases of the same task.
+
+    Declared-but-not-yet-existing objects are typed here too, so a phase over one validates like any
+    other. They are always movables: _deferred_entries refuses to let one be a surface.
     """
     surfaces = {table_name}
     for _, _, atoms, _ in phases:
         for name, args in atoms:
             if name == "On" and len(args) == 2:
                 surfaces.add(args[1])
+    known = set(objects) | {table_name} | set(deferred)
+    return SceneTypes(
+        surfaces=frozenset(surfaces & known),
+        movables=frozenset(known - surfaces),
+        deferred=frozenset(deferred),
+    )
+
+
+def _deferred_entries(
+    data: Any,
+    phases: Sequence[tuple[str, str, list[tuple[str, list[str]]], str]],
+    objects: Sequence[str],
+    table_name: str,
+) -> list[tuple[str, int, str]]:
+    """Parse ``new_objects`` into (name, created_by_phase, description), with everything checkable
+    before the atoms are grounded.
+
+    The anchor check needs grounded atoms, so it lives in _check_deferred_anchor; everything that can
+    be settled from the raw entries is settled here, where the message can still name the entry.
+    """
+    entries = _field(data, "new_objects", [])
+    if not isinstance(entries, list):
+        raise HITLProposalError(f"'new_objects' must be a list, got {type(entries).__name__}.")
     known = set(objects) | {table_name}
-    return SceneTypes(surfaces=frozenset(surfaces & known), movables=frozenset(known - surfaces))
+    out: list[tuple[str, int, str]] = []
+    for entry in entries:
+        name = str(_field(entry, "name"))
+        description = str(_field(entry, "description", ""))
+        try:
+            created = int(_field(entry, "created_by_phase", -1))
+        except (TypeError, ValueError) as exc:
+            raise HITLProposalError(
+                f"The `created_by_phase` of the new object '{name}' must be a whole number."
+            ) from exc
+        if name in known:
+            raise HITLProposalError(
+                f"'{name}' is already an object in the scene, so it is not a new one. Use it directly."
+            )
+        if any(name == n for n, _, _ in out):
+            raise HITLProposalError(f"You declared the new object '{name}' more than once.")
+        if not 0 <= created < len(phases):
+            raise HITLProposalError(
+                f"The new object '{name}' says it is created by phase {created}, but there are only "
+                f"{len(phases)} phase(s) (numbered 0 to {len(phases) - 1})."
+            )
+        if phases[created][0] != "human":
+            raise HITLProposalError(
+                f"The new object '{name}' is created by phase {created}, which is a ROBOT phase. The "
+                "robot only picks things up and puts them down, so it cannot bring a new object into "
+                "existence. A person has to, so that must be a human phase."
+            )
+        uses = [i for i, (_, _, atoms, _) in enumerate(phases) if any(name in args for _, args in atoms)]
+        if any(i < created for i in uses):
+            raise HITLProposalError(
+                f"The new object '{name}' is used by phase {min(uses)}, which comes before phase "
+                f"{created} where it is created. Nothing can refer to it until it exists."
+            )
+        out.append((name, created, description))
+    return out
+
+
+def _check_deferred_anchor(name: str, created: int, phases: Sequence[Phase], deferred: Sequence[str]) -> str:
+    """Where the creating phase says the new object ends up -- the one assertion binding can use.
+
+    Required, and required to be a real object: it is both what the camera check for that phase looks
+    for and, once the human has acted, how the object is picked out of the next perception pass. See
+    planning.bind_deferred_object.
+    """
+    anchors = [a.values[1] for a in phases[created].atoms if a.name == On.name and a.values[0] == name]
+    if len(anchors) != 1:
+        raise HITLProposalError(
+            f"Phase {created} creates the new object '{name}', so it must say where it ends up with "
+            f"exactly one On({name}, <a real object>) atom; it has {len(anchors)}."
+        )
+    if anchors[0] in deferred:
+        raise HITLProposalError(
+            f"On({name}, {anchors[0]}) puts the new object on '{anchors[0]}', which is another new "
+            "object. It has to end up on something that is already in the scene, so it can be found."
+        )
+    return anchors[0]
 
 
 def _build_invented(
@@ -263,7 +346,17 @@ def parse_plan_response(
 ) -> TaskSpecification:
     """Validate a plan response into the phases the rest of the system executes."""
     phase_entries = _phase_entries(data)
-    scene_types = _scene_types(phase_entries, objects, table_name)
+    deferred_entries = _deferred_entries(data, phase_entries, objects, table_name)
+    deferred_names = [name for name, _, _ in deferred_entries]
+    scene_types = _scene_types(phase_entries, objects, table_name, deferred_names)
+    misused = sorted(set(deferred_names) & scene_types.surfaces)
+    if misused:
+        # A surface is pinned for the whole task and becomes static world geometry, so one that does
+        # not exist for the first half of it is not something to guess at. Nothing has needed it.
+        raise HITLProposalError(
+            f"{', '.join(misused)} is a new object, but the plan puts something ON it. A new object "
+            "can be picked up and moved; it cannot be used as a surface."
+        )
 
     # An invented predicate's signature comes from its uses, where every argument is a concrete
     # object whose type this scene has already fixed.
@@ -284,12 +377,22 @@ def parse_plan_response(
         )
         for executor, description, atoms, instructions in phase_entries
     )
+    deferred = tuple(
+        DeferredObject(
+            name=name,
+            created_by_phase=created,
+            anchor=_check_deferred_anchor(name, created, phases, deferred_names),
+            description=description,
+        )
+        for name, created, description in deferred_entries
+    )
     unrepresented = parse_unrepresented(data)
     return TaskSpecification(
         instruction=instruction,
         phases=phases,
         scene_types=scene_types,
         invented=tuple(invented.values()),
+        deferred=deferred,
         unrepresented=unrepresented,
         coverage=check_coverage(data, len(phases), unrepresented),
     )
@@ -322,6 +425,11 @@ async def propose_plan(
             _log.info(f"HITL phase {i} instructions: {phase.instructions}")
     for predicate in spec.invented:
         _log.info(f"HITL invented predicate {display_name(predicate.name)}: {predicate.instructions}")
+    for deferred in spec.deferred:
+        _log.info(
+            f"HITL new object {deferred.name}: does not exist yet -- phase {deferred.created_by_phase} "
+            f"creates it, on {deferred.anchor} ({deferred.description})"
+        )
     for dropped in spec.unrepresented:
         _log.warning(
             f"HITL: NOT part of the plan -- {dropped['clause']!r}: {dropped['reason']}. "

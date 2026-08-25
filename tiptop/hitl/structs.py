@@ -89,6 +89,33 @@ def _validate_template(template: str, arity: int, context: str) -> None:
 
 
 @dataclass(frozen=True)
+class DeferredObject:
+    """A movable the plan names that does not exist YET: a human phase brings it into being.
+
+    Some instructions are about an object that is not a separate object when the plan is made. "Remove
+    a block from the jenga tower with the screwdriver, then put it back on top" names a loose block
+    that, at plan time, is one brick inside the tower -- perception detects ``jenga_tower``, and no
+    label the proposer is offered refers to the thing the second clause moves.
+
+    Without a name to bind, the proposer's only legal move was to invent a predicate, and an invented
+    predicate forces the phase to be a HUMAN one (see proposal._resolve_fluent). So a plain
+    pick-and-place -- exactly the work the robot exists to do -- was handed to a teleoperator, and
+    whether it was depended on whether that pass's detection happened to emit a block-shaped label.
+
+    Declaring the object instead keeps the phase a robot phase. ``created_by_phase`` is the human
+    phase that produces it and ``anchor`` is where that phase leaves it -- the plan says
+    ``On(name, anchor)`` -- which is both what the verifier checks and what the object is bound to a
+    real detection by once it exists. See planning.bind_deferred_object for why that anchor, rather
+    than the name, is what binding keys on.
+    """
+
+    name: str
+    created_by_phase: int
+    anchor: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class SceneTypes:
     """Which cuTAMP type each perceived object carries for the whole of one task.
 
@@ -102,6 +129,12 @@ class SceneTypes:
 
     surfaces: frozenset[str]
     movables: frozenset[str]
+    # The subset of `movables` that no perception pass has produced yet -- a DeferredObject's name,
+    # until a human phase creates it and it is bound to a real label. Typed like any other movable so
+    # a robot phase over it validates, but held apart because every check that asks "did perception
+    # detect everything the plan names?" must not fail over one of these. See
+    # HITLSession.objects_named.
+    deferred: frozenset[str] = frozenset()
 
     def type_of(self, name: str) -> str:
         """The cuTAMP type of ``name``, or raise if it was not perceived in this scene."""
@@ -118,11 +151,21 @@ class SceneTypes:
     def all_names(self) -> frozenset[str]:
         return self.surfaces | self.movables
 
+    @property
+    def detected(self) -> frozenset[str]:
+        """The names that stand for something a perception pass has actually produced."""
+        return self.all_names - self.deferred
+
     def rebind(self, mapping: Mapping[str, str]) -> "SceneTypes":
-        """The same split under this pass's object labels."""
+        """The same split under this pass's object labels.
+
+        A deferred name that appears in the mapping has just been bound to a real detection, so it
+        stops being deferred -- from here on it is checked like any other object.
+        """
         return SceneTypes(
             surfaces=frozenset(mapping.get(n, n) for n in self.surfaces),
             movables=frozenset(mapping.get(n, n) for n in self.movables),
+            deferred=frozenset(n for n in self.deferred if n not in mapping),
         )
 
 
@@ -203,6 +246,8 @@ class TaskSpecification:
     phases: tuple[Phase, ...]
     scene_types: SceneTypes
     invented: tuple[VLMPredicate, ...] = ()
+    # Objects the plan names that a human phase has to create first. Kept in declaration order.
+    deferred: tuple[DeferredObject, ...] = ()
     # Clauses of the instruction that made it into no phase, with the reason. Non-empty means the run
     # is deliberately doing LESS than it was asked to.
     unrepresented: tuple[dict[str, str], ...] = ()
@@ -220,6 +265,11 @@ class TaskSpecification:
         """Fluent name -> natural-language template, for everything that has one."""
         return {p.name: p.instructions for p in self.invented}
 
+    @property
+    def unbound_deferred(self) -> tuple[DeferredObject, ...]:
+        """The declared objects still waiting to be matched to a real detection."""
+        return tuple(d for d in self.deferred if d.name in self.scene_types.deferred)
+
     def rebind(self, mapping: Mapping[str, str]) -> "TaskSpecification":
         """The same plan under this pass's object labels (see planning.match_drifted_names)."""
         if not mapping:
@@ -229,6 +279,15 @@ class TaskSpecification:
             phases=tuple(p.rebind(mapping) for p in self.phases),
             scene_types=self.scene_types.rebind(mapping),
             invented=self.invented,
+            deferred=tuple(
+                DeferredObject(
+                    name=mapping.get(d.name, d.name),
+                    created_by_phase=d.created_by_phase,
+                    anchor=mapping.get(d.anchor, d.anchor),
+                    description=d.description,
+                )
+                for d in self.deferred
+            ),
             unrepresented=self.unrepresented,
             coverage=self.coverage,
         )
@@ -247,6 +306,18 @@ class TaskSpecification:
             ],
             "surfaces": sorted(self.scene_types.surfaces),
             "movables": sorted(self.scene_types.movables),
+            # Objects no perception pass had produced when the plan was made, and which human phase
+            # creates each. Anything still listed in `unbound` when the run ends never appeared.
+            "deferred_objects": [
+                {
+                    "name": d.name,
+                    "created_by_phase": d.created_by_phase,
+                    "anchor": d.anchor,
+                    "description": d.description,
+                }
+                for d in self.deferred
+            ],
+            "deferred_objects_unbound": sorted(self.scene_types.deferred),
             # Empty on a run that planned the whole instruction. Anything here is a clause the run
             # knowingly left out -- read it before trusting a "success" label.
             "unrepresented": [dict(u) for u in self.unrepresented],

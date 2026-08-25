@@ -8,7 +8,7 @@ trajectory it belongs to; anything that ends the trajectory ends the session wit
 
 import logging
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from cutamp.task_planning import Atom, State
 from PIL import Image
@@ -21,7 +21,14 @@ from tiptop.hitl.grounding import (
     describe_expectations,
     descriptions_for,
 )
-from tiptop.hitl.planning import check_robot_phases, goal_atoms_to_dicts, initial_state_for, phase_objects
+from tiptop.hitl.planning import (
+    ObjectGeometry,
+    bind_deferred_objects,
+    check_robot_phases,
+    goal_atoms_to_dicts,
+    initial_state_for,
+    phase_objects,
+)
 from tiptop.hitl.proposal import propose_plan
 from tiptop.hitl.structs import Phase, TaskSpecification, describe_atom
 
@@ -78,6 +85,20 @@ class HITLSession:
         """Whether the phase the rollout now running is followed by belongs to a human."""
         return self.current is not None and self.current.is_human
 
+    def is_last_leg(self) -> bool:
+        """Whether the leg about to run is the last one of the task -- nothing follows it.
+
+        Mirrors ``advance``: a human phase is one step, a robot leg is the whole ``robot_run()`` its
+        single cuTAMP goal covers. This is what tells cuTAMP whether to end the plan by driving the
+        arm home (``TAMPConfiguration.return_home``). Only the LAST leg should: a home in the middle
+        of a task is motion nobody asked for, recorded into the middle of the demonstration, and the
+        next leg then plans from home rather than from where this one left off.
+
+        True for a finished session too, so a caller that asks before checking ``finished`` gets the
+        conservative answer (plan the return home) rather than the surprising one.
+        """
+        return self.index + max(1, len(self.robot_run())) >= len(self.phases)
+
     def robot_run(self) -> tuple[Phase, ...]:
         """The consecutive robot phases this leg plans and executes as ONE cuTAMP goal.
 
@@ -121,11 +142,19 @@ class HITLSession:
         return goal_atoms_to_dicts(atoms)
 
     def objects_named(self) -> set[str]:
-        """Every object the remaining phases refer to, for the label-drift check."""
+        """Every object the remaining phases refer to, for the label-drift check.
+
+        Intersected with the DETECTED names, not with every name the plan uses: an object a human
+        phase has yet to create is missing from perception on purpose, and the drift check treats a
+        missing name as a plan that can no longer be executed. Left in, the very first leg of a plan
+        with a deferred object would report "perception no longer detects loose_block" and re-plan the
+        whole task -- the failure tiptop_run's re-binding path was added to stop. It joins this set the
+        moment it is bound (SceneTypes.rebind), and is checked like anything else from then on.
+        """
         names: set[str] = set()
         for phase in self.phases[self.index :]:
             names.update(phase_objects(phase))
-        return names & self.spec.scene_types.all_names
+        return names & self.spec.scene_types.detected
 
     def objects_needed_now(self) -> set[str]:
         """The subset of objects_named() this leg cannot proceed without.
@@ -141,13 +170,58 @@ class HITLSession:
         names = set(self.spec.scene_types.surfaces)
         for phase in self.robot_run() or ([self.current] if self.current is not None else []):
             names.update(phase_objects(phase))
-        return names & self.spec.scene_types.all_names
+        return names & self.spec.scene_types.detected
+
+    def robot_movables(self) -> set[str]:
+        """The objects cuTAMP may pick up: exactly the movables some ROBOT phase names.
+
+        A scene shared with a person contains the person's things. Perception detects them because
+        the instruction mentions them -- "remove a block from the jenga tower USING THE SCREWDRIVER"
+        is what makes the screwdriver a labelled object at all -- and every non-surface detection is
+        a Movable by default, so cuTAMP's search treats the human's tool as a thing to pick up. On
+        the run this was written for, three of the four skeletons it enumerated for "put the block
+        back on the tower" opened with Pick(screwdriver), and one of them placed the screwdriver on
+        the tower. None of that is wrong by cuTAMP's lights; it was never told whose the tool is.
+
+        Computed over EVERY robot phase, not the leg about to run, for the reason SceneTypes gives
+        for surfaces: an object that is a Movable in one leg and a static obstacle in the next
+        changes what the search is allowed to do partway through one task. Intersected with the
+        detected names so a deferred object still waiting to be bound -- or one the proposer named
+        that no pass ever produced, like the `top_block` in this task's own spec -- is not handed to
+        create_tamp_environment, whose unknown-object check would reject it.
+        """
+        names: set[str] = set()
+        for phase in self.phases:
+            if not phase.is_human:
+                names.update(phase_objects(phase))
+        return names & set(self.spec.scene_types.movables) & set(self.spec.scene_types.detected)
 
     def rebind(self, mapping: dict[str, str]) -> None:
         """Rename the plan's objects to this pass's labels, keeping the progress made so far."""
         _log.info(f"HITL: re-binding plan objects to this pass's labels: {mapping}")
         self.spec = self.spec.rebind(mapping)
         self.initial_state = initial_state_for(self.spec.scene_types, self.initially_true)
+
+    def bind_new_objects(self, geometry: Mapping[str, ObjectGeometry], detected: Sequence[str]) -> None:
+        """Match any object a human phase has since created onto the label this pass gave it.
+
+        Run on EVERY leg while something is still unbound, not only when the plan's name is missing
+        from this pass. Perception names objects from the task instruction, so on exactly the tasks
+        that need this it readily emits a label matching the plan's -- for a different object. Trusting
+        the name would bind the plan to it; the geometric test is the only thing that can tell them
+        apart, so it always runs.
+        """
+        if not self.spec.unbound_deferred:
+            return
+        mapping = bind_deferred_objects(self.spec, geometry, detected, self.index)
+        if mapping:
+            self.rebind(mapping)
+
+    def unbound_needed_now(self) -> list[str]:
+        """Deferred objects this leg cannot run without, and which nothing has bound yet."""
+        phases = self.robot_run() or ([self.current] if self.current is not None else [])
+        wanted = {name for phase in phases for name in phase_objects(phase)}
+        return sorted(wanted & self.spec.scene_types.deferred)
 
     def advance(self) -> Phase | None:
         """Move past the work this leg carried out, and return the phase it started at.
