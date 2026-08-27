@@ -162,6 +162,14 @@ class BlendConfig:
     # VAE-manifold checkpoint (vae mode). Taken from the SAME `vae_path` override the cuRobo manifold
     # cost uses, so the re-timer scores against the encoder and DROID cluster that shaped the geometry.
     vae_path: str | None = None
+    # VAE mode only. False (default) minimizes Mahalanobis distance to the DROID cluster MEAN -- a
+    # mode-seeking objective whose optimum is the centroid, which no real motion occupies (the
+    # checkpoint bakes maha2_droid_mean = 7.04 over 94,774 real segments). True draws one target
+    # latent per stroke from the cluster and aims at THAT, in both the optimizer and the multi-start
+    # ranking, which turns the objective from "be maximally typical" into a distribution match.
+    # Targets a measured defect: between-stroke residual log-duration sd 0.148 against DROID's 0.414
+    # (analysis_dataset_diff/VAE_RETIMING_FIX.md).
+    vae_sample_target: bool = False
     # Flow mode only: number of Euler ODE steps when sampling the flow model (more = finer, slower).
     flow_steps: int = 60
     # Flow mode only: use ONLY the flow's sampled timing and keep the collision-checked cuTAMP geometry,
@@ -259,6 +267,13 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
                                         checkpoints/droid_timing_stats.npz.
         blend_seed:       int        -- seed the pace / boundary / flow draws. Omitted (default) means a
                                         fresh draw per plan, which is the point in dataset generation.
+        blend_vae_sample_target: bool -- vae mode only. False (default) keeps the original objective:
+                                        minimize Mahalanobis distance to the DROID cluster MEAN. True
+                                        draws one target latent per stroke from the cluster and aims at
+                                        that instead, in BOTH the optimizer and the multi-start ranking.
+                                        Fixes a measured collapse of between-stroke timing variance
+                                        (residual log-duration sd 0.148 vs DROID's 0.414); see
+                                        vae_retiming.target_latent.
     """
     o = overrides or {}
     # vae_retiming means the VAE manifold cost owns the clock (it optimizes each waypoint interval's
@@ -323,6 +338,7 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         # Resolved the same way the cuRobo manifold cost resolves it, so both ends of the pipeline
         # score against one checkpoint even when the config gives a repo-relative path.
         vae_path=resolve_vae_path(str(o["vae_path"])) if o.get("vae_path") else None,
+        vae_sample_target=bool(o.get("blend_vae_sample_target", False)),
         flow_steps=int(o.get("blend_flow_steps", 60)),
         flow_retime_only=bool(o.get("blend_flow_retime_only", True)),
         pace_mode=pace_mode,
@@ -671,7 +687,7 @@ def _blend_trajectory_steps(
 
         pos, vel, acc, dt_out = vae_retime_group(
             joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed,
-            config.max_duration_mult, config.vae_path,
+            config.max_duration_mult, config.vae_path, config.vae_sample_target,
         )
     else:
         pos, vel, acc, dt_out = blend_group(

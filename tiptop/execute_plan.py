@@ -66,6 +66,39 @@ _TRAJ_LOOKAHEAD = 1
 # knock the object on approach. 0 reproduces the old firing instant, minus the stop.
 GRIPPER_LEAD_S = float(os.environ.get("TIPTOP_GRIPPER_LEAD_S", "0.0"))
 
+# --------------------------------------------------------------------------------------------- #
+# Empty-grasp detection                                                                          #
+# --------------------------------------------------------------------------------------------- #
+# A cuTAMP plan is executed OPEN-LOOP: it closes the gripper where the plan says to, then carries
+# and releases regardless of whether anything is in the jaws. Measured over the shipped datasets
+# (analysis_dataset_diff/TELEOP_VS_APEX.md), 32% of picks in
+# `1_pp_toys_plate_vae_style_timing_apex_learned_posture_prpl` closed on EMPTY AIR against 8% for
+# human teleop on the same task -- and because replay has no grasp feedback, every one of those
+# failures is TERMINAL and UNLABELLED: exactly 3 gripper-close events in all 20 episodes, where the
+# human retried and produced 3-5. A third of that dataset's pick demonstrations therefore show a
+# close-on-nothing followed by an unchanged carry-and-release, and nothing anywhere in it shows a
+# failed grasp being detected or recovered.
+#
+# So: check after each Pick close, and fail the episode if the jaws are empty. Failing (rather than
+# retrying in place) is deliberate -- a retry that repeats the same grasp pose usually misses the
+# same way, and the labelled-failure path already exists and keeps the episode out of the dataset.
+#
+# TWO SIGNALS, in preference order:
+#  1. `is_grasped` -- the Robotiq gOBJ register (`gOBJ in (1, 2)` = "stopped early because the
+#     fingers hit something"), i.e. the gripper's own object detection. Authoritative when present.
+#  2. Jaw width. An empty close drives the jaws to their mechanical minimum; a held object holds
+#     them apart by its own thickness. This is the criterion validated offline at 12/12 on a random
+#     wrist-camera sample: on the closedness convention `1 - width/GRIPPER_MAX_WIDTH`, held picks
+#     plateau at 0.88-0.95 and empty ones saturate above 0.97. 0.97 closedness is 2.5 mm of width.
+#
+# The width test is what fires on a gripper that reports no gOBJ (e.g. the YAM). An object thinner
+# than the threshold reads as empty -- fine for plush toys and fruit, wrong for a sheet of paper, so
+# the threshold is an env knob and the check as a whole can be turned off.
+GRASP_CHECK = os.environ.get("TIPTOP_GRASP_CHECK", "1") != "0"
+# Jaw width at or below which a closed gripper is holding nothing, in metres. 2.5 mm == 0.97 on the
+# recorded closedness convention (see above); the shipped datasets' empty closes sat at 0.8-1.1 mm.
+EMPTY_GRASP_WIDTH_M = float(os.environ.get("TIPTOP_EMPTY_GRASP_WIDTH_M", "0.0025"))
+
 
 class ExecutionFailure(Exception):
     """Failure in executing plan on robot."""
@@ -350,6 +383,68 @@ def _can_overlap_gripper(client) -> bool:
     return getattr(client, "gripper_socket", None) is not None
 
 
+def _grasp_is_empty(state: dict | None) -> tuple[bool | None, str]:
+    """Did the just-closed gripper end up holding nothing? ``(verdict, why)``.
+
+    ``verdict`` is None when neither signal is readable, so an unreadable gripper never fails an
+    episode -- it degrades to today's open-loop behaviour and says so in the reason string.
+    """
+    if not state:
+        return None, "gripper state unavailable"
+    width = state.get("width")
+    grasped = state.get("is_grasped")
+    w_txt = f"{width * 1000:.1f}mm" if isinstance(width, (int, float)) else "?"
+    # gOBJ is the gripper's own object detection; trust it when the controller reports it.
+    if isinstance(grasped, bool):
+        return (not grasped), f"is_grasped={grasped} (width {w_txt})"
+    if isinstance(width, (int, float)):
+        return bool(width <= EMPTY_GRASP_WIDTH_M), f"width {w_txt} vs {EMPTY_GRASP_WIDTH_M * 1000:.1f}mm"
+    return None, "gripper state has neither is_grasped nor width"
+
+
+def _adjudicate_grasp(state: dict | None, label: str, step: int) -> None:
+    """Raise :class:`ExecutionFailure` if ``state`` says the jaws came up empty.
+
+    An undeterminable verdict warns and returns: an unreadable gripper degrades to today's
+    open-loop behaviour rather than failing every episode.
+    """
+    empty, why = _grasp_is_empty(state)
+    if empty is None:
+        _log.warning(f"Grasp check skipped at step {step + 1} ({label}): {why}")
+        return
+    if empty:
+        raise ExecutionFailure(
+            f"empty grasp at step {step + 1} ({label}): the gripper closed on nothing [{why}]. "
+            f"The plan is open-loop and would carry and release regardless; failing the episode so "
+            f"it is not recorded as a successful pick. Set TIPTOP_GRASP_CHECK=0 to disable."
+        )
+    _log.info(f"Grasp check OK at step {step + 1} ({label}): {why}")
+
+
+def _check_grasped(client, arm: str | None, label: str, step: int) -> None:
+    """Adjudicate a close from a LIVE gripper read (the blocking path, which has already settled)."""
+    if not GRASP_CHECK:
+        return
+    _adjudicate_grasp(_gripper_state(client, arm), label, step)
+
+
+def _check_grasped_from(client, box: dict, step: int, label: str, arm: str | None = None) -> None:
+    """Adjudicate a close using the state its gripper thread already captured.
+
+    This is the overlapped path: the reading was taken inside the thread that polled the close to a
+    stop (see :func:`_spawn_gripper_command`), so the check costs the arm nothing and does not
+    reintroduce a stall at gripper events. Detection therefore lags by one gripper event -- harmless
+    here, because the response is to abandon the episode rather than to recover mid-plan.
+
+    Falls back to a live read when the box carries no state. That read is later than the seated
+    instant, but the jaws do not reopen on their own, so an empty close still reads empty.
+    """
+    if not GRASP_CHECK:
+        return
+    state = box.get("state") if isinstance(box, dict) else None
+    _adjudicate_grasp(state if state is not None else _gripper_state(client, arm), label, step)
+
+
 def _spawn_gripper_command(client, action: str, arm: str | None = None) -> tuple[threading.Thread, dict]:
     """Fire an open/close gripper command on a BACKGROUND thread; return ``(thread, box)``.
 
@@ -369,6 +464,11 @@ def _spawn_gripper_command(client, action: str, arm: str | None = None) -> tuple
     def _run() -> None:
         try:
             box["result"] = _command_gripper(client, action, arm=arm)
+            # Read the settled state HERE, on the gripper thread, so the empty-grasp verdict costs
+            # the arm nothing. _command_gripper has already polled the gripper to a stop, so this is
+            # the seated width -- the same quantity the offline detector was validated against.
+            if action == "close":
+                box["state"] = _gripper_state(client, arm)
         except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread at join time
             box["exc"] = exc
 
@@ -377,14 +477,19 @@ def _spawn_gripper_command(client, action: str, arm: str | None = None) -> tuple
     return thread, box
 
 
-def _join_gripper(pending: "tuple[threading.Thread, dict] | None") -> None:
-    """Wait for a spawned gripper command to finish and re-raise any error it captured."""
+def _join_gripper(pending: "tuple[threading.Thread, dict] | None") -> dict:
+    """Wait for a spawned gripper command to finish and re-raise any error it captured.
+
+    Returns the thread's box, whose ``state`` key holds the settled gripper reading for a close (see
+    :func:`_spawn_gripper_command`); callers use it for the empty-grasp check.
+    """
     if pending is None:
-        return
+        return {}
     thread, box = pending
     thread.join()
     if "exc" in box:
         raise box["exc"]
+    return box
 
 
 def _rewrite_timeline(timeline: list | None, seq_of_step: dict, times: dict) -> None:
@@ -477,6 +582,9 @@ def execute_cutamp_plan(
     # An overlapped gripper command keeps actuating (on the gripper socket) while the next
     # trajectory runs; we hold its handle here and join it before the next gripper / at the end.
     pending_gripper: "tuple[threading.Thread, dict] | None" = None
+    # (step, label) of the close whose thread is in flight, so its empty-grasp verdict can be
+    # adjudicated at join time and still be reported against the step that actually closed.
+    pending_close: "tuple[int, str] | None" = None
     try:
         for step, action_dict in enumerate(cutamp_plan):
             action_start_time = time.perf_counter()
@@ -501,8 +609,11 @@ def execute_cutamp_plan(
                     raise ValueError(f"Unknown gripper action: {action}")
                 # A previously overlapped gripper command may still own the gripper socket; finish it
                 # (surfacing any error) before issuing another.
-                _join_gripper(pending_gripper)
+                box = _join_gripper(pending_gripper)
                 pending_gripper = None
+                if pending_close is not None:
+                    _check_grasped_from(client, box, *pending_close)
+                    pending_close = None
                 if queued.available and last_traj_step is not None:
                     # Keep the next segment queued FIRST -- that is what lets the arm roll through this
                     # event instead of stopping -- then block until the arm actually reaches it, so the
@@ -527,6 +638,8 @@ def execute_cutamp_plan(
                     # sampler still sees the ramp); the NEXT loop iteration runs the trajectory
                     # concurrently on the control socket.
                     pending_gripper = _spawn_gripper_command(client, action)
+                    if action == "close":
+                        pending_close = (step, action_label)
                     settle_delay = CLOSE_CONTACT_DELAY_S if action == "close" else OPEN_CONTACT_DELAY_S
                     if settle_delay > 0 and not queued.available:
                         # Stationary settle: lets the fingers seat before the arm departs. This only
@@ -539,6 +652,8 @@ def execute_cutamp_plan(
                     result = {"success": True}  # real result/exception surfaced when the thread is joined
                 else:
                     result = _command_gripper(client, action)
+                    if action == "close":
+                        _check_grasped(client, None, action_label, step)
 
             elif action_type == "trajectory":
                 # Extract joint position and velocity waypoints for the trajectory
@@ -628,7 +743,12 @@ def execute_cutamp_plan(
         queued.close()
 
     # A trailing overlapped gripper (rare -- plans usually end on a trajectory) must finish here.
-    _join_gripper(pending_gripper)
+    box = _join_gripper(pending_gripper)
+    if pending_close is not None:
+        # A close that no later gripper step ever followed -- adjudicate it before declaring success,
+        # or a plan whose last pick came up empty would still report a clean run.
+        _check_grasped_from(client, box, *pending_close)
+        pending_close = None
 
     # Now we're done executing plan open-loop without any failures on the controller side
     duration = time.perf_counter() - start_time

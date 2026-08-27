@@ -16,6 +16,7 @@ from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs import TAMPEnvironment
+from cutamp.particle_initialization import NoGraspsError
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 from cutamp.tamp_domain import get_initial_state
 from cutamp.task_planning import PlanSkeleton, State
@@ -68,6 +69,7 @@ def build_tamp_config(
     transit_apex_min_dist: float = 0.10,
     q_home: Sequence[float] | None = None,
     posture_selection: dict | None = None,
+    require_m2t2_grasps: bool = False,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
@@ -129,6 +131,10 @@ def build_tamp_config(
         # teleop band, instead of cuRobo's top seed. Off unless a cfg/tamp yml sets
         # `posture_selection_seeds`; see resolve_posture_selection and cuTAMP's TAMPConfiguration.
         **(posture_selection or {}),
+        # Fail rather than substitute collision-sphere heuristic grasps when perception proposed
+        # nothing for an object that must be picked. Off unless a cfg/tamp yml sets
+        # `require_m2t2_grasps`; see resolve_require_m2t2_grasps and cuTAMP's TAMPConfiguration.
+        require_m2t2_grasps=require_m2t2_grasps,
     )
 
 
@@ -310,24 +316,38 @@ def run_planning(
             n += 1
         return experiment_dir / f"attempt_{n}"
 
+    starved: list[str] = []  # set by solve() when an object had no M2T2 grasps; see below
+
     def solve(skeleton):
         cutamp_out: dict = {}
-        plan, _, reason = run_cutamp(
-            env,
-            config,
-            cost_reducer,
-            constraint_checker,
-            q_init=q_init,
-            ik_solver=ik_solver,
-            grasps=grasps,
-            motion_gen=motion_gen,
-            experiment_dir=attempt_dir(),
-            reuse_plan_skeleton=skeleton,
-            plan_out=cutamp_out,
-            # Read from the closure so the reuse attempt and the fallback search below both end at
-            # the same configuration; cuTAMP ignores it when config.return_home is off.
-            q_return=q_return,
-        )
+        try:
+            plan, _, reason = run_cutamp(
+                env,
+                config,
+                cost_reducer,
+                constraint_checker,
+                q_init=q_init,
+                ik_solver=ik_solver,
+                grasps=grasps,
+                motion_gen=motion_gen,
+                experiment_dir=attempt_dir(),
+                reuse_plan_skeleton=skeleton,
+                plan_out=cutamp_out,
+                # Read from the closure so the reuse attempt and the fallback search below both end
+                # at the same configuration; cuTAMP ignores it when config.return_home is off.
+                q_return=q_return,
+            )
+        except NoGraspsError as exc:
+            # `require_m2t2_grasps` refused to substitute heuristic collision-sphere grasps for an
+            # object perception proposed nothing for. That is a PLANNING failure, not a crash:
+            # reported the same way as any other, so the reset path drops the offending object and
+            # retries and the task path fails the episode cleanly instead of unwinding the session.
+            #
+            # Recorded so the reuse fallback below can be SKIPPED. A starved object is a fact about
+            # this scene's perception, not about the skeleton, so a full task search would hit the
+            # same object and fail identically -- for the price of a whole search.
+            starved.append(str(exc))
+            return None, str(exc), None
         return plan, reason, cutamp_out.get("plan_skeleton")
 
     start = time.perf_counter()
@@ -343,7 +363,7 @@ def run_planning(
     cutamp_plan, failure_reason, final_skeleton = solve(reuse_plan_skeleton)
     if cutamp_plan is not None:
         reused = reuse_plan_skeleton is not None
-    elif reuse_plan_skeleton is not None:
+    elif reuse_plan_skeleton is not None and not starved:
         # The task plan still applies symbolically, but this scene admits no grasp/placement/motion
         # for it -- the objects have moved. A different skeleton may well work, so search after all.
         _log.warning(f"Reused task plan produced no motion plan ({failure_reason}); falling back to a full task search")

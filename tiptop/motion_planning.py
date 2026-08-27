@@ -376,6 +376,23 @@ def resolve_posture_selection(overrides: dict | None) -> dict:
     return out
 
 
+def resolve_require_m2t2_grasps(overrides: dict | None) -> bool:
+    """Whether a zero-candidate object should FAIL planning instead of taking heuristic grasps.
+
+    With ``m2t2_grasps`` on, an object M2T2 proposed nothing for is not dropped: cuTAMP's
+    ``_sample_grasps`` falls through to the 4-/6-DOF heuristic sampler, which draws grasps from the
+    object's COLLISION-SPHERE approximation rather than from perception. Measured over shipped runs'
+    ``scene_objects.json``, 18-43% of picked objects took that path, and it is a direct mechanism
+    for closing on empty air (analysis_dataset_diff/TELEOP_VS_APEX.md, Finding 5).
+
+    Off by default so existing configs keep their planning outcomes -- the fallback is warned about
+    either way. Data-collection configs should set ``require_m2t2_grasps: true``, where a guessed
+    grasp that misses costs a whole mislabelled episode; raise ``m2t2_num_runs`` alongside it so
+    objects actually get candidates rather than just failing more.
+    """
+    return bool((overrides or {}).get("require_m2t2_grasps"))
+
+
 def resolve_ik_num_seeds(overrides: dict | None) -> int | None:
     """How many seeds the IKSolver optimizes per problem.
 

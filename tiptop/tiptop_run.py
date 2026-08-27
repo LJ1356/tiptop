@@ -59,6 +59,7 @@ from tiptop.motion_planning import (
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
     resolve_posture_selection,
+    resolve_require_m2t2_grasps,
     resolve_time_dilation_factor,
     resolve_trace_cfg,
     resolve_traj_length_norm,
@@ -3891,6 +3892,10 @@ def _sync_entrypoint(
             # (plan_clear_then_task's second half) overrides it; run_planning's return_home=False
             # suppresses the drive altogether for a non-final HITL leg. All three coexist in cuTAMP.
             q_home=cfg.robot.q_home,
+            # Fail instead of silently substituting collision-sphere heuristic grasps for an object
+            # perception proposed nothing for (off unless the cfg sets it). See
+            # resolve_require_m2t2_grasps.
+            require_m2t2_grasps=resolve_require_m2t2_grasps(cost_overrides),
         )
         for robot_type in _planning_robot_types()
     }
