@@ -68,6 +68,7 @@ sam-server = "tiptop.scripts.sam_server:main"
 # Setup and calibration scripts
 tiptop-config = "tiptop.scripts.tiptop_config:entrypoint"
 calibrate-wrist-cam = "tiptop.scripts.calibrate_wrist_cam:calibrate_wrist_camera_entrypoint"
+calibrate-top-cam = "tiptop.scripts.calibrate_top_cam:calibrate_top_cam_entrypoint"
 compute-gripper-mask = "tiptop.scripts.compute_gripper_mask:compute_gripper_mask_entrypoint"
 paint-gripper-mask = "tiptop.scripts.paint_gripper_mask:paint_gripper_mask_entrypoint"
 
@@ -88,6 +89,10 @@ go-home = "tiptop.scripts.go_to_conf:go_to_home_entrypoint"
 go-to-capture = "tiptop.scripts.go_to_conf:go_to_capture_entrypoint"
 gripper-open = "tiptop.scripts.gripper_actuate:gripper_open_entrypoint"
 gripper-close = "tiptop.scripts.gripper_actuate:gripper_close_entrypoint"
+
+# Bimanual YAM equivalents: select a YAM config themselves and take --arm {left,right,both}
+go-home-yam = "tiptop.scripts.yam_commands:go_home_yam_entrypoint"
+gripper-open-yam = "tiptop.scripts.yam_commands:gripper_open_yam_entrypoint"
 
 # Main tiptop demo
 tiptop-run = "tiptop.tiptop_run:entrypoint"

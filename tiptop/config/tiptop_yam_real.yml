@@ -1,0 +1,134 @@
+# TiPToP configuration for the REAL bimanual YAM (i2rt arms on CAN + 3 RealSense cameras).
+#
+# Select it with TIPTOP_CONFIG (see config/__init__.py::_resolve_config_path):
+#
+#   TIPTOP_CONFIG=tiptop_yam_real.yml pixi run tiptop-run --output-dir ... --enable-recording
+#
+# data-collection sets that variable for you from the `embodiment:` key of cfg/tamp/*.yml
+# (see collect/config.py and server/lib/sessions.js).
+#
+# The two SIM configs next to this one (tiptop_yam.yml / tiptop_yam_right.yml) drive the websocket
+# server from Isaac Sim and are unrelated to this file beyond sharing the cuRobo embodiment.
+#
+# PREREQUISITE — the arm server must be running, in an environment that has i2rt:
+#
+#   sudo ip link set can_left  up type can bitrate 1000000
+#   sudo ip link set can_right up type can bitrate 1000000
+#   /home/prism-yam/openpi/examples/yam/.venv/bin/python tiptop/yam_arm_server.py
+#
+# tiptop talks to it over ZMQ; i2rt is never imported into this environment (it pins numpy 2.2.6 /
+# rerun >= 0.32, which cuRobo's pins here do not admit).
+
+robot:
+  # cuTAMP plans a single kinematic chain, so the ACTIVE ARM is part of the embodiment: this config
+  # selects that arm's ee_link and locks the other one as an obstacle. A sequential-bimanual rollout
+  # switches this value per plan (tiptop.yam.active_arm), so what is written here is only the arm
+  # that goes first.
+  type: bimanual_yam_left
+  dof: 6
+
+  # Sequential bimanual, exactly as droid-sim-evals/eval/yam_tiptop_eval.py --bimanual does it:
+  # split the perceived objects between the arms at the robot's midline, then plan and execute one
+  # arm's objects, park it, re-perceive, and do the other. NOT simultaneous dual-arm TAMP.
+  # Set to [left] (or [right]) to collect with one arm; the other is then only parked and recorded.
+  arms: [left, right]
+
+  # Midline the object split uses, in the URDF `world` frame. The base column is mounted at
+  # (0.24, 0, 0.0551) with the left arm at y = +0.24 and the right at y = -0.24
+  # (cutamp/robots/assets/yam_description/bimanual_yam.urdf), so objects at y >= this go to the left
+  # arm. Matches MOUNT_XYZ[1] in the sim environment.
+  base_y: 0.0
+
+  # yam_arm_server.py. Same port layout as the Franka's bamboo shim so the client code is shared:
+  # control blocks during a trajectory, state is a lock-free cache the LeRobot capture polls at
+  # 30 Hz throughout, gripper has its own thread so actuation can overlap arm motion.
+  host: "127.0.0.1"
+  port: 5555
+  gripper_port: 5559
+  state_port: 5557
+
+  # Fraction of cuRobo's own timing to execute at. The sim configs use 1.0; this is a real arm with
+  # stiff position control (kp 80 on the shoulder joints, i2rt/robots/config/yam.yml), so start slow
+  # and raise it once the motion looks right. 0.2 is what the Franka runs at.
+  time_dilation_factor: 0.3
+
+  # Elbow-up rest posture. This is NOT a free choice: it must equal
+  # cutamp.robots.bimanual_yam.bimanual_yam_neutral_joint_positions and the `lock_joints` values in
+  # bimanual_yam_{left,right}.yml, because the arm that is not planning is collision-checked at
+  # exactly this configuration. tiptop.yam.NEUTRAL_Q and yam_arm_server.NEUTRAL_Q are the same numbers.
+  q_home: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+  # Same as home: perception is through a FIXED camera, so unlike the Franka there is no pose the
+  # arm has to reach for the scene to be visible — it only has to be out of the way, which home is.
+  q_capture: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+
+cameras:
+  # The `hand` slot is "the camera TAMP perceives through" (the name is DROID history, where it is
+  # the wrist ZED). Here it is the FIXED third-person D435 on the base column — the same viewpoint
+  # the sim plans from (MolmoAct2's top_cam).
+  #
+  # mount: world means its calibration entry IS world_from_cam, read straight out of
+  # calibration_info_<workspace>.json and NOT composed with forward kinematics. Add an entry keyed
+  # by this serial, as [x, y, z, roll, pitch, yaw] in the URDF `world` frame — whose origin is
+  # 0.24 m in -x from the base column and 0.0551 m below its mounting face.
+  hand:
+    serial: "${oc.env:TIPTOP_TOP_CAMERA_ID,254622075770}"
+    type: realsense
+    width: 1280
+    height: 720
+    fps: 30
+    mount: world
+
+  # Wrist cameras. Recorded into the episode, never perceived through, so they open colour-only:
+  # the IR pair exists to feed FoundationStereo, and three IR pairs on one USB controller is what
+  # pushes a D405 down to USB-2 and loses the mode entirely.
+  external:
+    serial: "${oc.env:TIPTOP_LEFT_WRIST_CAMERA_ID,353322270876}"
+    type: realsense
+    width: 640
+    height: 360
+    fps: 30
+    record_only: true
+
+  external_2:
+    serial: "${oc.env:TIPTOP_RIGHT_WRIST_CAMERA_ID,353322271825}"
+    type: realsense
+    width: 640
+    height: 360
+    fps: 30
+    record_only: true
+
+perception:
+  foundation_stereo:
+    # Depth comes from FoundationStereo on the D435's IR stereo pair, warped onto the colour grid
+    # (perception/cameras/rs_camera.py::rs_infer_depth_async). The server must be up before a run.
+    #
+    # 1234 matches tiptop.yml and the `start-fs` shell helper. Note this URL is genuinely contacted
+    # here, unlike on the DROID path: tiptop.yml carries the same port as a placeholder because the
+    # ZED branch was patched to read hardware depth and never calls the server at all.
+    # FoundationStereo/server.py's own default is 8124, so the port is always passed explicitly.
+    url: "http://localhost:${oc.env:TIPTOP_FS_PORT,1234}"
+
+  m2t2:
+    url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
+    apply_bounds: true
+
+  # Add each M2T2 grasp's jaw-flipped twin (180 deg about the approach axis), which for a parallel
+  # jaw is the same physical grasp. On because the YAM is a 6-DOF arm: with no null space it cannot
+  # roll its wrist to whichever representative M2T2 emitted, so half the valid grasps are otherwise
+  # unreachable. Measured in sim on scene 6, the far toy had 3 grasps of which the arm could reach 0
+  # as emitted and all 3 flipped. Left off in tiptop.yml so the 7-DOF Franka path is unchanged.
+  augment_flipped_grasps: true
+
+  sam:
+    mode: "local"
+
+  depth_trunc_m: 2.5
+  voxel_downsample_size: 0.0075
+  contact_threshold_m: 0.01
+  mask_erosion_pixels: 3
+
+  # Median-fuse a burst of stereo frames at the (static) capture pose to suppress sensor noise.
+  # Worth more here than on the ZED: the D435's IR stereo is noisier, and unlike the Franka the
+  # camera is fixed, so the burst really is the same viewpoint every time.
+  depth_smoothing:
+    num_frames: 5

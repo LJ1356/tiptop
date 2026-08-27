@@ -43,6 +43,75 @@ class ZedIntrinsics:
     baseline: float  # Meters
 
 
+_STEREOLABS_USB_VENDOR_ID = "2b03"
+
+
+def _sdk_visible_serials() -> dict[str, str]:
+    """Serials the ZED SDK can currently enumerate, mapped to a 'model, state' description.
+
+    A ZED whose video interface failed to come up is either absent from this list or reported with
+    serial 0, which is why a serial can be correct yet still open as CAMERA NOT DETECTED.
+    """
+    import pyzed.sl as sl
+
+    devices = {}
+    for dev in sl.Camera.get_device_list():
+        devices[str(dev.serial_number)] = f"{dev.camera_model}, {dev.camera_state}"
+    return devices
+
+
+def _usb_attached_serials() -> dict[str, str]:
+    """Serials of Stereolabs USB devices the kernel sees, mapped to their product string.
+
+    Reads sysfs directly (Linux-only, returns {} elsewhere). Every ZED presents a low-speed HID
+    interface carrying the serial plus a separate USB3 video interface; the HID half enumerating
+    alone is the signature of a cable/port that isn't giving the camera USB3.
+    """
+    serials = {}
+    for dev_dir in Path("/sys/bus/usb/devices").glob("*/"):
+        try:
+            if (dev_dir / "idVendor").read_text().strip() != _STEREOLABS_USB_VENDOR_ID:
+                continue
+            serial = (dev_dir / "serial").read_text().strip()
+            product = (dev_dir / "product").read_text().strip()
+        except OSError:
+            continue
+        # The video interface reports a generic serial ("OV0001"); only the HID half carries the real one.
+        if serial.isdigit() and serial != "0":
+            serials[serial] = product
+    return serials
+
+
+def _open_failure_help(serial: str) -> str:
+    """Explain an open failure in terms of what is actually attached, not just the SDK error code."""
+    sdk = _sdk_visible_serials()
+    if serial in sdk:
+        return f"The SDK does see this serial ({sdk[serial]}), so it is attached but not openable."
+
+    usb = _usb_attached_serials()
+    lines = [
+        f"The ZED SDK does not see s/n {serial}.",
+        f"  SDK enumerates: {sdk if sdk else 'no cameras at all'}",
+        f"  Stereolabs USB devices attached: {usb if usb else 'none'}",
+    ]
+    if serial in usb:
+        lines += [
+            f"  -> s/n {serial} IS attached ({usb[serial]}) but only its HID interface enumerated; its USB3",
+            "     video interface never came up. The serial is correct -- editing it will not help.",
+            "     Cause is the cable, the port, or the camera itself. To tell them apart: move the camera to",
+            "     a USB3 port on the same controller as a working ZED and re-check. A video node appearing",
+            "     means cable/port; still missing means the unit.",
+        ]
+    elif usb:
+        lines += [
+            f"  -> s/n {serial} is not attached at all. The serials above are what is plugged in; if a camera",
+            "     was swapped, update TIPTOP_HAND_CAMERA_ID / TIPTOP_EXTERNAL_CAMERA_ID to match.",
+        ]
+    else:
+        lines.append("  -> No Stereolabs device is attached. Check power and the USB connection.")
+    return "\n".join(lines)
+
+
 def _custom_params(resolution: str, fps: int, flip: bool = False):
     """Build camera init params from explicit resolution and fps strings."""
     import pyzed.sl as sl
@@ -112,17 +181,26 @@ class ZedCamera:
             # by a stale handle from a previous run that didn't release it (crash / kill -9 /
             # interrupted teardown). A hardware reboot of the camera over USB clears that and a
             # wedged video module. Targets this serial only, so sibling cameras are unaffected.
-            try:
-                _log.info(f"Rebooting ZED camera {self.serial} over USB to recover...")
-                sl.Camera.reboot(int(self.serial))
-            except Exception as e:
-                _log.warning(f"ZED reboot({self.serial}) failed (continuing to retry): {e}")
+            # Only meaningful when the SDK can actually see the camera: rebooting a serial it can't
+            # enumerate just returns INVALID FUNCTION CALL and buries the real error in noise.
+            if self.serial in _sdk_visible_serials():
+                try:
+                    _log.info(f"Rebooting ZED camera {self.serial} over USB to recover...")
+                    sl.Camera.reboot(int(self.serial))
+                except Exception as e:
+                    _log.warning(f"ZED reboot({self.serial}) failed (continuing to retry): {e}")
+            else:
+                # Full diagnosis is left to the RuntimeError below, so it is not repeated per retry.
+                _log.warning(f"ZED camera {self.serial} is not enumerated by the SDK; skipping USB reboot")
             time.sleep(open_retry_delay)
             self._cam = sl.Camera()
             status = self._cam.open(sl_params)
             attempt += 1
         if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"ZED camera (s/n: {self.serial}) failed to open after {attempt} attempt(s): {status}")
+            raise RuntimeError(
+                f"ZED camera (s/n: {self.serial}) failed to open after {attempt} attempt(s): {status}\n"
+                f"{_open_failure_help(self.serial)}"
+            )
 
         # Cache the intrinsics
         _ = self.get_intrinsics()

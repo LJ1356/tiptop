@@ -32,20 +32,31 @@ cameras:
   #   hand      wrist camera. Its pose is only known through the arm, so world_from_cam is
   #             recomputed by forward kinematics at every capture and the arm first drives to
   #             q_capture to aim it at the scene. The gripper is masked out of the point cloud.
-  #   external  third-person camera. Its pose is static, read straight out of calibration_info
-  #             as world_from_cam, so the arm is left at q_home instead of driving into the shot
-  #             (an arm in frame lands in the point cloud, the RANSAC table fit and the grasps).
-  #             q_home must be clear of this camera's view.
-  # Either way the hand and external cameras are both opened and recorded as usual.
-  perception: external
+  #   external  third-person (side-view) camera. Its pose is static, read straight out of
+  #             calibration_info as world_from_cam, so the arm is left at q_home instead of driving
+  #             into the shot; the arm is dropped from the cloud by projecting cuRobo's collision
+  #             spheres into the frame (perception.robot_mask_margin_m below). That mask is not a
+  #             guarantee, and a leg that skips the return-home reset — an operator hand-off or the
+  #             phase after a human-in-the-loop one — leaves the arm wherever the person put it, so
+  #             an arm in frame can still land in the point cloud, the RANSAC table fit and the
+  #             grasps. q_home must be clear of this camera's view.
+  # Either way the hand and external cameras are both opened and recorded as usual — this only picks
+  # which one TAMP perceives through.
+  #
+  # Written through the env var so a launcher can pick per session (tamp-vla's data-collection sets
+  # TIPTOP_PERCEPTION_CAMERA from its top-bar selector); nothing in THIS repo sets it, so the default
+  # is what actually runs, and this rig's answer is external.
+  perception: "${oc.env:TIPTOP_PERCEPTION_CAMERA,external}"
+
+  # Hand (wrist) camera
   hand:
     serial: "${oc.env:TIPTOP_HAND_CAMERA_ID,14846828}"
     type: zed
     resolution: HD720
     fps: 15
 
-  # External (side/third-person) camera — recorded, and the perception camera when
-  # cameras.perception is "external"
+  # External (side/third-person) camera — recorded as DROID exterior_1, and the camera TAMP
+  # perceives through when cameras.perception is "external"
   external:
     serial: "${oc.env:TIPTOP_EXTERNAL_CAMERA_ID,32439448}"
     type: zed
@@ -72,20 +83,31 @@ perception:
     # at their own M2T2 server; defaults to 8123 (single-instance / full_eval). See datagen launcher.
     url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
     apply_bounds: true
+    # Confidence floor M2T2 applies when emitting grasps (its `mask_thresh`). 0.035 is M2T2's own
+    # default and what tiptop used before this was configurable. Lowering it yields several times
+    # more candidates per object -- which is what gives cuTAMP's grasp costs something to choose
+    # between -- at the price of admitting grasps M2T2 is less confident in. Settable per data-gen
+    # config via `grasp_threshold` in cfg/tamp tamp_overrides.
+    grasp_threshold: 0.035
+    # How many stochastic M2T2 passes are pooled into one grasp set. 5 is M2T2's own default. This
+    # is the strongest lever on how many candidates each object gets and, unlike grasp_threshold, it
+    # is quality-neutral -- more samples of the same distribution, not a lower bar. Costs linear
+    # wall-clock (~0.9 s at 5, ~3.2 s at 20). Settable per data-gen config via `m2t2_num_runs`.
+    num_runs: 5
 
   sam:
     mode: "local"
-
-  # Padding added to each of the robot's cuRobo collision spheres before they are projected into a
-  # third-person view and dropped from the point cloud (see project_spheres_to_mask). Covers
-  # extrinsics and kinematics error; raise it if a rim of arm survives in the cloud. Unused when the
-  # wrist camera does perception -- that view uses the painted gripper mask.
-  robot_mask_margin_m: 0.02
 
   depth_trunc_m: 5.0
   voxel_downsample_size: 0.0075
   contact_threshold_m: 0.01
   mask_erosion_pixels: 3
+
+  # Padding added to each of the robot's cuRobo collision spheres before they are projected into the
+  # third-person view and dropped from the point cloud (see project_spheres_to_mask). Covers
+  # extrinsics and kinematics error; raise it if a rim of arm survives in the cloud. Unused when the
+  # wrist camera does perception — that view uses the painted gripper mask.
+  robot_mask_margin_m: 0.02
 
   # Temporal depth smoothing: at the (static) capture pose we grab num_frames stereo frames
   # back-to-back and per-pixel median-fuse their depth maps to suppress sensor noise / flicker.

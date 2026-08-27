@@ -60,12 +60,23 @@ def build_tamp_config(
     enable_visualizer: bool = False,
     traj_length_norm: float = 2.0,
     grasp_orientation_cost: bool = False,
+    grasp_center_cost: bool = False,
+    arm_mode: str = "single",
+    dual_task: str = "parallel",
+    max_motion_refine_attempts: int | None = 32,
+    transit_apex_height: float = 0.0,
+    transit_apex_min_dist: float = 0.10,
     q_home: Sequence[float] | None = None,
+    posture_selection: dict | None = None,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
     See https://github.com/tiptop-robot/cuTAMP/blob/main/cutamp/config.py for
     documentation of each TAMPConfiguration parameter.
+
+    ``arm_mode``/``dual_task`` opt into cuTAMP's simultaneous dual-arm planning (only valid with
+    ``robot_type == "bimanual_yam_dual"`` -- cuTAMP's own ``validate_tamp_config`` enforces the two
+    travel together). Every other embodiment leaves these at their single-arm defaults.
     """
     return TAMPConfiguration(
         num_particles=num_particles,
@@ -74,8 +85,10 @@ def build_tamp_config(
         m2t2_grasps=True,
         prop_satisfying_break=0.1,
         robot=robot_type,
+        arm_mode=arm_mode,
+        dual_task=dual_task,
         curobo_plan=True,
-        max_motion_refine_attempts=32,
+        max_motion_refine_attempts=max_motion_refine_attempts,
         warmup_ik=False,
         warmup_motion_gen=False,
         num_initial_plans=10,
@@ -97,11 +110,25 @@ def build_tamp_config(
         # Gate for the grasp orientation-change soft cost (weight set in run_planning). Enabled from
         # cfg/tamp when `grasp_pose_change_weight` is present; see resolve_grasp_orientation_cost.
         grasp_orientation_cost=grasp_orientation_cost,
+        # Gate for the off-center grasp soft cost (weight set in run_planning). Enabled from cfg/tamp
+        # when `grasp_center_weight` is present; see resolve_grasp_center_cost.
+        grasp_center_cost=grasp_center_cost,
+        # Explicit apex waypoint in each Pick/Place free-space transit: planned as
+        # retract -> apex -> pre-grasp so the end-effector lifts, traverses and descends instead of
+        # sweeping low across the table. Off (0.0) unless a cfg/tamp yml sets `transit_apex_height`
+        # in tamp_overrides; see resolve_transit_apex and cuTAMP's TAMPConfiguration.
+        transit_apex_height=transit_apex_height,
+        transit_apex_min_dist=transit_apex_min_dist,
         # Where a plan parks the arm after its last operator. Pass the robot's real home (cfg/tiptop
         # `robot.q_home`); left None, cuTAMP ends every plan back at the configuration it planned
         # FROM, which on a rollout resuming from a teleop hand-off is wherever the human left the
         # arm -- unreachable often enough to fail the whole plan (see cutamp motion_solver).
         q_home=tuple(q_home) if q_home is not None else None,
+        # Teleop-posture IK branch selection: solve each endpoint's IK with return_seeds=k and keep
+        # the branch whose q1 - q3 (the FR3 shoulder null-space coordinate) best fits this lab's
+        # teleop band, instead of cuRobo's top seed. Off unless a cfg/tamp yml sets
+        # `posture_selection_seeds`; see resolve_posture_selection and cuTAMP's TAMPConfiguration.
+        **(posture_selection or {}),
     )
 
 
@@ -181,6 +208,7 @@ def run_planning(
     reuse_plan_skeleton: PlanSkeleton | None = None,
     plan_out: dict | None = None,
     return_home: bool = True,
+    q_return: np.ndarray | list | None = None,
 ) -> tuple[list | None, float, str | None]:
     """Run cuTAMP planning and return (plan, planning_time_seconds, failure_reason).
 
@@ -206,6 +234,26 @@ def run_planning(
     phases to come, say. cuTAMP then leaves off the final drive back to ``q_home``, so the arm stops
     at the retract above whatever it just placed and the next leg (or the human taking over) carries
     on from there instead of from home. See TAMPConfiguration.return_home.
+
+    ``q_return`` overrides where the plan's closing GoToInitial drives to, which otherwise is
+    ``config.q_home`` (or the ``q_init`` it started from when that is unset). Only a caller
+    concatenating plans needs it -- see ``tiptop_run.plan_clear_then_task``, whose second plan
+    starts mid-episode.
+
+    ``return_home``, ``config.q_home`` and ``q_return`` all answer the same question -- where the
+    plan ends -- at three different scopes, so they are ordered rather than exclusive, matching
+    cuTAMP's own ``run_cutamp``/``solve_curobo``:
+
+      * ``return_home=False`` drops the closing drive entirely, so NEITHER of the other two is
+        consulted; the plan stops at the retract above what it last placed.
+      * otherwise ``q_return`` (per-CALL) wins when given -- goal clearing plans two legs against one
+        shared config and the task leg has to end where the EPISODE started, not where the clearing
+        leg handed over;
+      * otherwise ``config.q_home`` (per-RUN, from build_tamp_config), or ``q_init`` when that is
+        None, which is cuTAMP's original behaviour.
+
+    Nothing warns when two of them are set: the ordering is here so a caller that passes both gets
+    a defined answer rather than whichever the code happened to read last.
     """
     if not return_home:
         # `config` is built once per session and shared, so this leg gets its own copy rather than
@@ -224,10 +272,26 @@ def run_planning(
     # initial EE orientation, steering the planner toward grasps that reorient the wrist least. Absent
     # / zero -> the multiplier is never set, so the reducer drops the (still-cheap) computed value and
     # cuTAMP behavior is unchanged. Assigned as a fresh dict so we don't mutate the shared default.
+    # `grasp_center_weight` works the same way for the off-center grasp cost: grasp_center_offset is
+    # the horizontal distance in METERS from the object's centroid to the grasp TCP, so it needs a much
+    # larger weight than grasp_rot_change (radians, <= pi) to matter. 20-50 is a starting range, not a
+    # calibration: measured over saved runs the candidate grasps on one object span roughly 3-5 cm, so
+    # w=30 separates them by ~1 cost unit, the order traj_length varies over. What settles it is one
+    # real run -- the per-term weighted values in `best_cost_breakdown`
+    # (<exp_dir>/optimization/opt_*.json). An order of magnitude below the other terms means raise it;
+    # the largest term means lower it. Note the charge is raw meters, so one weight is a tiebreaker on
+    # a small object and decisive on a large one.
+    grasp_weights = {}
     grasp_weight = (cost_overrides or {}).get("grasp_pose_change_weight")
     if grasp_weight:
-        constraint_to_mult[GraspCost.type] = {"grasp_rot_change": float(grasp_weight)}
-        _log.info(f"Grasp orientation-change cost active: grasp_rot_change weight={float(grasp_weight)}")
+        grasp_weights["grasp_rot_change"] = float(grasp_weight)
+    center_weight = (cost_overrides or {}).get("grasp_center_weight")
+    if center_weight:
+        grasp_weights["grasp_center_offset"] = float(center_weight)
+    if grasp_weights:
+        # Fresh dict: default_constraint_to_mult.copy() is shallow, so mutating the inner dict leaks.
+        constraint_to_mult[GraspCost.type] = grasp_weights
+        _log.info("Grasp soft costs active: " + ", ".join(f"{k} weight={v}" for k, v in grasp_weights.items()))
     cost_reducer = CostReducer(constraint_to_mult)
     constraint_checker = ConstraintChecker(constraint_to_tol)
 
@@ -260,6 +324,9 @@ def run_planning(
             experiment_dir=attempt_dir(),
             reuse_plan_skeleton=skeleton,
             plan_out=cutamp_out,
+            # Read from the closure so the reuse attempt and the fallback search below both end at
+            # the same configuration; cuTAMP ignores it when config.return_home is off.
+            q_return=q_return,
         )
         return plan, reason, cutamp_out.get("plan_skeleton")
 
@@ -422,5 +489,15 @@ def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"], trac
                 }
             )
         elif step["type"] == "gripper":
-            steps.append({"type": "gripper", "label": step["label"], "action": step["action"]})
-    return {"version": "1.3.0", "q_init": q_init, "steps": steps}
+            entry = {"type": "gripper", "label": step["label"], "action": step["action"]}
+            # Present only on cuTAMP's dual-arm path (motion_solver.py::gripper_step): "arms" names
+            # every hand this step actuates (plural -> simultaneous, e.g. PickBoth/PlaceBoth); "arm"
+            # is set too when exactly one hand acts (PickGiver/PlaceTaker, or one side of a
+            # Handover), for consumers that only care about a single hand. Single-arm cuTAMP steps
+            # never carry either key, so this is purely additive for existing plans.
+            if "arm" in step:
+                entry["arm"] = step["arm"]
+            if "arms" in step:
+                entry["arms"] = list(step["arms"])
+            steps.append(entry)
+    return {"version": "1.4.0", "q_init": q_init, "steps": steps}

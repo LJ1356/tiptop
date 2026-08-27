@@ -1,0 +1,83 @@
+# TiPToP configuration for the bimanual YAM in Isaac Sim.
+#
+# Select it with TIPTOP_CONFIG (see config/__init__.py::_resolve_config_path):
+#
+#   TIPTOP_CONFIG=tiptop_yam.yml pixi run python -m tiptop.tiptop_websocket_server --port 8765
+#
+# Driven by droid-sim-evals/eval/yam_tiptop_eval.py, which sends observations from the simulator's
+# FIXED THIRD-PERSON camera. There is no hardware client for this embodiment, so the `cameras`
+# section below is unused on the websocket path (pixels, intrinsics and extrinsics all arrive in the
+# request) and no robot connection is ever opened.
+
+robot:
+  # One robot type per arm: cuTAMP plans a single kinematic chain, so the active arm is part of the
+  # embodiment -- it selects the cuRobo config's ee_link and locks the other arm as an obstacle.
+  # See cuTAMP/cutamp/robots/bimanual_yam.py. Scene 6's objects sit at y in [-0.10, 0.22] and the
+  # left arm is the one mounted toward +y, so `left` is the arm the mount pose was tuned for.
+  type: bimanual_yam_left
+  dof: 6
+
+  # No hardware driver exists for the YAM; get_robot_client() raises NotImplementedError. These are
+  # present only so the schema matches tiptop.yml.
+  host: "127.0.0.1"
+  port: 5555
+  gripper_port: 5559
+
+  # 1.0 = plan at cuRobo's own timing. The 0.2 in tiptop.yml is a safety margin for a real arm; in
+  # simulation slowing the trajectory down just makes every rollout four times longer, and the
+  # episode budget in yam_tiptop_eval.py is sized for full speed.
+  time_dilation_factor: 1.0
+
+  # Elbow-up rest posture, matching ARM_RETRACT in the URDF generator, cuRobo's retract_config, and
+  # the pose the simulator spawns both arms at. Unused on the websocket path (q_init comes from the
+  # request) but kept correct so go-home/go-to-capture would do the right thing.
+  q_home: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+  q_capture: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+
+# Unused on the websocket path -- the simulator supplies rgb, depth, intrinsics and extrinsics in
+# every request. Kept so the config schema matches tiptop.yml.
+cameras:
+  hand:
+    serial: "sim"
+    type: zed
+    resolution: HD720
+    fps: 15
+  external:
+    serial: "sim"
+    type: zed
+    resolution: HD720
+    fps: 15
+
+perception:
+  foundation_stereo:
+    # Never contacted: the simulator renders true depth, so the server runs with
+    # depth_estimator=None and reads frame.depth directly.
+    url: "http://localhost:1234"
+
+  m2t2:
+    url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
+    apply_bounds: true
+
+  # Add each M2T2 grasp's jaw-flipped twin (180 deg about the approach axis), which for a parallel
+  # jaw is the same physical grasp. On by default here because the YAM is a 6-DOF arm: with no null
+  # space it cannot roll its wrist to whichever representative M2T2 happened to emit, so half the
+  # valid grasps are unreachable. Measured on a scene-6 run, the far toy had 3 grasps of which the
+  # arm could reach 0 as emitted and all 3 flipped -- which was the difference between a plan and
+  # "no satisfying particles". Left off in tiptop.yml so the 7-DOF Franka path is unchanged.
+  augment_flipped_grasps: true
+
+  sam:
+    mode: "local"
+
+  # The third-person camera sits ~1.0 m above the table, so everything of interest is within ~1.5 m;
+  # the scene has no ground plane (the floor is the HDR dome, which renders at infinite depth), so
+  # this mostly guards against stray far samples.
+  depth_trunc_m: 2.5
+  voxel_downsample_size: 0.0075
+  contact_threshold_m: 0.01
+  mask_erosion_pixels: 3
+
+  # A rendered frame has no sensor noise to median-fuse away, and the websocket path never populates
+  # Observation.depth_frames anyway.
+  depth_smoothing:
+    num_frames: 1

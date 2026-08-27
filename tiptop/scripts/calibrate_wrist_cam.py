@@ -625,7 +625,9 @@ def calibrate_wrist_camera():
 
         cycle_complete = (i * step_size) >= (2 * np.pi)
         cycle_prop_complete = 100 * (i * step_size) / (2 * np.pi)
-        _log.debug(f"{cycle_prop_complete:.2f}% calibration complete")
+        # INFO, not DEBUG: setup_logging() defaults to INFO, and this is the only progress the sweep
+        # reports — the data-collection UI parses these lines to drive its progress bar.
+        _log.info(f"{cycle_prop_complete:.2f}% calibration complete")
 
         calibrator.add_sample(cam_id=cam_id, image=frame.bgr, pose=pose)
         augmented_image = calibrator.augment_image(cam_id=cam_id, image=image)

@@ -7,7 +7,7 @@ from cutamp.envs.utils import unit_quat
 from cutamp.utils.rerun_utils import log_curobo_mesh_to_rerun
 
 from tiptop.config import tiptop_cfg
-from tiptop.utils import get_robot_rerun
+from tiptop.utils import YAM_ROBOT_TYPES, get_robot_rerun
 
 tensor_args = TensorDeviceType()
 
@@ -23,6 +23,18 @@ def fr3_workspace() -> tuple[Cuboid, ...]:
         pose=[0.0, 0.0, 1.50, *unit_quat],
         color=[200, 200, 200],
     )
+    return (ceiling,)
+
+
+def bimanual_yam_workspace() -> tuple[Cuboid, ...]:
+    # The table and the objects come from perception, so there is no fixed furniture to model here.
+    # Like fr3_workspace this is a single far-away ceiling, present because cuRobo's sphere-collision
+    # init errors on an empty obstacle set. It sits high enough to clear the base column.
+    #
+    # If the real cell has structure perception cannot see -- a rig above the table, a wall the arm
+    # could reach behind -- add it here: this is the only place a YAM plan learns about geometry that
+    # is not in the point cloud.
+    ceiling = Cuboid("ceiling", dims=[3.0, 3.0, 0.05], pose=[0.0, 0.0, 1.75, *unit_quat], color=[200, 200, 200])
     return (ceiling,)
 
 
@@ -57,6 +69,8 @@ def workspace_cuboids() -> tuple[Cuboid, ...]:
         cuboids = fr3_workspace()
     elif cfg.robot.type == "ur5":
         cuboids = ur5_workspace()
+    elif cfg.robot.type in YAM_ROBOT_TYPES:
+        cuboids = bimanual_yam_workspace()
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
     return tuple(replace(c, name=f"workspace_{c.name}") for c in cuboids)

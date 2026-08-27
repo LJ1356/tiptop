@@ -37,18 +37,73 @@ DEFAULT_TARGET_FPS = 15
 # DROID gripper convention (0 = open, 1 = closed).
 GRIPPER_MAX_WIDTH = 0.085
 
+# ---- the DEPLOYABLE joint-velocity action (``action_joint_velocity``) --------------------------- #
+#
+# The trained action channel is DROID's normalized joint velocity, and the deploy executor reads it
+# back in that space: ``RobotEnv(action_space="joint_velocity")`` runs each command through
+# ``droid/robot_ik/robot_ik_solver.py`` as ``joint_delta = jv * max_joint_delta`` once per control
+# step. Inverting that is the whole definition -- ``jv = (commanded - measured) / max_joint_delta``:
+#
+#     action_joint_velocity = DROID_JV_GAIN * (cmd_joint_position - joint_position)
+#
+# So it is a TRACKING ERROR, not a speed. It grows when the arm lags, which is what makes a policy
+# trained on it push harder under load, and it is the quantity DROID itself stores (fitted R^2 0.923
+# against 200 lerobot/droid_1.0.1 episodes).
+#
+# ``cmd_joint_velocity`` is NOT this and is deliberately left alone: it is the cuTAMP plan's own
+# feedforward rad/s, which is what oopsie_export publishes (its JV_SCALE table) and what the plan
+# analyses read. The two are different physical quantities, they differ per frame in SIGN as well as
+# magnitude, and the historical bug was exporting the plan velocity into the trained action channel:
+# every TAMP dataset built before this landed under-commands by ~1.27x against the executor, worst on
+# the elbow. Writing BOTH arrays under names that say what they are is the fix -- a single key whose
+# meaning depended on who captured the episode is what allowed the confusion.
+DROID_JV_GAIN = 5.0  # 1 / max_joint_delta (0.2 rad), from droid/robot_ik/robot_ik_solver.py
 
-def _read_gripper_width(robot) -> float | None:
+# Sanity band for the per-episode scale statistic (see _check_jv_ratio). This check exists because
+# the gain above is DROID's, while the lag it acts on is tiptop's: the blocking
+# ``move_to_joint_positions`` executor happens to track closely enough that the product lands where
+# DROID's does. That is an empirical property of the CURRENT executor, not an identity -- retune its
+# gains, its blending or its step timing and the ratio moves, and without a warning the next
+# collection run would ship a silently mis-scaled dataset.
+#
+# Bounds are the measured per-episode range of cohorts this capture is meant to resemble: this lab's
+# teleop spans 1.33-1.77 (n=20) and the four TAMP datasets recomputed this way span 1.15-2.20 (n=80),
+# so the band is their union plus ~10% margin. Pooled COHORT means are much tighter (teleop 1.48,
+# TAMP 1.44, lerobot/droid_1.0.1 1.44) -- it is the per-episode spread that forces a band this wide.
+#
+# What it therefore catches: a GROSS scale error, which is the realistic executor-drift failure --
+# a missing gain lands at 0.29, a stray /3 at 0.50, a doubled tracking lag at ~3.0.
+# What it does NOT catch: the historical bug (exporting the plan's feedforward rad/s), whose
+# per-episode ratios run 1.05-1.33 and therefore OVERLAP healthy episodes -- no per-episode
+# threshold can separate those two populations, and pretending otherwise would be a false comfort.
+# That bug is prevented structurally instead: ``action_joint_velocity`` is derived in one place from
+# the two arrays it must relate, so there is no longer a second channel for it to be confused with.
+#
+# Warn, never refuse: a ratio outside the band is a real rollout with a suspect action channel, and
+# the operator needs to see it rather than lose the episode.
+DROID_JV_RATIO_BAND = (1.05, 2.50)
+
+# A joint counts toward the statistic only if it actually moved: mean |velocity| over the episode
+# above this, in rad/s. Near-static joints put a ~0 denominator under the ratio -- on DROID that
+# alone produces per-episode values from 0.0 to 73.5, which is noise, not signal.
+_JV_RATIO_MOVING_FLOOR = 0.05
+
+
+def _read_gripper_width(robot, arm: str | None = None) -> float | None:
     """Best-effort read of the measured gripper opening width in metres. None if unavailable.
 
     The bamboo client returns ``{"success": ..., "state": {"width": <m>, ...}}``; older
     code read ``["width"]`` directly and always missed, defaulting the gripper to a
     constant. Navigate the real payload, tolerating the flatter shapes too.
+
+    ``arm`` addresses a specific hand -- only meaningful for a YamClient in dual mode, where there
+    is no default active arm to fall back to (see ``YamClient.arm``); every other client/embodiment
+    leaves it None and nothing changes.
     """
     try:
         if not hasattr(robot, "get_gripper_state"):
             return None
-        res = robot.get_gripper_state()
+        res = robot.get_gripper_state(arm) if arm is not None else robot.get_gripper_state()
         if not isinstance(res, dict):
             return float(res)
         if res.get("success") is False:
@@ -239,11 +294,14 @@ def _load_plan(plan_path: Path) -> dict:
     return plan
 
 
-def _flatten_plan(plan: dict, timeline: list | None = None) -> dict:
+def _flatten_plan(plan: dict, timeline: list | None = None, dof: int = 7) -> dict:
     """Flatten plan steps into dense 50 Hz arrays.
 
+    ``dof`` is the arm's joint count — 7 for the Franka, 6 for one YAM arm. It only sizes the
+    zero-velocity hold rows and the ``q_init`` fallback; every other array comes from the plan.
+
     Returns a dict with, for the M dense rows:
-      positions[M,7], velocities[M,7], gripper[M], dt[M] (per-row duration),
+      positions[M,dof], velocities[M,dof], gripper[M], dt[M] (per-row duration),
       t_plan[M] (start time of each row on the plan clock), and
       t_wall[M] (wall-clock time of each row, NaN where no execution timeline).
 
@@ -267,7 +325,7 @@ def _flatten_plan(plan: dict, timeline: list | None = None) -> dict:
     """
     HOLD_DT = 0.02  # 50 Hz, matching the plan's trajectory rate, for inserted hold rows
     pos_chunks, vel_chunks, grip_chunks, dt_chunks, twall_chunks = [], [], [], [], []
-    q_init = np.asarray(plan.get("q_init", np.zeros(7)), dtype=np.float32).reshape(-1)
+    q_init = np.asarray(plan.get("q_init", np.zeros(dof)), dtype=np.float32).reshape(-1)
     last_pos = q_init  # arm pose to freeze at during a gripper pause
     g = 0.0  # DROID convention: 0 = open, 1 = closed. Episodes start open.
     for i, step in enumerate(plan["steps"]):
@@ -300,7 +358,7 @@ def _flatten_plan(plan: dict, timeline: list | None = None) -> dict:
                 ts, te = float(entry["t_start"]), float(entry["t_end"])
                 n_hold = max(1, round((te - ts) / HOLD_DT))
                 pos_chunks.append(np.tile(last_pos, (n_hold, 1)))
-                vel_chunks.append(np.zeros((n_hold, 7), dtype=np.float32))
+                vel_chunks.append(np.zeros((n_hold, dof), dtype=np.float32))
                 grip_chunks.append(np.full(n_hold, g, dtype=np.float32))
                 dt_chunks.append(np.full(n_hold, HOLD_DT, dtype=np.float64))
                 twall_chunks.append(np.linspace(ts, te, n_hold))
@@ -347,6 +405,37 @@ def _nearest_by_wall(sample_t: np.ndarray, sample_v: np.ndarray, grid: np.ndarra
     return sample_v[nearest]
 
 
+def _check_jv_ratio(action_jv: np.ndarray, joint_position: np.ndarray, *, fps: int, where: str) -> float | None:
+    """Warn when the deployable action's scale leaves DROID's band (see DROID_JV_RATIO_BAND).
+
+    The statistic is per-joint ``mean|action| / mean|measured velocity|``, averaged over the joints
+    that actually moved (``_JV_RATIO_MOVING_FLOOR``) -- the same one the DROID/teleop/TAMP cohorts
+    were compared on. Returns the ratio, or None when it is not computable (a too-short episode, or
+    one where fewer than two joints moved), and never raises: this is a data-quality signal, not a
+    gate.
+    """
+    if len(joint_position) < 2:
+        return None
+    realized = np.abs(np.diff(joint_position, axis=0) * float(fps)).mean(axis=0)
+    commanded = np.abs(action_jv[:-1]).mean(axis=0)
+    moving = realized > _JV_RATIO_MOVING_FLOOR
+    if int(moving.sum()) < 2:
+        return None
+    ratio = float((commanded[moving] / realized[moving]).mean())
+    lo, hi = DROID_JV_RATIO_BAND
+    if not (lo <= ratio <= hi):
+        _log.warning(
+            "action_joint_velocity scale %.2f is OUTSIDE DROID's band [%.2f, %.2f] for %s. The "
+            "episode is still usable, but a policy trained on it will %s the arm at deploy. This "
+            "usually means the executor's tracking lag changed (gains, blending or step timing) -- "
+            "re-measure against lerobot/droid_1.0.1 before collecting a full dataset.",
+            ratio, lo, hi, where, "under-drive" if ratio < lo else "over-drive",
+        )
+    else:
+        _log.debug("action_joint_velocity scale %.2f (DROID band [%.2f, %.2f])", ratio, lo, hi)
+    return ratio
+
+
 def dump_raw_episode(
     save_dir: Path,
     plan_path: Path,
@@ -370,6 +459,10 @@ def dump_raw_episode(
         the nearest-preceding dense row per grid time.
       * MEASURED arrays (joint_position, gripper_position) come from the samplers by nearest
         wall-clock sample -- proprioception is the true measured state, decoupled from the command.
+      * DERIVED: ``action_joint_velocity``, the deployable DROID-convention action, is the tracking
+        error between the two -- ``DROID_JV_GAIN * (cmd_joint_position - joint_position)``. This is
+        the channel a policy is trained on; ``cmd_joint_velocity`` (the plan's own feedforward
+        rad/s) is a DIFFERENT quantity and is kept alongside it, not replaced.
 
     ``record_start`` / ``record_stop`` (epoch seconds bracketing the camera recording window from
     :func:`recording.record_cameras`) are written into ``_meta.json`` so the build can align each
@@ -448,6 +541,15 @@ def dump_raw_episode(
         return None
     gripper_position = np.clip(gripper_position, 0.0, 1.0).astype(np.float32)  # [n]
 
+    # DEPLOYABLE action: DROID's normalized joint velocity = the tracking error between the plan's
+    # commanded target and the measured arm, in the executor's own units (see DROID_JV_GAIN). This
+    # is what build_lerobot exports as action.joint_velocity and what a policy is trained to emit.
+    # Both operands are already on the same 15 Hz grid, so no realignment is needed.
+    action_joint_velocity = (
+        DROID_JV_GAIN * (cmd_joint_position - joint_position)
+    ).astype(np.float32)  # [n, 7]
+    _check_jv_ratio(action_joint_velocity, joint_position, fps=fps, where=str(save_dir))
+
     save_dir.mkdir(parents=True, exist_ok=True)
     npz_path = save_dir / "robot_state.npz"
     np.savez(
@@ -456,6 +558,7 @@ def dump_raw_episode(
         gripper_position=gripper_position,
         cmd_joint_position=cmd_joint_position,
         cmd_joint_velocity=cmd_joint_velocity,
+        action_joint_velocity=action_joint_velocity,
         cmd_gripper=cmd_gripper,
         # float64: epoch seconds (~1.78e9) in float32 have 128 s resolution, collapsing every
         # frame to one timestamp. frame_time is the master timeline, so it must stay float64.
@@ -468,6 +571,10 @@ def dump_raw_episode(
         "config_id": config_id,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "source": "tiptop",
+        # Which convention `action_joint_velocity` is in, so a consumer never has to infer it from
+        # the source. Absent = an episode captured before that array existed, whose only velocity
+        # array is the plan's feedforward rad/s (see build_lerobot's action-selection note).
+        "action_convention": "droid_joint_velocity",
         "cameras": cameras,
         "record_start": float(record_start) if record_start is not None else None,
         "record_stop": float(record_stop) if record_stop is not None else None,

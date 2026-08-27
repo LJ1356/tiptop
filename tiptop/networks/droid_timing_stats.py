@@ -16,8 +16,7 @@ plain regressions with an empirical residual pool rather than extra channels on 
 scalars, the pool reproduces DROID's skew (-0.8) and heavy tails (kurtosis 6.2) that a Gaussian would
 not, and being a 3-line model it stays inspectable.
 
-Measured over the 13 cached DROID proprio shards, position-derived at 15 Hz -- ``action.joint_velocity``
-is hard-clipped at +-1 rad/s and is NOT unit-comparable:
+The PACE is measured over the 13 cached DROID proprio shards, position-derived at 15 Hz:
 
 * pace:      ``log vbar = a + b log L + c (log K - mean log K) + off[k_start, k_end] + eps``, where K is
   :func:`path_curvature`. The CURVATURE term carries this model: ``c`` is about -0.7 (humans obey a
@@ -25,14 +24,34 @@ is hard-clipped at +-1 rad/s and is NOT unit-comparable:
   the length-only law leaves -- after which the kind offsets are small (-0.13 to +0.10), because
   curvature was most of what they had been standing in for. Residuals are skewed and heavy-tailed, so
   they are sampled from an empirical pool rather than a Gaussian.
-* boundary:  ``log v_e = a_k + b_k log vbar + eps_k`` per event kind, residual sd ~1.04-1.13. Note the
-  weak dependence on pace (corr 0.41-0.46): the event speed is very nearly its own random variable.
-  It is still conditioned on pace because drawing the two independently over-disperses the
-  boundary/pace ratio by ~18% (sd 1.24 vs DROID's 1.05).
+The pace sampler clips to the range DROID actually exhibits: a regression with a heavy-tailed empirical
+residual extrapolates past its own data once the conditioning value is itself a sample.
 
-Both samplers clip to the range DROID actually exhibits: a regression with a heavy-tailed empirical
-residual extrapolates past its own data once the conditioning value is itself a sample, and unclipped
-this asked for boundary speeds above 4 rad/s.
+The BOUNDARY is a different DROID COLUMN from the pace -- commanded, not achieved
+--------------------------------------------------------------------------------
+The gripper-event speed is fitted on DROID's ``action.joint_velocity`` (see
+:func:`droid_boundary_ratios`), the COMMANDED channel, while the pace above is position-derived
+(ACHIEVED). That split is deliberate, and getting it wrong was a real regression:
+
+* The two diverge exactly at a gripper event. A human's ARM slows to ~0.29 of its cruise into a
+  grasp; their COMMAND only to ~0.65, because the command leads the arm and does not wait for it.
+* cuRobo tracks our commands ~1:1, so writing an achieved-motion statistic into the command channel
+  emitted a grasp command ~3x slower than any human's -- the stall a velocity-action policy learns
+  (``analysis_gripper_events/GRIPPER_EVENT_VELOCITY.md`` measured min/cruise 0.15 against teleop's
+  0.62 on data generated that way).
+
+Two traps worth naming, since both cost a wrong conclusion here:
+
+* ``action.joint_velocity`` is NOT the aggregate ``action`` column that the proprio shards cache.
+  That one is a composite: it correlates r~0.1 with joint motion and ~33% of its entries sit at
+  +-1, which reads as a hard-clipped velocity signal but is not one. ``action.joint_velocity`` is
+  genuine rad/s -- 0.2% at the clip, r=0.82-0.89 against d(q)/dt, matching teleop's 0.83-0.94.
+* The grasp/release asymmetry differs between the channels: open/close is 1.55 in achieved motion
+  but ~1.2 in the command, so a boundary model fitted on one does not transfer to the other.
+
+``--boundary-source teleop`` refits the same quantity from the local teleop dataset instead. It is a
+small-n cross-check (~61 events per kind against DROID's ~9k), useful because teleop is this robot and
+this task; the two agree that the command does not collapse at a grasp, and differ in detail.
 
 Fit (writes ``checkpoints/droid_timing_stats.npz``)::
 
@@ -59,6 +78,11 @@ _POOL = 20000
 # plan time, so both live on this constant.
 CURV_STEP = 0.01
 _MIN_CURV_ARC = 0.2   # below this a path has too few grid points for a stable curvature
+DOF_TELEOP = 7
+# Per-event boundary ratios streamed from DROID's action.joint_velocity (see droid_boundary_ratios).
+DEFAULT_BND_CACHE = _PKG_DIR / "checkpoints" / "boundary_cache"
+# Teleop, available as a cross-check boundary source (--boundary-source teleop).
+DEFAULT_TELEOP = Path.home() / ".cache/huggingface/lerobot/SamratSahoo/teleop_prpl"
 
 
 def path_curvature(q: np.ndarray, step: float = CURV_STEP) -> float:
@@ -100,13 +124,25 @@ class TimingStats:
         # compressed to keep the approach at a human PHYSICAL width (see flow_blending._end_remap).
         self.dur_median = float(b["dur_median"]) if "dur_median" in b else 4.07
         self.pace_range = tuple(b["pace_range"]) if "pace_range" in b else (1e-3, 1e3)
+        # Boundary: per-event COMMANDED-speed / stroke-pace ratios (DROID action.joint_velocity by
+        # default -- see sample_event_speed). Absent in an older stats file, which falls back to the
+        # achieved-motion regression below.
+        self.bnd_ratio = {k: b[f"bnd_ratio_{k}"] for k in ("close", "open")
+                          if f"bnd_ratio_{k}" in b}
         self.bnd = {}
         for kind in ("close", "open"):
+            if f"bnd_a_{kind}" not in b:
+                continue
             rng_ = tuple(b[f"bnd_range_{kind}"]) if f"bnd_range_{kind}" in b else (1e-4, 1e3)
             self.bnd[kind] = (float(b[f"bnd_a_{kind}"]), float(b[f"bnd_b_{kind}"]),
                               b[f"bnd_resid_{kind}"], *rng_)
-        _log.info("Loaded DROID timing stats %s (pace resid sd %.3f, %d strokes)", p.name,
-                  float(self.pace_resid.std()), int(b["n_strokes"]))
+        # Record WHICH source the ratios came from -- the two differ (DROID close 0.63 of cruise vs
+        # teleop 1.05), so a run log that cannot tell them apart is worse than no log.
+        self.bnd_source = str(b["bnd_source"]) if "bnd_source" in b else "unknown"
+        src = (f"{self.bnd_source} commanded ratios (n={len(next(iter(self.bnd_ratio.values())))})"
+               if self.bnd_ratio else "DROID achieved motion (legacy)")
+        _log.info("Loaded timing stats %s (pace: DROID, resid sd %.3f, %d strokes; boundary: %s)",
+                  p.name, float(self.pace_resid.std()), int(b["n_strokes"]), src)
 
     def sample_pace(self, arc_length: float, curvature: float, kinds: tuple[str, str],
                     rng: np.random.Generator) -> float:
@@ -127,7 +163,25 @@ class TimingStats:
         return float(np.clip(np.exp(mu + rng.choice(self.pace_resid)), *self.pace_range))
 
     def sample_event_speed(self, kind: str, pace: float, rng: np.random.Generator) -> float:
-        """Joint speed (rad/s) at a gripper event of this kind, for a stroke running at ``pace``."""
+        """COMMANDED joint speed (rad/s) at a gripper event of this kind, for a stroke running at ``pace``.
+
+        Drawn as a FRACTION of the stroke's own pace, from the teleop ratios measured on
+        ``action.joint_velocity`` -- the same channel this value ends up in. See the module docstring
+        for why the DROID-fitted version (kept below as a fallback) was the wrong reference: it
+        described how fast the human's ARM moved, which is ~3x slower at a grasp than what the human
+        COMMANDED, and our commands are tracked almost 1:1.
+
+        A ratio rather than an absolute speed because the teleop operators run ~1.5x slower than our
+        plans, so their absolute rad/s would not transfer; the ratio does, and it makes the anchor
+        scale with whatever pace this stroke happened to draw. The draw is a plain inverse-CDF sample
+        over the ~61 measured events per kind -- n that size supports an empirical distribution, not a
+        pace-conditional law (and on DROID the pace slope explained only ~17% of the variance anyway).
+        """
+        if kind not in ("close", "open"):
+            return 0.0
+        if kind in self.bnd_ratio:
+            return float(max(pace, 1e-6) * rng.choice(self.bnd_ratio[kind]))
+        # Fallback: a stats file fitted before the teleop ratios existed (DROID achieved motion).
         if kind not in self.bnd:
             return 0.0
         a, b, resid, lo, hi = self.bnd[kind]
@@ -137,6 +191,78 @@ class TimingStats:
         # asks for boundary speeds over 4 rad/s, which the caps then claw back by stretching the whole
         # stroke -- so one outlier draw slows an entire operation.
         return float(np.clip(v, lo, hi))
+
+
+def droid_boundary_ratios(cache_dir: Path = None) -> dict[str, np.ndarray]:
+    """Per-gripper-event COMMANDED speed / stroke pace, from DROID's ``action.joint_velocity``.
+
+    This is the shipped boundary reference. Note it is a DIFFERENT DROID column from the one the pace
+    law uses: the pace comes from position-derived (achieved) speed, this comes from the commanded
+    channel, because that is the channel the blend writes into and the two differ sharply at a grasp
+    (a human's arm slows to ~0.29 of cruise there; their command only to ~0.65).
+
+    Not to be confused with the aggregate ``action`` column the proprio shards cache -- that one is a
+    composite that correlates only r~0.1 with joint motion and is useless as a velocity reference.
+    ``action.joint_velocity`` is genuine rad/s: 0.2% at the +-1 clip, r=0.82-0.89 against d(q)/dt.
+
+    Pre-extracted by ``boundary_cache/bnd_*.npz`` (see the streaming note in the fit CLI help), since
+    the column is not in the cached proprio shards and must be streamed from the Hub.
+    """
+    d = Path(cache_dir) if cache_dir else DEFAULT_BND_CACHE
+    files = sorted(Path(d).glob("bnd_*.npz"))
+    if not files:
+        raise FileNotFoundError(
+            f"no bnd_*.npz under {d}. The boundary reference needs DROID's action.joint_velocity, "
+            f"which the proprio shards do not carry -- stream it first (see --help)."
+        )
+    out = {}
+    for kind in ("close", "open"):
+        pool = np.concatenate([np.load(f)[kind] for f in files])
+        out[kind] = pool[np.isfinite(pool) & (pool > 0)].astype(np.float32)
+    return out
+
+
+def teleop_boundary_ratios(teleop_dir: Path) -> dict[str, np.ndarray]:
+    """Per-gripper-event COMMANDED speed / stroke pace, from a teleop LeRobot dataset.
+
+    Reads ``action.joint_velocity`` -- genuine rad/s, unlike DROID's action channel, which is
+    normalized with 35% of entries at the +-1 clip and cannot serve as a velocity reference at all.
+    That is why the boundary comes from teleop while the pace law still comes from DROID: this is the
+    only human source we have for the channel the blend actually writes.
+
+    For each event: the stroke ending at it, its mean commanded speed, and a 3-frame median of the
+    commanded speed at the event (one frame is noisy, and the 3-frame window straddles the edge, which
+    matches how the blender's single shared anchor serves both adjacent strokes).
+    """
+    import pyarrow.parquet as pq
+
+    files = sorted(Path(teleop_dir).glob("data/**/*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"no parquet under {teleop_dir}/data")
+    out = {"close": [], "open": []}
+    for fp in files:
+        t = pq.read_table(fp)
+        av = np.asarray(t["action.joint_velocity"].combine_chunks().flatten()
+                        .to_numpy(zero_copy_only=False), np.float64).reshape(-1, DOF_TELEOP)
+        g = np.asarray(t["action.gripper_position"].combine_chunks()
+                       .to_numpy(zero_copy_only=False), np.float64).reshape(-1)
+        ep = np.asarray(t["episode_index"].combine_chunks().to_numpy(zero_copy_only=False))
+        for e in np.unique(ep):
+            m = ep == e
+            v, gg = np.linalg.norm(av[m], axis=1), g[m]
+            closed = (gg > 0.5).astype(int)
+            edges = np.flatnonzero(np.diff(closed)) + 1
+            bounds = sorted({0, len(v) - 1, *edges.tolist()})
+            for i in edges:
+                kind = "close" if closed[i] else "open"
+                start = max([x for x in bounds if x < i], default=0)
+                if i - start < 6:
+                    continue
+                pace = float(v[start:i + 1].mean())
+                if pace < 1e-6:
+                    continue
+                out[kind].append(float(np.median(v[max(i - 1, 0):i + 2])) / pace)
+    return {k: np.asarray(v, np.float32) for k, v in out.items() if v}
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +304,8 @@ def _strokes(shard_dir: Path, shard_ids):
     return rows
 
 
-def fit(shard_dir: Path, shard_ids, out: Path, seed: int = 0):
+def fit(shard_dir: Path, shard_ids, out: Path, seed: int = 0, boundary_source: str = "droid",
+        teleop_dir: Path | None = None, bnd_cache: Path | None = None):
     rows = _strokes(shard_dir, shard_ids)
     if not rows:
         raise SystemExit("no strokes found -- fetch the shards first (vae/data_full.py fetch)")
@@ -241,6 +368,24 @@ def fit(shard_dir: Path, shard_ids, out: Path, seed: int = 0):
         blob[f"bnd_resid_{kind}"] = rng.choice(r, min(_POOL, len(r)), replace=False).astype(np.float32)
         blob[f"bnd_range_{kind}"] = np.array([np.percentile(v_e[s], 0.5), np.percentile(v_e[s], 99.5)])
 
+    # The boundary the blender actually uses: teleop COMMANDED speed as a fraction of stroke pace.
+    # The DROID block above is kept only as a fallback for older stats files -- it measures achieved
+    # motion, which at a grasp is ~3x slower than what a human commands.
+    ratios = (droid_boundary_ratios(bnd_cache) if boundary_source == "droid"
+              else teleop_boundary_ratios(teleop_dir or DEFAULT_TELEOP))
+    blob["bnd_source"] = boundary_source
+    print(f"\nboundary (SHIPPED): {boundary_source} COMMANDED speed / stroke pace, per event kind")
+    print(f"  {'kind':<7}{'n':>5} {'p5':>7} {'p25':>7} {'p50':>7} {'p75':>7} {'p95':>7}  {'sd(log)':>8}")
+    for kind in ("close", "open"):
+        r = ratios[kind]
+        blob[f"bnd_ratio_{kind}"] = r
+        print(f"  {kind:<7}{len(r):>5} " + " ".join(f"{np.percentile(r, q):>7.3f}"
+                                                   for q in (5, 25, 50, 75, 95))
+              + f"  {np.log(r).std():>8.3f}")
+    print(f"  open/close (median ratio) = {np.median(ratios['open']) / np.median(ratios['close']):.2f}"
+          f"   -- against 1.55 for DROID ACHIEVED motion. The command dips far less at a grasp than the"
+          f" arm does (0.65 of cruise vs 0.29), which is the whole reason this is a separate fit.")
+
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, **blob)
     print(f"\nwrote {out}")
@@ -254,13 +399,18 @@ def fit(shard_dir: Path, shard_ids, out: Path, seed: int = 0):
     print(f"  pace   sampled {np.percentile(sp,5):.3f}/{np.percentile(sp,50):.3f}/"
           f"{np.percentile(sp,95):.3f}   source {np.percentile(vbar,5):.3f}/"
           f"{np.percentile(vbar,50):.3f}/{np.percentile(vbar,95):.3f}")
+    # The boundary is a RATIO now, so check it against the teleop ratios, not against DROID's
+    # absolute achieved speeds -- those are a different channel and would look like a huge miss.
     for kind in ("close", "open"):
-        s = (k1 == kind) & (v_e > 1e-4)
-        sub = g.choice(np.flatnonzero(s), 20000)
-        sv = np.array([st.sample_event_speed(kind, vbar[i], g) for i in sub])
-        print(f"  {kind:<6} sampled {np.percentile(sv,5):.3f}/{np.percentile(sv,50):.3f}/"
-              f"{np.percentile(sv,95):.3f}   source {np.percentile(v_e[s],5):.3f}/"
-              f"{np.percentile(v_e[s],50):.3f}/{np.percentile(v_e[s],95):.3f}")
+        sv = np.array([st.sample_event_speed(kind, 1.0, g) for _ in range(20000)])
+        r = ratios[kind]
+        print(f"  {kind:<6} boundary/pace sampled {np.percentile(sv,5):.3f}/"
+              f"{np.percentile(sv,50):.3f}/{np.percentile(sv,95):.3f}   source "
+              f"{np.percentile(r,5):.3f}/{np.percentile(r,50):.3f}/{np.percentile(r,95):.3f}")
+    print(f"  -> at our ~0.35 rad/s cruise that is "
+          f"{0.35*np.median(ratios['close']):.2f} rad/s at a grasp and "
+          f"{0.35*np.median(ratios['open']):.2f} at a release "
+          f"(the DROID-ACHIEVED fit gave 0.10 / 0.17 -- the regression this replaces).")
 
 
 if __name__ == "__main__":
@@ -272,7 +422,16 @@ if __name__ == "__main__":
                     default="/home/prpl/tamp-vla/vae/data_cache/droid_full_proprio")
     ap.add_argument("--shards", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12")
     ap.add_argument("--out", type=str, default=str(DEFAULT_STATS))
+    ap.add_argument("--boundary-source", type=str, default="droid", choices=("droid", "teleop"),
+                    help="whose COMMANDED gripper-event speed to sample. 'droid' (default) reads the "
+                         "pre-streamed boundary_cache/bnd_*.npz; 'teleop' reads the local teleop "
+                         "LeRobot cache and is a small-n cross-check (~61 events/kind vs ~10k).")
+    ap.add_argument("--bnd-cache", type=str, default=str(DEFAULT_BND_CACHE),
+                    help="dir of bnd_*.npz holding DROID action.joint_velocity event ratios")
+    ap.add_argument("--teleop-dir", type=str, default=str(DEFAULT_TELEOP))
     a = ap.parse_args()
     if not a.fit:
         ap.error("pass --fit")
-    fit(Path(a.shard_dir), [int(s) for s in a.shards.split(",")], Path(a.out))
+    fit(Path(a.shard_dir), [int(s) for s in a.shards.split(",")], Path(a.out),
+        boundary_source=a.boundary_source, teleop_dir=Path(a.teleop_dir),
+        bnd_cache=Path(a.bnd_cache))

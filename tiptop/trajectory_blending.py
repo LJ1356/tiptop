@@ -152,10 +152,16 @@ class BlendConfig:
     # flow_blending; each sample is a different human-like realization, so generated data reproduces the
     # distribution of teleoperator styles). In both modes the GEOMETRY smoothing, vel/accel caps,
     # endpoint pinning and non-idle boundary speed are enforced by the same engine.
+    # or "vae" (the VAE motion-manifold cost picks each stroke's clock directly -- see vae_retiming;
+    # no learned timing model, and no DROID timing stats, just the same Mahalanobis distance the
+    # cuRobo cost already minimizes, scored on whole strokes instead of individual cuRobo legs).
     mode: str = "spline"
     # Path to the learned flow checkpoint (flow mode). Relative paths resolve under the tiptop package
     # dir; when omitted the model uses its own default (flow_net_t64.pt).
     model_path: str | None = None
+    # VAE-manifold checkpoint (vae mode). Taken from the SAME `vae_path` override the cuRobo manifold
+    # cost uses, so the re-timer scores against the encoder and DROID cluster that shaped the geometry.
+    vae_path: str | None = None
     # Flow mode only: number of Euler ODE steps when sampling the flow model (more = finer, slower).
     flow_steps: int = 60
     # Flow mode only: use ONLY the flow's sampled timing and keep the collision-checked cuTAMP geometry,
@@ -219,7 +225,9 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
                                         without speeding up the careful cruise (see _asymmetric_stroke).
         blend_ops:        list[str]  -- restrict blending to these operations by name, e.g.
                                         [Pick, Place]; omitted/empty blends every operation
-        blend_mode:       str        -- "spline" (default; the analytic time law here) or "flow" (a
+        blend_mode:       str        -- "spline" (default; the analytic time law here), "vae" (the VAE
+                                        motion-manifold cost picks each stroke's clock; needs
+                                        `vae_retiming: false`, see vae_retiming) or "flow" (a
                                         DROID-learned flow-matching model samples the stroke's speed
                                         profile -- see flow_blending). Only the TIMING differs; geometry +
                                         limits + endpoint/non-idle handling are identical between the two.
@@ -253,6 +261,27 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
                                         fresh draw per plan, which is the point in dataset generation.
     """
     o = overrides or {}
+    # vae_retiming means the VAE manifold cost owns the clock (it optimizes each waypoint interval's
+    # duration inside cuRobo's trajopt, and the result is baked into the emitted waypoints).
+    # Blending would refit the geometry with a smoothing spline and re-time it from its own model,
+    # discarding that. Gated HERE rather than at the call site so it covers every caller and both
+    # backends -- and before the blend_* validation below, so a stale or malformed blend stanza in a
+    # vae_retiming config cannot raise on values that are about to be ignored anyway.
+    # local: keeps this module import-light
+    from tiptop.motion_planning import resolve_vae_path, resolve_vae_retiming
+
+    if resolve_vae_retiming(o):
+        if o.get("blend_trajectory"):
+            extra = (
+                " -- note blend_mode: vae ALSO gives the manifold cost the clock, but per gripper-"
+                "delimited stroke rather than per cuRobo leg; set vae_retiming: false to use it"
+                if str(o.get("blend_mode", "")).strip().lower() == "vae"
+                else ""
+            )
+            _log.warning(
+                "vae_retiming active: trajectory blending (blend_*) is DISABLED for this run%s", extra
+            )
+        return BlendConfig(enabled=False)
     raw_ops = o.get("blend_ops")
     ops = tuple(str(x) for x in raw_ops) if raw_ops else None
     speed_scale = float(o.get("blend_speed_scale", _DEFAULT_SPEED_SCALE))
@@ -262,8 +291,8 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
     if boundary_window < 0.0:
         raise ValueError(f"blend_boundary_window must be >= 0 (got {boundary_window})")
     mode = str(o.get("blend_mode", "spline")).strip().lower()
-    if mode not in ("spline", "flow"):
-        raise ValueError(f"blend_mode must be 'spline' or 'flow' (got {mode!r})")
+    if mode not in ("spline", "flow", "vae"):
+        raise ValueError(f"blend_mode must be 'spline', 'flow' or 'vae' (got {mode!r})")
     raw_model_path = o.get("blend_model_path")
     model_path = str(raw_model_path) if raw_model_path else None
     pace_mode = str(o.get("blend_pace", "plan")).strip().lower()
@@ -291,6 +320,9 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         ops=ops,
         mode=mode,
         model_path=model_path,
+        # Resolved the same way the cuRobo manifold cost resolves it, so both ends of the pipeline
+        # score against one checkpoint even when the config gives a repo-relative path.
+        vae_path=resolve_vae_path(str(o["vae_path"])) if o.get("vae_path") else None,
         flow_steps=int(o.get("blend_flow_steps", 60)),
         flow_retime_only=bool(o.get("blend_flow_retime_only", True)),
         pace_mode=pace_mode,
@@ -632,10 +664,20 @@ def _blend_trajectory_steps(
     vel_cap, acc_cap = _resolve_caps(
         orig_velocities, dt, vel_limit, acc_limit, config.vel_slack, config.acc_slack
     )
-    pos, vel, acc, dt_out = blend_group(
-        joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed,
-        config.boundary_window,
-    )
+    if config.mode == "vae":
+        # The VAE manifold cost picks this stroke's clock. Unlike the spline/flow laws it gets the
+        # group's wall-clock only as a RANGE BOUND, not a target -- choosing the pace is the point.
+        from tiptop.vae_retiming import vae_retime_group
+
+        pos, vel, acc, dt_out = vae_retime_group(
+            joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed,
+            config.max_duration_mult, config.vae_path,
+        )
+    else:
+        pos, vel, acc, dt_out = blend_group(
+            joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed,
+            config.boundary_window,
+        )
 
     plan = JointState(
         position=torch.as_tensor(pos, dtype=torch.float32, device=device),

@@ -1,0 +1,121 @@
+# TiPToP configuration for the REAL bimanual YAM -- SIMULTANEOUS dual-arm handover.
+#
+# Select it with TIPTOP_CONFIG (see config/__init__.py::_resolve_config_path):
+#
+#   TIPTOP_CONFIG=tiptop_yam_dual_real.yml pixi run tiptop-run --output-dir ... --enable-recording
+#
+# data-collection sets that variable for you from the `embodiment:` key of cfg/tamp/*.yml
+# (see collect/config.py and server/lib/sessions.js).
+#
+# Hardware twin of the sim config tiptop_yam_dual.yml: same TIPTOP_CONFIG selection mechanism, same
+# robot.arm_mode/dual_task plumbing, but with the real CAN/camera rig from tiptop_yam_real.yml
+# instead of the websocket-driven sim path (there is no hardware client on that path at all).
+#
+# DO NOT use this config until the mandatory sim-validation gate has passed (see the project plan:
+# 20 consecutive clean sim episodes via eval/yam_tiptop_eval.py --handover +
+# tools/replay_tiptop_dual_plan.py, including its automated close/open ordering assertion, plus a
+# human review of the replay videos) and then only per the staged physical rollout there -- starting
+# at this file's conservative time_dilation_factor, with a human spotter at e-stop reach, using the
+# exact 22cm-bar-style object cuTAMP's own handover geometry was tuned around. This is real hardware:
+# two arms moving toward a shared mid-air configuration, with no live inter-arm collision avoidance
+# at execution time -- only the pre-planned, pre-verified-safe joint path.
+#
+# PREREQUISITE -- the arm server must be running, in an environment that has i2rt:
+#
+#   sudo ip link set can_left  up type can bitrate 1000000
+#   sudo ip link set can_right up type can bitrate 1000000
+#   /home/prism-yam/openpi/examples/yam/.venv/bin/python tiptop/yam_arm_server.py
+#
+# tiptop talks to it over ZMQ; i2rt is never imported into this environment (it pins numpy 2.2.6 /
+# rerun >= 0.32, which cuRobo's pins here do not admit).
+
+robot:
+  # cuTAMP plans both arms as ONE 12-DOF chain for this embodiment -- see
+  # cutamp/robots/assets/bimanual_yam_dual.yml and cutamp/robots/bimanual_yam.py's DUAL constant.
+  # Unlike tiptop_yam_real.yml's `type: bimanual_yam_left` + `arms: [left, right]` (sequential,
+  # one plan per arm), there is no per-arm split here: one perceive-plan-execute cycle covers the
+  # whole episode (see tiptop.yam.task_split.handover_goal_builder / tiptop_run.py's
+  # _run_yam_dual_rollout).
+  type: bimanual_yam_dual
+  dof: 12
+  arm_mode: dual
+  dual_task: handover
+
+  # Midline the handover-atom detector (tiptop.yam.task_split.atom_crosses_midline) uses, in the
+  # URDF `world` frame. Matches tiptop_yam_real.yml's base_y -- same physical rig.
+  base_y: 0.0
+
+  # yam_arm_server.py. Same port layout as tiptop_yam_real.yml -- identical physical rig, only the
+  # planning/execution SHAPE differs (dual vs sequential).
+  host: "127.0.0.1"
+  port: 5555
+  gripper_port: 5559
+  state_port: 5557
+
+  # Conservative first-attempt speed per the project plan's staged physical rollout -- MORE
+  # conservative than tiptop_yam_real.yml's single-arm 0.3: a dual-arm handover has two failure
+  # surfaces instead of one, and no live inter-arm collision avoidance at execution, only the
+  # pre-verified-safe planned path. Raise toward 0.3 only after repeated clean attempts at each step
+  # (see the plan's staged-rollout checklist); do not skip stages even if early attempts succeed.
+  time_dilation_factor: 0.1
+
+  # Both arms' elbow-up rest posture, back to back -- matches
+  # cutamp.robots.bimanual_yam.bimanual_yam_neutral_joint_positions repeated twice (the dual chain's
+  # q_init/retract_config) and yam_arm_server.NEUTRAL_Q for each arm. The arm that is not currently
+  # the "acting" hand in a given plan segment is still collision-checked against the real geometry of
+  # the OTHER arm here (unlike the sequential configs, which lock the idle arm as a static obstacle
+  # at exactly this posture) -- see bimanual_yam_dual.yml's self-collision spheres.
+  q_home: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0,
+           0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+  q_capture: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0,
+              0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+
+cameras:
+  # Identical physical rig to tiptop_yam_real.yml -- same fixed third-person D435 the dual chain
+  # perceives through, same two wrist cameras recorded but not perceived from.
+  hand:
+    serial: "${oc.env:TIPTOP_TOP_CAMERA_ID,254622075770}"
+    type: realsense
+    width: 1280
+    height: 720
+    fps: 30
+    mount: world
+
+  external:
+    serial: "${oc.env:TIPTOP_LEFT_WRIST_CAMERA_ID,353322270876}"
+    type: realsense
+    width: 640
+    height: 360
+    fps: 30
+    record_only: true
+
+  external_2:
+    serial: "${oc.env:TIPTOP_RIGHT_WRIST_CAMERA_ID,353322271825}"
+    type: realsense
+    width: 640
+    height: 360
+    fps: 30
+    record_only: true
+
+perception:
+  foundation_stereo:
+    url: "http://localhost:${oc.env:TIPTOP_FS_PORT,1234}"
+
+  m2t2:
+    url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
+    apply_bounds: true
+
+  # Same reasoning as tiptop_yam_real.yml: the YAM is 6-DOF per arm with no wrist null space, so
+  # half the valid grasps are otherwise unreachable.
+  augment_flipped_grasps: true
+
+  sam:
+    mode: "local"
+
+  depth_trunc_m: 2.5
+  voxel_downsample_size: 0.0075
+  contact_threshold_m: 0.01
+  mask_erosion_pixels: 3
+
+  depth_smoothing:
+    num_frames: 5
