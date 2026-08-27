@@ -566,6 +566,11 @@ def execute_cutamp_plan(
 
     def _submit_through(count: int) -> None:
         nonlocal n_submitted
+        # Once a hand-off is latched, run out what is already queued and add NOTHING new. The loop
+        # below keeps walking the queued segments so they get timeline entries and their gripper
+        # steps fire; without this it would keep the lookahead topped up and never catch up.
+        if stop_requested:
+            return
         while n_submitted < min(count, len(traj_steps)):
             i = traj_steps[n_submitted]
             plan_i = cutamp_plan[i]["plan"]
@@ -692,7 +697,7 @@ def execute_cutamp_plan(
             action_duration = time.perf_counter() - action_start_time
             _log.debug(f"Executing {action_type} action took {action_duration:.2f}s")
 
-            if should_stop is not None and should_stop():
+            if should_stop is not None and not stop_requested and should_stop():
                 # The teleop hand-off checkpoint, met with the queued streaming path. BREAK rather
                 # than return: under queueing this loop is _TRAJ_LOOKAHEAD (= 1) segments ahead of
                 # the arm, so what is already in the shim's queue is still moving it. Falling
@@ -709,9 +714,23 @@ def execute_cutamp_plan(
                 stop_requested = True
                 _log.info(
                     f"Stopping after step {step + 1}/{len(cutamp_plan)} ({action_label}) at the caller's "
-                    f"request; the remaining {len(cutamp_plan) - step - 1} step(s) will not be issued "
-                    "(a segment already queued still runs out)"
+                    f"request; no further segment will be QUEUED, and the loop walks out the "
+                    f"{max(n_submitted - traj_seen, 0)} already in flight before returning"
                 )
+
+            # Leave only once nothing queued is still ahead of us. _submit_through runs
+            # _TRAJ_LOOKAHEAD segments in front of the arm, so at the instant a stop lands the shim
+            # is normally already streaming a segment this loop has NOT walked past. Breaking here
+            # would let wait_done() run it anyway -- off the end of the recorded episode, and with
+            # any gripper step in between never issued, so the arm can lift with open jaws. Walking
+            # it instead gives it its timeline entry and fires that gripper, which is what makes the
+            # hand-off leg a contiguous prefix that ENDS where the arm actually is.
+            #
+            # On the blocking path nothing is ever queued, so this is the immediate break it has
+            # always been. Aborting is not an option either way: the lookahead segment starts
+            # streaming the instant wait_arrival returns, so abort() would be the mid-trajectory
+            # stop this checkpoint exists to avoid.
+            if stop_requested and (not queued.available or traj_seen >= n_submitted):
                 break
 
     except BaseException:

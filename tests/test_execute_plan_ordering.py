@@ -234,3 +234,72 @@ def test_these_checks_would_catch_the_2026_07_28_regression(monkeypatch):
         f"(segment {SEG*1000:.0f} ms), so test_consecutive_grippers_are_one_segment_apart cannot "
         f"detect the regression"
     )
+
+
+# --- the teleop hand-off, against the QUEUED arm ---------------------------------------------- #
+#
+# should_stop is the SIGUSR1 checkpoint (tiptop_run._sigusr1_teleop_switch): the operator asks for
+# the arm mid-plan, the current step finishes, and the rollout is saved as one leg of a hand-off
+# trajectory that a human continues. Both properties below are about the SEAM between those legs.
+#
+# Queueing is what makes this subtle. _submit_through keeps _TRAJ_LOOKAHEAD segments in flight, so
+# when a stop lands the shim is normally already streaming a segment the loop has not walked past --
+# invisible to the loop, absent from the timeline, and with any gripper step before it never issued.
+
+
+def _stop_after(k, plan=None, monkeypatch=None):
+    """Run a plan, requesting a stop after the k-th should_stop poll. Returns (queue, timeline)."""
+    plan = plan or _plan()
+    q = FakeQueue()
+    monkeypatch.setattr(ep, "_QueuedArm", lambda: q)
+    monkeypatch.setattr(ep, "GRIPPER_LEAD_S", 0.0)
+    timeline: list = []
+    n = {"i": 0}
+
+    def should_stop():
+        n["i"] += 1
+        return n["i"] > k
+
+    ep.execute_cutamp_plan(plan, client=FakeClient(q), timeline=timeline, should_stop=should_stop)
+    return q, timeline
+
+
+@pytest.mark.parametrize("k", range(6))
+def test_a_handoff_leaves_the_arm_where_the_recorded_episode_ends(k, monkeypatch):
+    """Every segment the arm RUNS is one the episode recorded, at every stop point.
+
+    lerobot_capture._flatten_plan keeps the finite-t_wall PREFIX of the plan, so a segment that runs
+    without a timeline entry is motion the dataset does not contain: the robot leg ends at the pose
+    of its last recorded frame while the human's leg starts a segment further on, and stitching the
+    two (collect/merge_trajectory.py) shows an unexplained jump.
+    """
+    q, timeline = _stop_after(k, monkeypatch=monkeypatch)
+    recorded = sum(1 for e in timeline if e["type"] == "trajectory")
+    ran = sum(1 for e in q.events if e[0] == "submit")
+    assert recorded == ran, (
+        f"stopping after poll {k}: the arm ran {ran} segments but the episode recorded {recorded}. "
+        f"The lookahead queued a segment the loop never walked past."
+    )
+
+
+@pytest.mark.parametrize("k", range(6))
+def test_a_handoff_never_hands_over_mid_grasp(k, monkeypatch):
+    """No segment the arm RUNS is missing a gripper command that belongs before it.
+
+    Derived from what the arm did, not from what the timeline says, because the two coming apart is
+    the defect. The failure this pins: a stop landing between a trajectory's submit and its poll used
+    to break immediately, so the queued NEXT segment ran while the close that belongs before it never
+    fired -- the arm diving to the grasp and lifting with open jaws, which is the mid-plan motion the
+    checkpoint exists to prevent.
+    """
+    plan = _plan()
+    q, _ = _stop_after(k, plan=plan, monkeypatch=monkeypatch)
+    ran = sum(1 for e in q.events if e[0] == "submit")
+    traj_idx = [i for i, s in enumerate(plan) if s["type"] == "trajectory"]
+    end = traj_idx[ran - 1] if ran else 0        # plan index of the last segment actually executed
+    want = [s["action"] for s in plan[:end] if s["type"] == "gripper"]
+    fired = [e[1] for e in q.events if e[0] == "gripper"]
+    assert fired == want, (
+        f"stopping after poll {k}: the arm ran {ran} segments (through plan step {end}), which "
+        f"needed the gripper to have fired {want}, but it fired {fired}"
+    )
