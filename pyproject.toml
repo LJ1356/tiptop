@@ -69,6 +69,7 @@ sam-server = "tiptop.scripts.sam_server:main"
 tiptop-config = "tiptop.scripts.tiptop_config:entrypoint"
 calibrate-wrist-cam = "tiptop.scripts.calibrate_wrist_cam:calibrate_wrist_camera_entrypoint"
 calibrate-top-cam = "tiptop.scripts.calibrate_top_cam:calibrate_top_cam_entrypoint"
+calibrate-third-person-cam = "tiptop.scripts.calibrate_third_person_cam:calibrate_third_person_camera_entrypoint"
 compute-gripper-mask = "tiptop.scripts.compute_gripper_mask:compute_gripper_mask_entrypoint"
 paint-gripper-mask = "tiptop.scripts.paint_gripper_mask:paint_gripper_mask_entrypoint"
 

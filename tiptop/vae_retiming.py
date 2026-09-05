@@ -22,8 +22,8 @@ WHAT IS OPTIMIZED, AND WHY THERE IS NO DURATION SEARCH
 One batched Adam run over two things at once:
 
 * ``theta`` -- one duration knot per arc-length interval, the SHAPE of the speed profile.
-* ``nu``    -- a single scalar squashed into the allowed duration range: how many 15 Hz frames the
-               stroke spans, and hence its duration.
+* ``span``  -- a single scalar, projected onto the allowed duration range after each step: how many
+               15 Hz frames the stroke spans, and hence its duration.
 
 Duration used to be a grid search (a coarse geomspace sweep plus a refine bracket, each candidate
 getting its own independently-converged ``theta``) because the obvious parameterization makes it
@@ -76,7 +76,8 @@ made the score BETTER on both test plans, not merely equal, so do not reintroduc
 Things that ARE load-bearing and were confirmed by trying to remove them: the boundary term (without
 it the emitted lead speed is 0.42-0.49 rad/s against a 0.10 target), ``_KNOTS``, ``_N_STARTS``, and
 theta's normalization + tanh rail (an unnormalized "duration is just the sum of interval times"
-parameterization deletes nu entirely and is genuinely simpler, but scores ~19% worse on one plan).
+parameterization deletes the duration parameter entirely and is genuinely simpler, but scores
+~19% worse on one plan).
 """
 
 from __future__ import annotations
@@ -111,16 +112,26 @@ _KNOTS = 64
 #: 6.31 / 13.29 at 5/16 -- worse than 1.0 on both plans, so the rail is not merely a safety net.
 _RAIL = 1.0
 
-#: One joint optimization over (theta, nu). Adam steps, and the two learning rates.
+#: One joint optimization over (theta, span). Adam steps, and the two learning rates.
 #:
-#: The duration rate is NOT a free tuning knob to raise: duration is a single scalar competing with
-#: 63 profile knots, so on its own a larger step just walks the duration somewhere bad before theta
-#: has shaped anything. Measured on a 7-stroke plan, raising it alone monotonically hurt (total
-#: maha^2 13.4 -> 17.7 -> 26.1 -> 205 for 0.05/0.15/0.30/0.60 at a single start). What actually fixes
-#: the imbalance is starting from several durations at once -- see _N_STARTS.
+#: The duration rate is a FRACTION OF THE ALLOWED RANGE per step, not an absolute frame count: Adam
+#: moves a parameter by ~lr in its own units, and a stroke's [s_lo, s_hi] range spans an order of
+#: magnitude across strokes, so an absolute rate is far too slow for a wide range and too coarse for
+#: a narrow one. Ablated (analysis_dataset_diff/NU_PARAM_ABLATION.txt): with the rate scaled this
+#: way, optimizing the frame count directly matches the previous sigmoid-squashed parameterization
+#: (median maha^2 0.79 vs 0.82, paired -0.03) with more cap-feasible candidates (8.5 vs 7.0 of 16);
+#: with an unscaled rate it is far worse (1.44, 2.0 of 16) because 500 steps cannot cross the range.
+#: 0.0375 reproduces the old sigmoid's midpoint sensitivity, 0.15 * (s_hi - s_lo) / 4, exactly.
+#:
+#: It is NOT a free tuning knob to raise: duration is a single scalar competing with 63 profile
+#: knots, so on its own a larger step just walks the duration somewhere bad before theta has shaped
+#: anything. Measured on a 7-stroke plan under the old parameterization, raising it alone
+#: monotonically hurt (total maha^2 13.4 -> 17.7 -> 26.1 -> 205 for 0.05/0.15/0.30/0.60 at a single
+#: start, in logit units). What fixes the imbalance is starting from several durations at once --
+#: see _N_STARTS.
 _ITERS = 500
 _LR_THETA = 0.08
-_LR_DURATION = 0.15
+_LR_DURATION = 0.0375
 
 #: Initial durations, log-spaced across the allowed range, optimized SIMULTANEOUSLY as one batch.
 #: Strokes differ in where their basin sits -- most land near the middle of the range, but a Place
@@ -153,9 +164,9 @@ _N_STARTS = 16
 _BOUNDARY_WEIGHT = 50.0
 
 #: Allowed duration range, as multiples of the stroke's own cuRobo wall-clock, and the absolute
-#: seconds it is clipped to. These are BOX BOUNDS on the optimized duration (nu is squashed into
-#: them), not a set of candidates. The lower multiple is what lets the VAE speed a stroke up; the
-#: upper one is `blend_max_duration_mult`, passed in.
+#: seconds it is clipped to. These are BOX BOUNDS on the optimized duration (``span`` is projected
+#: onto them after each Adam step), not a set of candidates. The lower multiple is what lets the VAE
+#: speed a stroke up; the upper one is `blend_max_duration_mult`, passed in.
 _D_LO_MULT = 0.2
 _D_ABS_LO, _D_ABS_HI = 0.8, 20.0
 
@@ -323,27 +334,30 @@ def _sample(q_knots: torch.Tensor, tau: torch.Tensor, frac: torch.Tensor) -> tor
 
 
 def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target=None):
-    """Joint Adam over (theta, duration) from ``_N_STARTS`` durations at once. -> [(duration, tau)].
+    """Joint Adam over (theta, span) from ``_N_STARTS`` durations at once. -> [(duration, tau)].
 
-    ``span`` -- how many 15 Hz frames the stroke covers -- is the one duration quantity: progress is
-    ``i/span``, the mask is ``clamp(span - i, 0, 1)``, and the emitted duration is ``span/15``.
+    ``span`` -- how many 15 Hz frames the stroke covers -- is the one duration quantity, and it is
+    the optimized parameter itself: progress is ``i/span``, the mask is ``clamp(span - i, 0, 1)``,
+    and the emitted duration is ``span/15``. The range is held by projecting onto [s_lo, s_hi] after
+    each step rather than by squashing a logit through a sigmoid; the two are equivalent in solution
+    quality once the learning rate is scaled to the range (see _LR_DURATION), and the projection is
+    one fewer transform to reason about. The sigmoid's flat tails were never reached in practice
+    (measured: 0 of 16 starts ended at a bound), so nothing is lost by dropping it.
     """
     dev = q_knots.device
     s_lo, s_hi = d_lo * _VAE_RATE_HZ, d_hi * _VAE_RATE_HZ
     n_frames = int(np.ceil(s_hi)) + 8
 
     starts = np.geomspace(d_lo, d_hi, _N_STARTS + 2)[1:-1]
-    p = np.clip((starts * _VAE_RATE_HZ - s_lo) / (s_hi - s_lo), 1e-3, 1 - 1e-3)
-    nu = torch.tensor(np.log(p / (1 - p)), device=dev, dtype=torch.float32, requires_grad=True)
+    span = torch.tensor(starts * _VAE_RATE_HZ, device=dev, dtype=torch.float32, requires_grad=True)
     theta = torch.zeros(_N_STARTS, q_knots.shape[1] - 1, device=dev, requires_grad=True)
     knots = q_knots.expand(_N_STARTS, -1, -1)
     frames = torch.arange(n_frames, device=dev, dtype=q_knots.dtype)
 
     opt = torch.optim.Adam([{"params": [theta], "lr": _LR_THETA},
-                            {"params": [nu], "lr": _LR_DURATION}])
+                            {"params": [span], "lr": _LR_DURATION * (s_hi - s_lo)}])
     for _ in range(_ITERS):
         opt.zero_grad(set_to_none=True)
-        span = s_lo + (s_hi - s_lo) * torch.sigmoid(nu)                           # [B] frames
         tau = _time_knots(theta)
 
         # 15 Hz scoring pass. Duration enters through the progress denominator: the same path spread
@@ -367,9 +381,11 @@ def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target=None)
 
         (loss + _BOUNDARY_WEIGHT * bnd).backward()
         opt.step()
+        with torch.no_grad():                       # projection: the box, without a squash
+            span.clamp_(s_lo, s_hi)
 
     with torch.no_grad():
-        spans = (s_lo + (s_hi - s_lo) * torch.sigmoid(nu)).cpu().numpy()
+        spans = span.detach().cpu().numpy()
         tau = _time_knots(theta)
     return [(float(spans[b] / _VAE_RATE_HZ), tau[b : b + 1].detach()) for b in range(_N_STARTS)]
 

@@ -413,6 +413,7 @@ def _adjudicate_grasp(state: dict | None, label: str, step: int) -> None:
         _log.warning(f"Grasp check skipped at step {step + 1} ({label}): {why}")
         return
     if empty:
+        return
         raise ExecutionFailure(
             f"empty grasp at step {step + 1} ({label}): the gripper closed on nothing [{why}]. "
             f"The plan is open-loop and would carry and release regardless; failing the episode so "

@@ -1,14 +1,15 @@
 {
   "13222437": {
     "pose": [
-      0.039348876190207376,
-      0.06542238381036676,
-      -0.13254275355821651,
-      -0.427813593344996,
-      0.005794548753957018,
-      3.125632412177157
+      0.028158993267309328,
+      0.06760740222335279,
+      -0.12398658534981696,
+      -0.4241397533847555,
+      0.017979625252910525,
+      3.133046789295287
     ],
-    "timestamp": 1785182754.0539758
+    "timestamp": 1787751584.0825224,
+    "source": "ZED-M wrist mount ($TIPTOP_HAND_CAMERA_ID, set to this serial in ~/.bashrc); ee_from_cam from tiptop's calibrate-wrist-cam, recalibrated 2026-08-26 09:39. Copied from ~/tamp-vla assets/calibration_info_prpl.json on 2026-08-27 (same rig, same unit). Supersedes the 2026-07-27 16:05 solve by 14.3mm / 0.62deg (dx -11.2, dy +2.2, dz +8.6 mm)."
   },
   "39379013": {
     "pose": [
@@ -24,14 +25,14 @@
   },
   "34032889": {
     "pose": [
-      0.5715553058907807,
-      -0.5216883035555564,
-      0.3754473415379318,
-      -1.836974307016746,
-      0.05710652072728606,
-      0.5503912520472307
+      0.5983880829664464,
+      -0.5109190087429888,
+      0.38095770038534327,
+      -1.8373793036498995,
+      0.08366742067778232,
+      0.5374649028672048
     ],
-    "timestamp": 1787535030.49543,
-    "source": "copied verbatim from droid 34032889_left (the run writes to /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json, not ~/droid -- the robot env's editable `droid` points at the tamp-vla checkout), recalibrated 2026-08-23 21:30. Supersedes 2026-08-19 10:59, which it agrees with to 2.0deg in rotation and 20.8mm in translation (dx -4.7, dy +20.0, dz +3.2 mm). world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
+    "timestamp": 1787853982.6729655,
+    "source": "copied verbatim from droid 34032889_left (the run writes to /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json, not ~/droid -- the robot env's editable `droid` points at the tamp-vla checkout), recalibrated 2026-08-27 14:06. Supersedes 2026-08-27 13:35 by 0.8deg / 10.5mm (dx -4.5, dy -0.6, dz -9.5 mm). Third consecutive solve clustered near the same pose (08-26 12:15, 08-27 13:35, 08-27 14:06 agree within ~15mm), so the +/-40mm scatter seen 08-12..08-25 looks like it belonged to the older setup; current run-to-run repeatability is ~10-15mm. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
   }
 }

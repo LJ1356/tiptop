@@ -79,7 +79,7 @@ def detect_and_translate(
     image: Image.Image,
     task_instruction: str,
     client: genai.Client | None = None,
-    model_id: str = "gemini-robotics-er-1.6-preview",
+    model_id: str = "gemini-robotics-er-2-preview",
     temperature: float | None = None,
     extra_objects: Sequence[str] = (),
 ) -> tuple[list[dict], list[dict]]:
@@ -115,7 +115,7 @@ async def detect_and_translate_async(
     image: Image.Image,
     task_instruction: str,
     client: genai.Client | None = None,
-    model_id: str = "gemini-robotics-er-1.6-preview",
+    model_id: str = "gemini-robotics-er-2-preview",
     temperature: float | None = None,
     extra_objects: Sequence[str] = (),
 ) -> tuple[list[dict], list[dict]]:
