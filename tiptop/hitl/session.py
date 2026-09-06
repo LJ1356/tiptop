@@ -85,6 +85,18 @@ class HITLSession:
         """Whether the phase the rollout now running is followed by belongs to a human."""
         return self.current is not None and self.current.is_human
 
+    def is_final_phase(self) -> bool:
+        """Whether the phase now current is the LAST one in the plan -- nothing follows it.
+
+        Distinct from ``is_last_leg``, which asks about the whole ``robot_run()`` a leg covers: a leg
+        of three coalesced robot phases is the last leg while only its third phase is the final one.
+        This is the phase-level question, which is what decides whether a human step is verified at
+        all (tiptop_run._hitl_human_phase) and what a hand-back does (``plan_next``).
+
+        False for a finished session: there is no current phase to be the final one.
+        """
+        return not self.finished and self.index + 1 >= len(self.phases)
+
     def is_last_leg(self) -> bool:
         """Whether the leg about to run is the last one of the task -- nothing follows it.
 
@@ -397,6 +409,17 @@ def retry_message(missing: Sequence[str], attempts_left: int) -> str:
     return "\n".join(lines)
 
 
-def phase_summary(phase: Phase) -> dict:
-    """The human phase as it goes into the rollout's event stream."""
-    return {"description": phase.description, "expected": sorted(str(a) for a in phase.atoms)}
+def phase_summary(session: HITLSession, phase: Phase) -> dict:
+    """The human phase as it goes into the rollout's event stream.
+
+    Carries where the phase sits in the plan as well as what it asks for. The UI has one "next"
+    control for the hand-off, and what pressing it does -- carry on with the robot, or close the
+    trajectory out -- is the plan's decision, not the operator's: ``is_last_phase`` is that decision.
+    """
+    return {
+        "description": phase.description,
+        "expected": sorted(str(a) for a in phase.atoms),
+        "phase_index": session.index,
+        "n_phases": len(session.phases),
+        "is_last_phase": session.is_final_phase(),
+    }

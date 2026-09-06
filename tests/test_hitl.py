@@ -28,7 +28,7 @@ from tiptop.hitl.planning import (
 )
 from tiptop.hitl.prompts import plan_prompt
 from tiptop.hitl.proposal import parse_plan_response
-from tiptop.hitl.session import HITLSession, handoff_message
+from tiptop.hitl.session import HITLSession, handoff_message, phase_summary
 from tiptop.hitl.structs import (
     DeferredObject,
     HITLProposalError,
@@ -306,6 +306,43 @@ def test_the_handoff_message_says_work_remains():
     message = handoff_message(session, session.current)
     assert "Open the white_box" in message
     assert "1 more phase(s) follow" in message, "the operator must know the robot is not done"
+
+
+def test_the_final_phase_is_the_one_the_robot_never_follows():
+    # is_final_phase gates whether a human step is verified at all: the check exists because every
+    # LATER phase is planned against the belief that this one happened, and after the last phase
+    # there is no later phase -- only the operator, labeling the whole trajectory.
+    session = _session()  # robot, human, robot
+    assert not session.is_final_phase()
+    session.advance()
+    assert not session.is_final_phase(), "the human phase is followed by a robot one"
+    session.advance()
+    assert session.is_final_phase(), "the third phase is the last in the plan"
+    session.advance()
+    assert session.finished and not session.is_final_phase(), "a finished session has no current phase"
+    # Distinct from is_last_leg, which asks about the whole robot_run a leg covers -- a leg can be
+    # several phases wide, and advancing it steps the index by all of them at once.
+    sorted_session = _sort_session()  # robot, robot, human
+    assert len(sorted_session.robot_run()) == 2, "the two robot phases are coalesced into one leg"
+    assert not sorted_session.is_final_phase(), "the leg's first phase is not the plan's last"
+    sorted_session.advance()
+    assert sorted_session.index == 2, "one advance covers the whole robot run"
+    assert sorted_session.is_final_phase(), "which lands on the plan's last phase -- the human's"
+
+
+def test_the_human_phase_event_places_the_step_in_the_plan():
+    # The data-collection UI draws ONE "next" button for a hand-off and says what it will do, rather
+    # than making the operator choose between replanning and finishing. What it says comes from here:
+    # is_last_phase is the plan's own answer to "what happens after this step?".
+    session = _session()  # robot, human, robot
+    session.advance()
+    summary = phase_summary(session, session.current)
+    assert summary["phase_index"] == 1 and summary["n_phases"] == 3
+    assert summary["is_last_phase"] is False, "a robot phase still follows, so the robot carries on"
+    assert summary["description"] and summary["expected"], "what the step asks for still rides along"
+    # The last phase of a task is where the button has to say "finish the episode" instead.
+    session.advance()
+    assert phase_summary(session, session.current)["is_last_phase"] is True
 
 
 def test_a_renamed_object_re_binds_instead_of_throwing_the_plan_away():
@@ -989,6 +1026,44 @@ def test_a_teleop_handoff_resume_still_moves_the_arm_not_at_all():
         continuing_trajectory=True,
         perception_cam_key="external",
     ) == (False, False, False)
+
+
+def test_the_task_prompt_disarms_a_finished_trajectorys_carry_over():
+    """Pressing "Collect another" must give a FULL reset, whatever the last trajectory was doing.
+
+    The bug: a finished HITL task left `_continue_trajectory` armed. The hand-off's resume sets it,
+    the human-phase branch keeps it on purpose (clearing it mid-plan minted a new trajectory id and
+    split the episode), and nothing cleared it once the plan turned out to be OVER. The next episode
+    then read itself as another leg of the trajectory just labeled -- so the arm never went home, and
+    through the same flag it inherited the old trajectory_id and `_trajectory_handed_off`, which also
+    cost it its post-processing.
+
+    Reaching the task prompt is what makes them stale: a real continuation re-enters the loop through
+    `_pending_instruction` and never gets here (nor emits `awaiting_task`) precisely so that it is not
+    interrupted. So every carry-over flag is disarmed here by construction.
+    """
+    from tiptop import tiptop_run as tr
+
+    saved = (tr._skip_episode_reset, tr._skip_episode_arm_motion, tr._continue_trajectory, tr._reuse_plan_skeleton)
+    try:
+        tr._skip_episode_reset = True
+        tr._skip_episode_arm_motion = True
+        tr._continue_trajectory = True
+        tr._reuse_plan_skeleton = ["not-a-real-skeleton"]
+        tr._disarm_rollout_carryover()
+        assert tr._continue_trajectory is False, "the next episode is not a leg of the last trajectory"
+        assert tr._skip_episode_reset is False and tr._skip_episode_arm_motion is False
+        assert tr._reuse_plan_skeleton is None, "and it plans its own task rather than reusing a skeleton"
+        # Which is what actually sends the arm home: all three clear => the full reset.
+        assert tr._episode_reset_actions(
+            resuming_from_handoff=tr._skip_episode_reset,
+            resuming_after_human_phase=tr._skip_episode_arm_motion,
+            continuing_trajectory=tr._continue_trajectory,
+            perception_cam_key="external",
+        ) == (True, True, False), "Collect another homes the arm and opens the gripper"
+    finally:
+        (tr._skip_episode_reset, tr._skip_episode_arm_motion, tr._continue_trajectory,
+         tr._reuse_plan_skeleton) = saved
 
 
 def test_a_robot_to_robot_continuation_does_not_drive_the_arm_home_either():

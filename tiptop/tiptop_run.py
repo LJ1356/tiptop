@@ -393,7 +393,9 @@ def _reacquire_cameras(container: "_DemoContainer", *, had_external_cam_2: bool)
     object.__setattr__(container, "external_cam_2", external_cam_2)
 
 
-def _run_teleop_handoff(container: "_DemoContainer", can_finish: bool = False) -> bool:
+def _run_teleop_handoff(
+    container: "_DemoContainer", can_finish: bool = False, plan_next: str | None = None
+) -> bool:
     """Hand the physical arm off to a human teleop session, then block until it's handed back.
 
     Returns True when the operator ended the trajectory from teleop ("resume_finish") rather than
@@ -405,6 +407,13 @@ def _run_teleop_handoff(container: "_DemoContainer", can_finish: bool = False) -
     hand-off does; the ones taken at a prompt or after a preempt have no leg to label and no
     trajectory to end, so they advertise `can_finish: false` and downgrade a "resume_finish" to a
     plain resume rather than stranding the operator.
+
+    `plan_next` says what a PLAIN "resume" will do, when something already knows -- "robot" (a phase
+    follows this one, so the arm carries on) or "end" (this was the plan's last phase, so handing
+    back closes the trajectory out and lands at the label prompt). A HITL human phase always knows;
+    a hand-off the operator took mid-rollout does not, and passes None. It is advisory, for the UI's
+    single "next" control: nothing here branches on it, because a plain "resume" already does the
+    right thing in both cases -- _hitl_human_phase advances the plan and labels when it is finished.
 
     Called at a rollout checkpoint (see _sigusr1_teleop_switch), so the current plan step has already
     finished and this rollout's partial episode is already on disk. From here:
@@ -469,8 +478,15 @@ def _run_teleop_handoff(container: "_DemoContainer", can_finish: bool = False) -
     # trajectory_id rides along so the server can stamp the teleop leg it is about to spawn with the
     # same id, making the human's demonstration a segment of this trajectory rather than its own episode.
     # can_finish tells the server whether to offer "hand back and finish" alongside the plain
-    # hand-back, so the UI never shows a button this hand-off cannot honour.
-    _emit_event({"event": "awaiting_teleop_resume", "trajectory_id": _trajectory_id, "can_finish": can_finish})
+    # hand-back, so the UI never shows a button this hand-off cannot honour. plan_next goes further:
+    # where the plan already settles what comes after the hand-back, the UI shows ONE button and says
+    # what it will do, instead of making the operator re-decide something the plan has decided.
+    _emit_event({
+        "event": "awaiting_teleop_resume",
+        "trajectory_id": _trajectory_id,
+        "can_finish": can_finish,
+        "plan_next": plan_next,
+    })
     _log.info(
         "Robot and cameras released; waiting for 'resume' on stdin (sent once the operator hands "
         "control back and the teleop process has exited) before reconnecting and replanning..."
@@ -1033,6 +1049,35 @@ def _run_robot_command(container, cfg, cmd: str) -> None:
         _emit_event({"event": "robot_command", "command": cmd, "ok": False, "error": str(e)})
 
 
+def _disarm_rollout_carryover() -> None:
+    """Drop every flag armed to carry ONE rollout into the next.
+
+    They exist to make a continuation -- a teleop hand-off resume, a HITL phase, a robot->robot leg --
+    re-enter the rollout loop without resetting the arm or minting a new trajectory. Each is consumed
+    at the top of the next rollout, so the only way one survives is a continuation that stopped being
+    one: the plan finished, or was abandoned. See _get_task_instruction for where that is known.
+    """
+    global _skip_episode_reset, _skip_episode_arm_motion, _continue_trajectory, _reuse_plan_skeleton
+    armed = [
+        name
+        for name, value in (
+            ("_skip_episode_reset", _skip_episode_reset),
+            ("_skip_episode_arm_motion", _skip_episode_arm_motion),
+            ("_continue_trajectory", _continue_trajectory),
+            ("_reuse_plan_skeleton", _reuse_plan_skeleton is not None),
+        )
+        if value
+    ]
+    if armed:
+        # Worth a line: this is the moment a finished trajectory stops being one, and if the next
+        # episode ever misbehaves again this says exactly what it inherited.
+        _log.info(f"Back at the task prompt: disarming {', '.join(armed)} -- the next episode is a fresh one")
+    _skip_episode_reset = False
+    _skip_episode_arm_motion = False
+    _continue_trajectory = False
+    _reuse_plan_skeleton = None
+
+
 def _get_task_instruction() -> str:
     """Task for the next rollout. The first comes from ``TIPTOP_TASK`` (non-interactive
     launch); subsequent ones are prompted interactively so the warmed container is reused
@@ -1051,6 +1096,21 @@ def _get_task_instruction() -> str:
         instr = _pending_instruction
         _pending_instruction = None
         return instr
+    # Nothing queued, so the loop is about to block on the operator -- and REACHING this prompt is
+    # itself the statement that no trajectory is still in flight. A continuation re-enters the loop
+    # through _pending_instruction above precisely so it never emits `awaiting_task` (the one state
+    # in which the data-collection server lets someone home the arm or start another rollout midway
+    # through a trajectory). So every carry-over flag is stale here by construction.
+    #
+    # Concretely, this is the "Collect another didn't send the arm home" bug. A finished HITL task
+    # left `_continue_trajectory` set: the hand-off's resume armed it, the human-phase branch keeps it
+    # deliberately (clearing it mid-plan minted a new trajectory id and split the episode), and
+    # nothing cleared it when the plan turned out to be OVER. The next episode then read itself as
+    # another leg of the trajectory just labeled -- no return to home, and through the same flag the
+    # old `_trajectory_id` and `_trajectory_handed_off` carried into it, which also cost that episode
+    # its post-processing. Disarmed HERE rather than at each arming site: there are four of those and
+    # this is the one place all of them are provably stale.
+    _disarm_rollout_carryover()
     env_task = os.environ.get("TIPTOP_TASK", "")
     if env_task:
         os.environ["TIPTOP_TASK"] = ""  # consume the launch task
@@ -1384,17 +1444,24 @@ def _await_human_phase(message: str) -> str:
 async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool) -> bool:
     """Hand one human phase over, then check from a fresh image that it happened.
 
-    Returns True when this rollout should be labeled and the trajectory closed out: either the
-    operator ended it from teleop ("return & finish"), or this was the task's LAST phase, so there is
-    nothing left to plan. Both are the same thing to the caller -- a `labeled` event, which is what
-    ends the trajectory and has the server merge its legs. Returning False leaves the trajectory open,
-    which is what lets a robot phase AFTER a human one still happen.
+    Returns True when this rollout should be labeled and the trajectory closed out. Three ways there,
+    all the same thing to the caller -- a `labeled` event, which ends the trajectory and has the
+    server merge its legs: the operator ended it from teleop ("return & finish"); this was the task's
+    LAST phase, so there is nothing left to plan; or the check gave up on a middle phase, which stops
+    the plan but must NOT cost the operator the demonstration. Returning False leaves the trajectory
+    open, which is what lets a robot phase AFTER a human one still happen.
 
-    A failed check is not silently accepted: the operator is told what is still missing and given
-    another go (``verify_retries``). Continuing on a false belief is the one outcome worth avoiding,
-    since every later phase is planned against it -- but so is throwing away a demonstration a human
-    just gave because one classifier call went the wrong way, hence the retry rather than an
-    immediate failure.
+    **The last phase is not checked at all.** Verification exists because every LATER phase is planned
+    against the belief that this one happened -- and after the final phase there is no later phase.
+    What there is instead is the operator, labeling the whole trajectory seconds later: a human
+    verdict on the finished episode, which strictly supersedes a per-phase classifier. So the plan
+    ends and the label prompt decides whether the episode is kept.
+
+    Elsewhere a failed check is not silently accepted: the operator is told what is still missing and
+    given another go (``verify_retries``). Continuing on a false belief is the one outcome worth
+    avoiding -- but so is throwing away a demonstration a human just gave because one classifier call
+    went the wrong way, which is why a spent retry budget still ends at the label prompt rather than
+    dropping the legs unlabeled.
     """
     from tiptop.hitl.grounding import missing_statements, verify_phase
     from tiptop.hitl.session import handoff_message, phase_summary, retry_message
@@ -1408,7 +1475,7 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
         _emit_event({
             "event": "awaiting_human_phase",
             "instructions": phase.instructions,
-            **phase_summary(phase),
+            **phase_summary(session, phase),
         })
         try:
             answer = _await_human_phase(handoff_message(session, phase))
@@ -1417,11 +1484,39 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
             # to run satisfies it, rather than leaving it armed to fire again in the next rollout.
             _consume_teleop_request()
             _log.info("HITL: handing the arm over for the human phase")
-            finished_from_teleop = _run_teleop_handoff(container, can_finish=can_finish)
+            # The plan, not the operator, decides what a hand-back does here: the last phase closes
+            # the trajectory out (the advance() below finishes the session and returns True), any
+            # earlier one carries on into the next phase. Reported so the UI can say which.
+            finished_from_teleop = _run_teleop_handoff(
+                container,
+                can_finish=can_finish,
+                plan_next="end" if session.is_final_phase() else "robot",
+            )
             answer = "done"
         if answer == "abort":
             _hitl_reset_session("the operator abandoned the human phase")
             return finished_from_teleop
+
+        # The plan's LAST phase is not verified. Nothing downstream is planned against it -- there is
+        # no later phase to plan -- and the operator labels the whole trajectory seconds later, which
+        # is a human verdict on the finished episode and strictly supersedes a per-phase classifier.
+        # Checking here did real damage rather than none: a verdict that went the wrong way with the
+        # retries spent returned False, so the caller never labeled, and a demonstration the human had
+        # just finished was dropped unlabeled and never merged (data-collection ARCHITECTURE.md §6c).
+        # Emitted with skipped:true so the audit trail says it was NOT checked rather than that it
+        # passed.
+        if session.is_final_phase():
+            _log.info("HITL: last phase of the task -- not verifying; the operator labels the episode")
+            _emit_event({
+                "event": "human_phase_verified",
+                "description": phase.description,
+                "ok": True,
+                "skipped": True,
+                "verdicts": [],
+            })
+            session.advance()
+            _hitl_reset_session("every phase of the task is done")
+            return True
 
         try:
             ok, verdicts = await verify_phase(
@@ -1443,7 +1538,10 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
                 _log.warning("HITL: the human step did not verify, but verify_enforced is off; continuing")
             session.advance()
             if session.finished:
-                # That was the last phase of the task; nothing remains to plan or execute.
+                # Unreachable as things stand -- the final phase returned above without ever being
+                # verified, and advance() moves a human phase by one. Kept as the safe fallback if
+                # that ever stops holding: a finished plan must reach the label prompt, never fall
+                # through to another rollout.
                 _log.info("HITL: every phase of the task is done")
                 _hitl_reset_session("every phase of the task is done")
                 return True
@@ -1463,15 +1561,21 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
         missing = missing_statements(verdicts)
         _log.warning(f"HITL: the human phase did not verify. Still expected: {missing}")
         if attempts_left <= 0:
+            # Out of retries, so the plan stops here -- but the demonstration is still HANDED TO THE
+            # OPERATOR rather than thrown away. True, not finished_from_teleop: returning False left
+            # the caller with nothing to label, so the legs recorded so far were dropped unlabeled and
+            # never merged. What the config promises ("the operator still labels the episode, so a
+            # false negative is recoverable by answering the label prompt") is this: the label prompt
+            # appears and they keep it, mark it suboptimal, or call it a failure.
             print(retry_message(missing, 0), flush=True)
             _hitl_reset_session("the human phase could not be verified")
-            return finished_from_teleop
+            return True
         attempts_left -= 1
         print(retry_message(missing, attempts_left + 1), flush=True)
         if finished_from_teleop:
             # They already ended the trajectory; there is no leg left to hand off again.
             _hitl_reset_session("the human phase could not be verified")
-            return finished_from_teleop
+            return True
 
 
 def _spawn_postprocess(rollout_dir: Path) -> None:
@@ -3638,6 +3742,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # _continue_trajectory is deliberately LEFT set: this is still the same
                         # trajectory, and clearing both (as one flag once did) minted a new
                         # trajectory id, which dropped the plan mid-task and split the episode.
+                        # When the plan is FINISHED it is stale rather than wrong to leave -- the
+                        # task prompt disarms it (_disarm_rollout_carryover), which is what stops the
+                        # next episode inheriting this one's trajectory and skipping its homing.
                         _skip_episode_reset = False
                         # Armed only when the loop goes STRAIGHT back into this task, which is
                         # exactly what a queued _pending_instruction means (_get_task_instruction

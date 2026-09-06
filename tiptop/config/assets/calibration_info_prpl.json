@@ -25,14 +25,14 @@
   },
   "34032889": {
     "pose": [
-      0.5983880829664464,
-      -0.5109190087429888,
-      0.38095770038534327,
-      -1.8373793036498995,
-      0.08366742067778232,
-      0.5374649028672048
+      0.59232549917372,
+      -0.5073165370635324,
+      0.3708863688217851,
+      -1.8327014835044162,
+      0.04873407972676347,
+      0.4292693155040675
     ],
-    "timestamp": 1787853982.6729655,
-    "source": "copied verbatim from droid 34032889_left (the run writes to /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json, not ~/droid -- the robot env's editable `droid` points at the tamp-vla checkout), recalibrated 2026-08-27 14:06. Supersedes 2026-08-27 13:35 by 0.8deg / 10.5mm (dx -4.5, dy -0.6, dz -9.5 mm). Third consecutive solve clustered near the same pose (08-26 12:15, 08-27 13:35, 08-27 14:06 agree within ~15mm), so the +/-40mm scatter seen 08-12..08-25 looks like it belonged to the older setup; current run-to-run repeatability is ~10-15mm. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
+    "timestamp": 1788559581.9159496,
+    "source": "copied verbatim from droid 34032889_left in /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json (the robot env's editable `droid` points at the tamp-vla checkout, not ~/droid -- ~/droid's copy is stale at 2026-08-12), recalibrated 2026-09-04 18:06. Supersedes the 2026-08-27 14:06 solve by 6.5deg / 12.3mm (dx -6.1, dy +3.6, dz -10.1 mm); the rotation change is almost all yaw (rz 0.537 -> 0.429), well outside the ~10-15mm / <1deg run-to-run scatter of the 08-26..08-27 cluster, so the unit was most likely physically nudged or remounted. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
   }
 }
