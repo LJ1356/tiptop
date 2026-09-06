@@ -67,6 +67,52 @@ def check_robot_phases(spec: TaskSpecification, initial_state: State) -> str | N
     return None
 
 
+def wasted_robot_move(phases: Sequence[Phase]) -> str | None:
+    """Why two consecutive ROBOT phases move the same object twice, or None if none do.
+
+    Placing an object is not a step that composes: a later ``On(obj, ...)`` replaces the earlier one
+    outright, so if nothing happens in between, the first placement is motion that achieves nothing.
+    "Put the toy on the cloth, then put the toy on the board" leaves the toy on the board -- exactly
+    where one phase would have put it.
+
+    A human phase between them makes it legitimate and is why this looks only at CONSECUTIVE robot
+    phases. The canonical HITL plan is "take the toy off the box / open the box / put the toy back
+    in": the toy is placed twice, but the world changed in between, and the first placement is what
+    made the opening possible.
+
+    So the pattern is diagnostic: it is what a plan looks like when a step the robot CANNOT do was
+    written as a pick-and-place anyway -- "solve the puzzle" as ``On(pink_toy, puzzle_board)``, which
+    put the toy on the board, called the puzzle solved, and undid the phase before it to do so.
+
+    Reported for the LOG, not as a rejection. The shape is supported: ``HITLSession.robot_run`` splits
+    exactly here, and the tamp -> tamp -> teleop chain is built on that split, so refusing such a plan
+    would make the robot->robot continuation unreachable. The prompt is where this is actually
+    prevented (prompts.plan_prompt, "WHAT On CANNOT SAY"); this is how a recurrence gets noticed
+    without the operator having to watch the arm do the same pick twice.
+    """
+    last_robot_placement: dict[str, int] = {}
+    for i, phase in enumerate(phases):
+        if phase.is_human:
+            # The world changed; every earlier placement is now something a later phase may redo.
+            last_robot_placement.clear()
+            continue
+        # phase_moves, NOT phase_objects: two phases that put DIFFERENT toys on the same table share
+        # that table and move nothing in common. Asking the wrong question here would reject the
+        # commonest plan there is.
+        for name in sorted(phase_moves(phase)):
+            earlier = last_robot_placement.get(name)
+            if earlier is not None:
+                return (
+                    f"phases {earlier} ({phases[earlier].description!r}) and {i} "
+                    f"({phase.description!r}) are both robot phases and both move {name}, with no "
+                    f"human phase in between. The second placement replaces the first, so phase "
+                    f"{earlier} is wasted motion. Either a human phase belongs between them, or the "
+                    f"step in phase {i} is not really a pick-and-place and should be a HUMAN phase."
+                )
+            last_robot_placement[name] = i
+    return None
+
+
 def goal_atoms_to_dicts(atoms: frozenset[Atom]) -> list[dict]:
     """Render a phase's atoms back into the ``{"predicate", "args"}`` form perception emits.
 
@@ -86,6 +132,20 @@ def goal_atoms_to_dicts(atoms: frozenset[Atom]) -> list[dict]:
 def phase_objects(phase: Phase) -> set[str]:
     """Every object a phase names, for the label-drift check."""
     return {value for atom in phase.atoms for value in atom.values}
+
+
+def phase_moves(phase: Phase) -> set[str]:
+    """The objects a phase MOVES: the thing placed or held, never the surface it lands on.
+
+    Distinct from ``phase_objects``, which names the surface too -- and the distinction is the whole
+    correctness of ``wasted_robot_move``: "put toy_a on the table" and "put toy_b on the table" name
+    ``table`` in common while moving nothing in common.
+    """
+    return {
+        atom.values[0]
+        for atom in phase.atoms
+        if atom.name in (On.name, Holding.name) and atom.values
+    }
 
 
 @dataclass(frozen=True)

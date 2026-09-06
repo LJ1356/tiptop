@@ -18,6 +18,7 @@ from PIL import Image
 from tiptop.hitl.cache import ProposalCache
 from tiptop.hitl.config import HITLConfig
 from tiptop.hitl.llm import query_json
+from tiptop.hitl.planning import wasted_robot_move
 from tiptop.hitl.prompts import PLAN_SCHEMA, plan_prompt
 from tiptop.hitl.structs import (
     DeferredObject,
@@ -430,6 +431,14 @@ async def propose_plan(
             f"HITL new object {deferred.name}: does not exist yet -- phase {deferred.created_by_phase} "
             f"creates it, on {deferred.anchor} ({deferred.description})"
         )
+    # A warning, deliberately NOT a rejection. Two consecutive robot phases moving the same object are
+    # a SUPPORTED shape -- `robot_run` splits exactly there and the tamp -> tamp -> teleop chain is
+    # built on it (data-collection ARCHITECTURE.md §6c) -- so refusing the plan would make that path
+    # unreachable. But it is also what a misclassified human step looks like, and the operator finding
+    # out by watching the arm do the same pick twice is the outcome this line exists to prevent.
+    wasted = wasted_robot_move(spec.phases)
+    if wasted:
+        _log.warning(f"HITL: this plan repeats work -- {wasted}")
     for dropped in spec.unrepresented:
         _log.warning(
             f"HITL: NOT part of the plan -- {dropped['clause']!r}: {dropped['reason']}. "

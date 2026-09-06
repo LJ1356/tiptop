@@ -138,6 +138,14 @@ executes each of its phases itself; you only say what must be TRUE when the phas
 these predicates:
 {STATE_PREDICATE_DESCRIPTION}
 
+WHAT On CANNOT SAY. On({{0}}, {{1}}) means {{0}} is RESTING LOOSELY somewhere on top of {{1}}, and \
+nothing more. The robot places by opening its gripper above a surface, so it cannot fit, insert, \
+slot, thread, plug, screw, seat, close, or align one thing to another, and On cannot ask it to. If a \
+clause needs the object to end up IN something, or in a particular position or orientation on it -- a \
+puzzle piece in its matching cut-out, a lid seated on a jar, a plug in a socket, a book squared onto \
+a shelf -- that is a HUMAN phase, however much it looks like a pick-and-place. Say so with an \
+invented predicate, not with On.
+
 The human can do anything the robot cannot -- open, close, fold, unfold, tie, flatten, rotate, \
 manipulate cloth. Give a human phase `instructions` addressed to the person, and `atoms` saying what \
 should be true afterwards. That is what a camera will be used to check, so it must be visible.
@@ -199,11 +207,29 @@ list -- it is still a brick inside the tower -- so declare it:
 Phase 1 is a ROBOT phase. It is one pick and one place, which is exactly what the robot is for; the \
 human is needed for phase 0 only because prying a block out with a screwdriver is not a pick-and-place.
 
+A third worked example, about that last point. Objects: pink_toy, puzzle_board, yellow_cloth. \
+Instruction: "place the toy on the cloth and solve the puzzle". Two clauses, so two phases:
+  new_predicates: [{{"name": "IsSolved", "instructions": "every piece of {{0}} is sitting down inside
+                     its own matching cut-out, flush with the board, with no gaps"}}]
+  phase 0, robot  -- "place the toy on the cloth"  atoms: On(pink_toy, yellow_cloth)
+  phase 1, human  -- "solve the puzzle"            atoms: IsSolved(puzzle_board)
+                     instructions: "Fit each puzzle piece into its matching cut-out in the
+                     puzzle_board so it sits flush."
+  coverage: [["place the toy on the cloth", 0], ["solve the puzzle", 1]]
+"solve the puzzle" is NOT On(pink_toy, puzzle_board). Resting the toy on the board solves nothing -- \
+the piece has to go INTO its slot, which the robot cannot do. Writing it as a robot phase is worse \
+than useless: the robot picks the toy straight back up and drops it on the board, undoing phase 0 to \
+achieve nothing.
+
 Rules, all of which are checked:
 - A ROBOT phase's atoms may use ONLY On, Holding and HandEmpty. The robot cannot achieve a predicate \
 you invent -- if a phase needs one, it is a human phase.
 - Give a whole pick-and-place ONE phase, ending with On(?obj, ?surface). Do not split it into a \
 "pick it up" phase and a "put it down" phase; the robot does both as one piece of work.
+- Two ROBOT phases in a row must not move the same object twice. The second placement throws the \
+first one away, so the first is wasted motion -- and it almost always means a step that is not really \
+a pick-and-place was given to the robot. If a human phase belongs between them, put it there; if the \
+second phase is the one the robot cannot do, make IT the human phase.
 - Every phase needs at least one atom, and a human phase needs `instructions` too.
 - Every object name must be one of the objects listed above, spelled exactly, or one you declared in \
 `new_objects`. Do not name an object any other way.

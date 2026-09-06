@@ -17,6 +17,8 @@ from tiptop.hitl.config import HITLConfig, load_hitl_config, resolve_hitl_config
 from tiptop.hitl.grounding import Verdict
 from tiptop.hitl.planning import (
     ObjectGeometry,
+    phase_moves,
+    wasted_robot_move,
     bind_deferred_object,
     bind_deferred_objects,
     match_drifted_names,
@@ -306,6 +308,93 @@ def test_the_handoff_message_says_work_remains():
     message = handoff_message(session, session.current)
     assert "Open the white_box" in message
     assert "1 more phase(s) follow" in message, "the operator must know the robot is not done"
+
+
+def test_a_repeated_robot_move_is_reported_but_not_refused():
+    """Observed on the rig: "place the toy on the cloth and solve the puzzle" planned as TWO robot
+    phases -- On(pink_toy, yellow_cloth) then On(pink_toy, puzzle_board).
+
+    The proposer read "solve the puzzle" as a pick-and-place, because On is the only thing a robot
+    phase can say and putting the toy on the board looks like putting the toy on the board. The run
+    did TAMP twice: the second phase picked the toy straight back up and dropped it on the board,
+    undoing the first to achieve nothing, and the puzzle was of course not solved.
+
+    Reported, NOT refused. The shape is supported -- robot_run() splits exactly here and the
+    tamp -> tamp -> teleop chain is built on that split -- so rejecting it would make the
+    robot->robot continuation unreachable. The prompt is where this is prevented; this is what makes
+    a recurrence visible in the log.
+    """
+    spec = parse(
+        _phases(
+            {
+                "executor": "robot",
+                "description": "place the toy on the cloth",
+                "atoms": [{"predicate": "On", "args": ["pink_toy", "yellow_cloth"]}],
+            },
+            {
+                "executor": "robot",
+                "description": "solve the puzzle",
+                "atoms": [{"predicate": "On", "args": ["pink_toy", "puzzle_board"]}],
+            },
+        ),
+        objects=["pink_toy", "yellow_cloth", "puzzle_board"],
+    )
+    reason = wasted_robot_move(spec.phases)
+    assert reason and "pink_toy" in reason
+    assert "HUMAN phase" in reason, "the message must say what to do about it, not just that it happened"
+
+    # The plan it should have produced -- "solve the puzzle" as the human's -- says nothing.
+    fixed = parse(
+        {
+            "new_predicates": [
+                {"name": "IsSolved", "instructions": "every piece of {0} sits flush in its own cut-out"}
+            ],
+            **_phases(
+                {
+                    "executor": "robot",
+                    "description": "place the toy on the cloth",
+                    "atoms": [{"predicate": "On", "args": ["pink_toy", "yellow_cloth"]}],
+                },
+                {
+                    "executor": "human",
+                    "description": "solve the puzzle",
+                    "atoms": [{"predicate": "IsSolved", "args": ["puzzle_board"]}],
+                    "instructions": "Fit each piece into its matching cut-out.",
+                },
+            ),
+        },
+        objects=["pink_toy", "yellow_cloth", "puzzle_board"],
+    )
+    assert wasted_robot_move(fixed.phases) is None
+
+
+def test_a_human_phase_between_two_robot_ones_makes_the_repeat_legitimate():
+    # The canonical HITL plan: the toy IS placed twice, but the world changed in between and the first
+    # placement is what made the opening possible. Flagging this would cry wolf on the flagship plan.
+    assert wasted_robot_move(parse().phases) is None
+
+
+def test_two_robot_phases_sharing_only_a_SURFACE_are_not_flagged():
+    # The false positive worth guarding: "put toy_a on the table" and "put toy_b on the table" name
+    # `table` in common while moving nothing in common. Asking phase_objects instead of phase_moves
+    # would flag the commonest plan there is.
+    spec = parse(
+        _phases(
+            {
+                "executor": "robot",
+                "description": "put toy_a on the table",
+                "atoms": [{"predicate": "On", "args": ["toy_a", "table"]}],
+            },
+            {
+                "executor": "robot",
+                "description": "put toy_b on the table",
+                "atoms": [{"predicate": "On", "args": ["toy_b", "table"]}],
+            },
+        ),
+        objects=["toy_a", "toy_b"],
+    )
+    assert phase_moves(spec.phases[0]) == {"toy_a"}, "the surface is not something the phase moves"
+    assert wasted_robot_move(spec.phases) is None
 
 
 def test_the_final_phase_is_the_one_the_robot_never_follows():
