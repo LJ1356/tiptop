@@ -904,18 +904,40 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str, recording_en
     directory (or the unchanged eval dir if skipped) so it can be post-processed.
 
     A rollout that executed nothing -- planning failed, so no `_meta.json` was written -- holds no
-    episode to file. It is DELETED rather than filed, and None is returned; the label is still
-    reported first, because it is what ends the trajectory and the server merges a hand-off's legs
-    on it. Only checked when recording is on, since otherwise no rollout ever writes `_meta.json`.
+    EPISODE, but it does hold the whole record of why: `metadata.json` (with
+    `planning.failure_reason`), the perception artifacts cuTAMP planned against, `cutamp/`, the run
+    log, and `vlm/` on a HITL run. That is the only evidence a planning failure ever leaves, and it
+    is exactly what you need to diagnose one, so it is FILED under `failure/` -- "the task was not
+    done" -- rather than deleted. None is still returned, because there is no episode for the
+    caller to post-process. Only checked when recording is on, since otherwise no rollout ever
+    writes `_meta.json`.
+
+    The operator's y/n does not choose the bucket here: nothing executed, so there is nothing to
+    grade, and a `y` at this prompt is answering for the TRAJECTORY (an earlier leg did the work),
+    not for this dir. The label is still reported, because it is what ends the trajectory and the
+    server merges a hand-off's legs on it.
 
     A "switch to teleop" (SIGUSR1) landing here raises TeleopHandoffRequested out of the prompt (see
     _at_prompt) -- the rollout stays unlabeled in eval/ and the caller hands the arm off."""
     global _at_prompt
     nothing_recorded = recording_enabled and not (save_dir / "_meta.json").exists()
 
-    def discard() -> None:
-        shutil.rmtree(save_dir, ignore_errors=True)
-        _log.info(f"Nothing was executed in this rollout, so there is no episode to keep: removed {save_dir}")
+    def file_unexecuted() -> Path:
+        """Move the artifacts-only rollout into failure/. Returns where it ended up."""
+        dest = Path(output_dir) / "failure" / timestamp
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(save_dir), str(dest))
+        except OSError as exc:
+            # Never let filing cost us the artifacts: leaving them in eval/ keeps every one of them
+            # readable (the Episodes page scans eval/ too), where rmtree used to be the fallback.
+            _log.warning(f"Could not file {save_dir} under failure/ ({exc}); leaving it in eval/")
+            return save_dir
+        _log.info(
+            f"Nothing was executed in this rollout, so there is no episode to keep -- filed its "
+            f"perception and planning artifacts under failure/: {dest}"
+        )
+        return dest
 
     _emit_event({"event": "awaiting_label", "dir": str(save_dir)})
     try:
@@ -927,8 +949,10 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str, recording_en
             _at_prompt = False
             user_input = user_input.strip().lower()
             if user_input in ("y", "n"):
-                dest = save_dir
-                if not nothing_recorded:
+                if nothing_recorded:
+                    # Filed BEFORE the event so `dir` names where the artifacts actually are.
+                    dest = file_unexecuted()
+                else:
                     cls = "success" if user_input == "y" else "failure"
                     dest = Path(output_dir) / cls / timestamp
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -938,20 +962,20 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str, recording_en
                 # that the trajectory has ENDED (the operator could always have handed off again).
                 # The server merges the trajectory's legs on this event, and files the merged
                 # episode under this success flag -- which is the only place the label survives
-                # when this rollout itself is discarded just below.
+                # when this rollout itself holds no episode of its own.
                 _emit_event({
                     "event": "labeled",
                     "dir": str(dest),
                     "success": user_input == "y",
                     "trajectory_id": _trajectory_id,
                 })
-                if nothing_recorded:
-                    discard()
-                    return None
-                return dest
+                return None if nothing_recorded else dest
             elif user_input == "":
                 if nothing_recorded:
-                    discard()
+                    # Skipping declines to grade an EPISODE, and there is none here -- but the
+                    # artifacts are still the record of a planning failure, so file them anyway
+                    # rather than leaving them in the staging bucket.
+                    file_unexecuted()
                     return None
                 _log.info(f"Keeping rollout in eval directory: {save_dir}")
                 return save_dir
@@ -3371,7 +3395,8 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         remove_file_handler(file_handler)
                     if execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp, container.enable_recording)
-                        # None when the rollout executed nothing and was discarded (_label_rollout).
+                        # None when the rollout executed nothing: its artifacts are filed under failure/ but there
+                        # is no episode to post-process (_label_rollout).
                         if final_dir is not None:
                             _spawn_postprocess(final_dir)
                     continue
@@ -3407,7 +3432,8 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         remove_file_handler(file_handler)
                     if execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp, container.enable_recording)
-                        # None when the rollout executed nothing and was discarded (_label_rollout).
+                        # None when the rollout executed nothing: its artifacts are filed under failure/ but there
+                        # is no episode to post-process (_label_rollout).
                         if final_dir is not None:
                             _spawn_postprocess(final_dir)
                     continue
@@ -3681,7 +3707,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # the next rollout can start immediately instead of blocking on it. Skipped
                         # for a multi-leg trajectory: this dir is only its LAST leg, and exporting
                         # it would produce a fragment. merge_trajectory.py joins the legs first.
-                        # final_dir is None when the rollout executed nothing and was discarded.
+                        # final_dir is None when the rollout executed nothing (artifacts filed under failure/).
                         if final_dir is not None and not _trajectory_handed_off:
                             _spawn_postprocess(final_dir)
                         # PATCH (cortex v3): DO NOT auto-open the gripper after Pick.
