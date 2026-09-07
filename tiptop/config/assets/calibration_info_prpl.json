@@ -1,14 +1,15 @@
 {
   "13222437": {
     "pose": [
-      0.039348876190207376,
-      0.06542238381036676,
-      -0.13254275355821651,
-      -0.427813593344996,
-      0.005794548753957018,
-      3.125632412177157
+      0.028158993267309328,
+      0.06760740222335279,
+      -0.12398658534981696,
+      -0.4241397533847555,
+      0.017979625252910525,
+      3.133046789295287
     ],
-    "timestamp": 1785182754.0539758
+    "timestamp": 1787751584.0825224,
+    "source": "ZED-M wrist mount ($TIPTOP_HAND_CAMERA_ID, set to this serial in ~/.bashrc); ee_from_cam from tiptop's calibrate-wrist-cam, recalibrated 2026-08-26 09:39. Copied from ~/tamp-vla assets/calibration_info_prpl.json on 2026-08-27 (same rig, same unit). Supersedes the 2026-07-27 16:05 solve by 14.3mm / 0.62deg (dx -11.2, dy +2.2, dz +8.6 mm)."
   },
   "39379013": {
     "pose": [
@@ -24,14 +25,14 @@
   },
   "34032889": {
     "pose": [
-      0.5777921840348561,
-      -0.5694681285265875,
-      0.38490267573878834,
-      -1.8267029344492502,
-      0.020478510428575847,
-      0.5678903500705192
+      0.59232549917372,
+      -0.5073165370635324,
+      0.3708863688217851,
+      -1.8327014835044162,
+      0.04873407972676347,
+      0.4292693155040675
     ],
-    "timestamp": 1786406044.2170005,
-    "source": "copied verbatim from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1), recalibrated 2026-08-10 19:54 -- the third run that evening (17:41, 18:10, 19:54). The three agree to <1.5deg in rotation but spread ~23mm in x, so trust the rotation more than the x offset here. All supersede 2026-08-07, before the mount shifted. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from"
+    "timestamp": 1788559581.9159496,
+    "source": "copied verbatim from droid 34032889_left in /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json (the robot env's editable `droid` points at the tamp-vla checkout, not ~/droid -- ~/droid's copy is stale at 2026-08-12), recalibrated 2026-09-04 18:06. Supersedes the 2026-08-27 14:06 solve by 6.5deg / 12.3mm (dx -6.1, dy +3.6, dz -10.1 mm); the rotation change is almost all yaw (rz 0.537 -> 0.429), well outside the ~10-15mm / <1deg run-to-run scatter of the 08-26..08-27 cluster, so the unit was most likely physically nudged or remounted. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
   }
 }

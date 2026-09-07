@@ -1,0 +1,78 @@
+# TiPToP configuration for the bimanual YAM in Isaac Sim -- SIMULTANEOUS dual-arm (handover).
+#
+# Select it with TIPTOP_CONFIG (see config/__init__.py::_resolve_config_path):
+#
+#   TIPTOP_CONFIG=tiptop_yam_dual.yml pixi run python -m tiptop.tiptop_websocket_server --port 8767
+#
+# Unlike tiptop_yam.yml / tiptop_yam_right.yml (one process per arm, run in SEQUENCE by
+# tiptop_run.py's sequential-bimanual loop), this config plans BOTH arms as one 12-DOF kinematic
+# chain in a single cuTAMP call -- see cuTAMP/cutamp/robots/bimanual_yam_dual.yml,
+# tiptop.yam.task_split.handover_goal_builder, and tiptop_run.py::_run_yam_dual_rollout. It is what
+# a perception-grounded handover episode runs against; droid-sim-evals/eval/yam_tiptop_eval.py
+# --handover drives it. There is no hardware client for this embodiment (see tiptop_yam_dual_real.yml
+# for the physical rig), so the `cameras` section below is unused on the websocket path exactly as
+# in tiptop_yam.yml.
+
+robot:
+  type: bimanual_yam_dual
+  dof: 12
+  arm_mode: dual
+  dual_task: handover
+
+  # No hardware driver exists for this embodiment on the sim websocket path; get_robot_client()
+  # raises NotImplementedError. Present only so the schema matches tiptop.yml.
+  host: "127.0.0.1"
+  port: 5555
+  gripper_port: 5559
+
+  # 1.0 = plan at cuRobo's own timing, same reasoning as tiptop_yam_right.yml: in simulation there is
+  # no controller-stiffness reason to slow down, and the eval's episode budget is sized for full speed.
+  time_dilation_factor: 1.0
+
+  # Both arms' elbow-up rest posture, back to back -- matches ARM_RETRACT/retract_config and
+  # cuTAMP's `neutral * 2` q_init for the dual chain (cutamp/robots/bimanual_yam.py). Unused on the
+  # websocket path (q_init comes from the request) but kept correct for go-home/go-to-capture.
+  q_home: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0,
+           0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+  q_capture: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0,
+              0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+
+# Unused on the websocket path -- the simulator supplies rgb, depth, intrinsics and extrinsics in
+# every request. Kept so the config schema matches tiptop.yml.
+cameras:
+  hand:
+    serial: "sim"
+    type: zed
+    resolution: HD720
+    fps: 15
+  external:
+    serial: "sim"
+    type: zed
+    resolution: HD720
+    fps: 15
+
+perception:
+  foundation_stereo:
+    # Never contacted: the simulator renders true depth, so the server runs with
+    # depth_estimator=None and reads frame.depth directly.
+    url: "http://localhost:1234"
+
+  m2t2:
+    url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
+    apply_bounds: true
+
+  # Add each M2T2 grasp's jaw-flipped twin (180 deg about the approach axis) -- same reasoning as
+  # tiptop_yam.yml: the YAM is 6-DOF per arm with no wrist null space, so half the valid grasps are
+  # otherwise unreachable.
+  augment_flipped_grasps: true
+
+  sam:
+    mode: "local"
+
+  depth_trunc_m: 2.5
+  voxel_downsample_size: 0.0075
+  contact_threshold_m: 0.01
+  mask_erosion_pixels: 3
+
+  depth_smoothing:
+    num_frames: 1

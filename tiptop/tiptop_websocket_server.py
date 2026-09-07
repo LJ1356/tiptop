@@ -30,17 +30,24 @@ from curobo.wrap.reacher.ik_solver import IKSolver
 from curobo.wrap.reacher.motion_gen import MotionGen
 
 from tiptop.config import tiptop_cfg
+from tiptop.goal_clearing import resolve_clear_goal_surfaces
+from cutamp.posture_prior import posture_ref_summary
 from tiptop.motion_planning import (
     build_curobo_solvers,
+    apply_perception_overrides,
+    resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
+    resolve_max_motion_refine_attempts,
+    resolve_posture_selection,
     resolve_time_dilation_factor,
     resolve_traj_length_norm,
+    resolve_transit_apex,
     resolve_trace_cfg,
 )
 from tiptop.perception.cameras import Frame
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import save_run_metadata, save_run_outputs
-from tiptop.tiptop_run import Observation, run_perception
+from tiptop.tiptop_run import Observation, plan_clear_then_task, run_perception
 from tiptop.utils import NumpyEncoder, add_file_handler, check_cutamp_version, get_robot_rerun, print_tiptop_banner, remove_file_handler, setup_logging
 
 _log = logging.getLogger(__name__)
@@ -96,6 +103,10 @@ class TiptopPlanningServer:
         # cuRobo cost/tamp-parameter overrides (empty by default -> stock gradient_trajopt.yml +
         # tiptop.yml behavior). Applied at solver build time so every plan uses these tamp params.
         self._curobo_overrides = _load_curobo_overrides(curobo_overrides)
+        # Perception knobs travel in the same dict; applied before any perception so the grasp
+        # candidates cuTAMP receives reflect them. See apply_perception_overrides.
+        for _key, (_old, _new) in apply_perception_overrides(self._cfg, self._curobo_overrides).items():
+            _log.info(f"Perception override: {_key} {_old} -> {_new}")
         time_dilation_factor = resolve_time_dilation_factor(
             self._curobo_overrides, self._cfg.robot.time_dilation_factor
         )
@@ -116,6 +127,16 @@ class TiptopPlanningServer:
         self._ik_solver: IKSolver | None = None
         self._motion_gen: MotionGen | None = None
         self._initial_world_cfg: WorldConfig | None = None
+        _apex_height, _apex_min_dist = resolve_transit_apex(self._curobo_overrides)
+        if _apex_height > 0:
+            _log.info(f"Transit apex active: {_apex_height}m (min transit distance {_apex_min_dist}m)")
+        _posture_selection = resolve_posture_selection(self._curobo_overrides)
+        if _posture_selection.get("posture_selection_seeds", 0) > 1:
+            _log.info(
+                "Teleop-posture IK branch selection active: %s seeds | prior: %s",
+                _posture_selection["posture_selection_seeds"],
+                posture_ref_summary(_posture_selection.get("posture_ref")),
+            )
         self._config = build_tamp_config(
             num_particles=num_particles,
             max_planning_time=max_planning_time,
@@ -124,6 +145,19 @@ class TiptopPlanningServer:
             time_dilation_factor=time_dilation_factor,
             traj_length_norm=resolve_traj_length_norm(self._curobo_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(self._curobo_overrides),
+            grasp_center_cost=resolve_grasp_center_cost(self._curobo_overrides),
+            # Only meaningful for robot_type == "bimanual_yam_dual" (see tiptop_yam_dual.yml); every
+            # other config leaves robot.arm_mode/dual_task unset and gets cuTAMP's single-arm defaults.
+            arm_mode=self._cfg.robot.get("arm_mode", "single"),
+            dual_task=self._cfg.robot.get("dual_task", "parallel"),
+            max_motion_refine_attempts=resolve_max_motion_refine_attempts(self._curobo_overrides),
+            # Apex waypoint in each Pick/Place transit (0 = off), a TAMP-config knob like
+            # traj_length_norm rather than a cuRobo cost weight. See resolve_transit_apex.
+            transit_apex_height=_apex_height,
+            transit_apex_min_dist=_apex_min_dist,
+            # IK branch selection by teleop posture (off unless the cfg sets
+            # posture_selection_seeds). See resolve_posture_selection.
+            posture_selection=_posture_selection,
             q_home=self._cfg.robot.q_home,
         )
         self._output_dir = Path("tiptop_server_outputs")
@@ -330,17 +364,33 @@ class TiptopPlanningServer:
             _log.info("Running cuTAMP planning...")
             async with self._gpu_lock:
                 self._reset_motion_planning()
-                cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
-                    run_planning,
-                    env,
-                    self._config,
-                    q_init,
-                    self._ik_solver,
-                    processed_scene.grasps,
-                    self._motion_gen,
-                    all_surfaces,
-                    cost_overrides=self._curobo_overrides,
-                )
+                if resolve_clear_goal_surfaces(self._curobo_overrides):
+                    # Same knob and same two-phase planner as the TAMP datagen path: clear whatever
+                    # occupies a goal surface, then plan the task against that, and return the two
+                    # concatenated. The client executes one plan either way. See tiptop.goal_clearing.
+                    cutamp_plan, planning_duration, failure_reason, _ = await asyncio.to_thread(
+                        plan_clear_then_task,
+                        self._config,
+                        processed_scene,
+                        q_init,
+                        grounded_atoms,
+                        save_dir,
+                        ik_solver=self._ik_solver,
+                        motion_gen=self._motion_gen,
+                        cost_overrides=self._curobo_overrides,
+                    )
+                else:
+                    cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
+                        run_planning,
+                        env,
+                        self._config,
+                        q_init,
+                        self._ik_solver,
+                        processed_scene.grasps,
+                        self._motion_gen,
+                        all_surfaces,
+                        cost_overrides=self._curobo_overrides,
+                    )
 
             if cutamp_plan is None:
                 return {

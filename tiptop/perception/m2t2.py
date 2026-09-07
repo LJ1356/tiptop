@@ -27,6 +27,47 @@ def m2t2_to_tiptop_transform():
     return base_to_tcp @ to_tiptop_frame
 
 
+@cache
+def jaw_flip_transform() -> Float[np.ndarray, "4 4"]:
+    """180 degree rotation about the gripper's approach axis, in the tiptop grasp frame.
+
+    A parallel jaw is symmetric under this rotation: the two fingers simply swap sides, so the
+    resulting pose is the SAME physical grasp reached with the wrist rolled over. M2T2 emits only one
+    of the two representatives.
+    """
+    flip = np.eye(4)
+    flip[0, 0] = -1.0
+    flip[1, 1] = -1.0
+    return flip
+
+
+def augment_flipped_grasps(
+    world_from_grasp: Float[np.ndarray, "n 4 4"], grasp_dict: dict
+) -> tuple[Float[np.ndarray, "2n 4 4"], dict]:
+    """Append each grasp's jaw-flipped twin, keeping ``grasp_dict``'s arrays aligned.
+
+    Free extra reach for a robot with no null space. A 7-DOF arm can usually roll its wrist to the
+    representative M2T2 happened to emit, but a 6-DOF arm cannot, so half the physically valid
+    grasps are silently unreachable -- measured on a scene-6 run, the bimanual YAM could reach 0 of
+    the 3 grasps found on the far toy as emitted and all 3 of their flipped twins. Enabled via
+    ``perception.augment_flipped_grasps``.
+
+    ``poses`` is recomputed rather than duplicated so the invariant the saved outputs rely on --
+    ``world_from_grasp == poses @ m2t2_to_tiptop_transform()`` -- still holds for the new entries.
+    """
+    if len(world_from_grasp) == 0:
+        return world_from_grasp, grasp_dict
+
+    both = np.concatenate([world_from_grasp, world_from_grasp @ jaw_flip_transform()], axis=0)
+    out = dict(grasp_dict)
+    out["poses"] = both @ np.linalg.inv(m2t2_to_tiptop_transform())
+    for key in ("confidences", "contacts"):
+        # The flipped twin is the same physical grasp, so it inherits confidence and contact point.
+        if key in grasp_dict and len(grasp_dict[key]):
+            out[key] = np.concatenate([grasp_dict[key], grasp_dict[key]], axis=0)
+    return both, out
+
+
 def _build_payload(
     scene_xyz: Float[np.ndarray, "n 3"],
     scene_rgb: Float[np.ndarray, "n 3"],

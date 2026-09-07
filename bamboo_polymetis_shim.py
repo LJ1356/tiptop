@@ -33,6 +33,29 @@ summed duration (intermediate waypoints discarded, so the executed arm path is N
 -- fine in free workspace). Under --endpoint-exec, anyone recording plan-derived commanded actions
 should treat the plan waypoints, not the executed motion, as the command source.
 
+TRAJECTORY QUEUE (execute_trajectory with `queue: true`): a cuTAMP plan arrives as one request per
+operation group, i.e. one per gripper event. Handled one-at-a-time, each request started a joint
+impedance policy, streamed its waypoints, and terminated the policy -- so between every pair of
+groups the arm sat with NO active policy while the reply travelled back, the client issued the next
+request, and a fresh policy started. Measured on a real episode: the arm parked below 0.05 rad/s for
+1-12 frames at every gripper event while the commanded velocity was still 0.13-0.75 rad/s and
+changing. A velocity-command VLA trained on that learns to stall at grasps.
+
+With `queue: true` the request is appended to _TrajectoryStreamer's queue and acknowledged
+immediately; one persistent worker owns the policy and streams batches back-to-back against a
+continuous deadline clock, so segment N+1's first setpoint follows N's last by one waypoint
+duration -- no round trip, no policy restart. Companion commands: `wait_trajectory_done` (block
+until the queue drains -- a queued client must call this before tearing the episode down),
+`abort_trajectory` (stops the batch already streaming too, via an epoch bump), `trajectory_times`
+(per-batch [t_start, t_end], which the LeRobot export needs because a queued client only ever sees
+the submit instant), `trajectory_queue_status` (also the capability probe).
+
+Requests WITHOUT `queue: true` behave exactly as before -- stream, terminate, then reply -- so an
+older client is unaffected and TIPTOP_QUEUED_TRAJ=0 reverts the behaviour without redeploying.
+
+Note the streamer, like the code it replaces, uses only `q_goal`; a waypoint's `velocity` field is
+never read. Velocity reaches the arm only implicitly, through the spacing of the position setpoints.
+
 The state_port (5557) serves get_robot_state from a cache filled by a ~100 Hz background
 poller, so encoders stay readable while _control_handler is parked inside a blocking
 move_to_joint_positions (the control socket cannot answer during motion).
@@ -281,6 +304,201 @@ class RobotiqDriver:
             pass
 
 
+class _TrajectoryStreamer:
+    """Persistent joint-impedance streamer with a batch QUEUE, so consecutive plan segments join.
+
+    The legacy path started a joint-impedance policy per ``execute_trajectory`` request and called
+    ``terminate_current_policy()`` when the batch ended. A cuTAMP plan is one request per operation
+    group, so between every pair of groups -- i.e. at every gripper event -- the arm sat with no
+    active policy while the reply travelled back, the client issued the next request, and a fresh
+    policy started. Measured on a real episode: the arm parked below 0.05 rad/s for 1-12 frames at
+    each event while the commanded velocity was still 0.13-0.75 rad/s and changing. That stop is
+    what a velocity-command policy learns to reproduce.
+
+    Here one worker owns the policy and a queue of batches. It streams waypoints against a
+    CONTINUOUS deadline clock, so the first setpoint of batch N+1 goes out one waypoint-duration
+    after the last of batch N -- no reply round trip and no policy restart in between.
+
+    Two details that matter:
+
+    * The deadline is reset to ``now`` whenever it has fallen into the past (queue genuinely went
+      idle). Without that, a batch arriving after a pause would be streamed as fast as the loop can
+      issue setpoints, trying to "catch up" to a stale clock -- a burst of motion at full rate.
+    * Aborts are by EPOCH, not by clearing the deque. The worker may already have popped a batch and
+      be mid-stream when a clear lands, so a cleared queue does not stop the arm. Bumping the epoch
+      does: the streaming loop re-checks it between setpoints and drops the rest of the batch.
+    """
+
+    _MAX_QUEUED = 64  # backstop; a plan is ~7 batches
+
+    def __init__(self, robot, idle_terminate_s: float = 3.0):
+        self._robot = robot
+        self._idle_terminate_s = idle_terminate_s
+        self._cv = threading.Condition()
+        self._q: list = []
+        self._epoch = 0
+        self._seq = 0
+        self._done_seq = 0
+        self._errors: dict[int, str] = {}
+        # Wall-clock (epoch) span each batch actually occupied. With queueing the CLIENT only sees
+        # the submit instant, but the LeRobot export places every control frame on this span to
+        # align camera frames to states -- so the shim, which is the only party that knows when a
+        # batch really ran, reports it back.
+        self._times: dict[int, tuple[float, float]] = {}
+        # Projected monotonic end time per batch, published as soon as the batch starts streaming.
+        # This is what lets a caller fire a gripper AT the moment the arm reaches that batch's last
+        # waypoint instead of at the moment it queued the batch (see wait_arrival).
+        self._eta: dict[int, float] = {}
+        self._policy_active = False
+        self._t_next = 0.0
+        self._idle_since = None
+        threading.Thread(target=self._run, name="traj-streamer", daemon=True).start()
+
+    # -- client-facing -------------------------------------------------------------------------
+    def submit(self, waypoints: list, default_duration: float, terminate_after: bool) -> int:
+        with self._cv:
+            if len(self._q) >= self._MAX_QUEUED:
+                raise RuntimeError(f"trajectory queue full ({self._MAX_QUEUED})")
+            self._seq += 1
+            self._q.append((self._epoch, self._seq, waypoints, default_duration, terminate_after))
+            self._cv.notify_all()
+            return self._seq
+
+    def abort(self) -> None:
+        """Drop everything queued AND stop the batch being streamed (see the epoch note above)."""
+        with self._cv:
+            self._epoch += 1
+            self._q.clear()
+            self._cv.notify_all()
+
+    def wait_for(self, seq: int, timeout: float) -> dict:
+        with self._cv:
+            ok = self._cv.wait_for(lambda: self._done_seq >= seq, timeout=timeout)
+        if not ok:
+            return {"success": False, "error": f"timeout waiting for trajectory {seq}"}
+        err = self._errors.pop(seq, None)
+        return {"success": False, "error": err} if err else {"success": True}
+
+    def wait_arrival(self, seq: int, lead: float = 0.0, timeout: float = 120.0) -> dict:
+        """Block until batch ``seq`` finishes, or is within ``lead`` seconds of finishing.
+
+        The synchronisation point a queued client loses. With one-at-a-time execution the reply
+        itself said "the arm is here"; queueing removes that, and without this a caller fires its
+        gripper when the batch was ACCEPTED -- i.e. potentially a whole plan early.
+
+        ``lead`` > 0 returns early by that much, so a slow gripper can begin closing before the arm
+        actually arrives.
+        """
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while True:
+                if self._done_seq >= seq:
+                    return {"success": True, "arrived": True}
+                eta = self._eta.get(seq)
+                now = time.monotonic()
+                if eta is not None and now >= eta - lead:
+                    return {"success": True, "arrived": True, "lead": lead}
+                if now >= deadline:
+                    return {"success": False, "error": f"timeout waiting for arrival of {seq}"}
+                wait = deadline - now
+                if eta is not None:
+                    wait = min(wait, max(0.001, eta - lead - now))
+                self._cv.wait(timeout=wait)
+
+    def wait_idle(self, timeout: float) -> dict:
+        with self._cv:
+            ok = self._cv.wait_for(lambda: not self._q and self._done_seq >= self._seq,
+                                   timeout=timeout)
+        return {"success": bool(ok)} if ok else {"success": False, "error": "timeout draining queue"}
+
+    def times(self) -> dict:
+        """{seq: [t_start, t_end]} epoch seconds for finished batches; drained on read."""
+        with self._cv:
+            out = {str(k): [v[0], v[1]] for k, v in self._times.items()}
+            self._times.clear()
+            return out
+
+    def status(self) -> dict:
+        with self._cv:
+            return {"queued": len(self._q), "submitted": self._seq, "done": self._done_seq,
+                    "policy_active": self._policy_active}
+
+    # -- worker --------------------------------------------------------------------------------
+    def _start_policy(self) -> None:
+        if not self._policy_active:
+            self._robot.start_joint_impedance()
+            self._policy_active = True
+
+    def _stop_policy(self) -> None:
+        if self._policy_active:
+            try:
+                self._robot.terminate_current_policy()
+            except Exception:
+                log.exception("terminate_current_policy failed")
+            self._policy_active = False
+
+    def _run(self) -> None:
+        import torch
+
+        while True:
+            with self._cv:
+                while not self._q:
+                    # Idle: hold the last setpoint under the live policy. Only give the policy up
+                    # after a real pause, so back-to-back plan segments never see a restart.
+                    if self._policy_active and self._idle_since is not None \
+                            and time.monotonic() - self._idle_since > self._idle_terminate_s:
+                        self._stop_policy()
+                    self._cv.wait(timeout=0.1)
+                epoch, seq, waypoints, default_duration, terminate_after = self._q.pop(0)
+                self._idle_since = None
+            if epoch != self._epoch:          # aborted before it started
+                self._finish(seq, None)
+                continue
+            err = None
+            t_started = time.time()
+            try:
+                self._start_policy()
+                now = time.monotonic()
+                # Continue the previous batch's clock when it is still in the future (seamless
+                # join); otherwise start fresh so a post-idle batch does not burst.
+                if self._t_next < now:
+                    self._t_next = now
+                total = sum((float(wp.get("duration", default_duration)) or default_duration)
+                            for wp in waypoints)
+                with self._cv:
+                    self._eta[seq] = self._t_next + total
+                    self._cv.notify_all()
+                for wp in waypoints:
+                    if epoch != self._epoch:
+                        break
+                    q = wp.get("q_goal") or []
+                    if len(q) != 7:
+                        raise ValueError(f"waypoint q_goal len {len(q)} != 7")
+                    self._robot.update_desired_joint_positions(torch.tensor(q, dtype=torch.float32))
+                    d = float(wp.get("duration", default_duration))
+                    self._t_next += d if d > 0 else default_duration
+                    time.sleep(max(0.0, self._t_next - time.monotonic()))
+                if terminate_after:
+                    self._stop_policy()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("streamed trajectory failed")
+                self._stop_policy()
+                err = str(exc)
+            self._finish(seq, err, t_started)
+
+    def _finish(self, seq: int, err: str | None, t_started: float | None = None) -> None:
+        with self._cv:
+            if t_started is not None:
+                self._times[seq] = (t_started, time.time())
+            self._eta.pop(seq, None)
+            if err:
+                self._errors[seq] = err
+            self._done_seq = max(self._done_seq, seq)
+            if not self._q:
+                self._idle_since = time.monotonic()
+            self._cv.notify_all()
+
+
 def _np_from(a):
     return np.asarray(a, dtype=np.float32)
 
@@ -302,7 +520,8 @@ def _connect_robot(ip, port, robotiq_port: str | None = "/dev/ttyUSB0"):
     return robot, gripper
 
 
-def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool, dense_exec: bool = True):
+def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool, dense_exec: bool = True,
+                     streamer: '_TrajectoryStreamer' = None):
     log.info(f"Control loop listening... (dense_exec={dense_exec})")
     while True:
         replied = False
@@ -340,36 +559,31 @@ def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool, den
                     # controller so the arm tracks the planned path -- including the DROID-manifold
                     # jerkiness that vae_manifold_weight induces. Contrast with the endpoint path
                     # below, which min-jerks to the final waypoint and discards the plan's shape.
-                    import torch
+                    #
+                    # Both modes go through the same streamer, which paces to an ABSOLUTE per-waypoint
+                    # deadline rather than sleeping the full duration after each setpoint:
+                    # update_desired_joint_positions is a ~5 ms gRPC round trip, so sleeping d ON TOP
+                    # of it added that overhead to every ~20 ms waypoint and ran trajectories a
+                    # near-constant ~1.25x slow (measured 1.21-1.26x on real episodes).
+                    #
+                    # queue=True: reply as soon as the batch is accepted, and DON'T drop the policy at
+                    # the end, so the caller can hand over the next segment before this one finishes
+                    # and the arm flows through the gripper event. Absent (legacy clients), this
+                    # blocks until the batch completes and terminates the policy exactly as before.
+                    queued = bool(data.get("queue"))
                     try:
-                        robot.start_joint_impedance()
-                        streamed = 0
-                        # Pace to an ABSOLUTE per-waypoint deadline rather than sleeping the full
-                        # duration after each setpoint. update_desired_joint_positions is a ~5 ms gRPC
-                        # round trip; sleeping d ON TOP of it adds that overhead to every ~20 ms
-                        # waypoint, so trajectories ran a near-constant ~1.25x slower than commanded
-                        # (measured 1.21-1.26x on real episodes). Sleeping to a running deadline absorbs
-                        # the call time instead, so the arm tracks the planned duration.
-                        t_next = time.monotonic()
-                        for wp in waypoints:
-                            q = wp.get("q_goal") or []
-                            if len(q) != 7:
-                                raise ValueError(f"waypoint {streamed} q_goal len {len(q)} != 7")
-                            d = float(wp.get("duration", default_duration))
-                            robot.update_desired_joint_positions(torch.tensor(q, dtype=torch.float32))
-                            t_next += d if d > 0 else default_duration
-                            time.sleep(max(0.0, t_next - time.monotonic()))
-                            streamed += 1
-                        # Leave the arm holding the final setpoint for the next command.
-                        robot.terminate_current_policy()
-                        log.info(f"  trajectory: streamed {streamed} dense waypoints (joint impedance)")
-                        resp = {"success": True}
+                        seq = streamer.submit(waypoints, default_duration,
+                                              terminate_after=not queued)
+                        if queued:
+                            log.info(f"  trajectory: queued {len(waypoints)} waypoints (seq {seq})")
+                            resp = {"success": True, "queued": True, "seq": seq}
+                        else:
+                            total = sum(float(w.get("duration", default_duration)) for w in waypoints)
+                            resp = streamer.wait_for(seq, timeout=total * 1.5 + 10.0)
+                            log.info(f"  trajectory: streamed {len(waypoints)} dense waypoints "
+                                     f"(joint impedance)")
                     except Exception as e:
                         log.exception("dense trajectory exec failed")
-                        try:
-                            robot.terminate_current_policy()  # don't leave a half-run policy active
-                        except Exception:
-                            pass
                         resp = {"success": False, "error": str(e)}
                 else:
                     # Endpoint execution (legacy, --endpoint-exec): sum the per-waypoint durations to
@@ -395,6 +609,24 @@ def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool, den
                         except Exception as e:
                             log.exception("trajectory exec failed")
                             resp = {"success": False, "error": str(e)}
+            elif cmd == "wait_trajectory_arrival":
+                resp = streamer.wait_arrival(int(req.get("seq", 0)),
+                                             lead=float(req.get("lead", 0.0)),
+                                             timeout=float(req.get("timeout", 120.0)))
+            elif cmd == "wait_trajectory_done":
+                # Block until the queue drains. The caller uses this once at the end of a plan; it
+                # is how a queued client learns the arm actually finished.
+                resp = streamer.wait_idle(timeout=float(req.get("timeout", 120.0)))
+            elif cmd == "abort_trajectory":
+                # Bumps the epoch, so it also stops the batch currently streaming -- clearing the
+                # queue alone would not (the worker has already popped it).
+                streamer.abort()
+                resp = {"success": True}
+            elif cmd == "trajectory_times":
+                resp = {"success": True, "times": streamer.times()}
+            elif cmd == "trajectory_queue_status":
+                # Also the capability probe: a shim without queueing answers "Unknown command".
+                resp = {"success": True, **streamer.status()}
             elif cmd == "start_joint_impedance":
                 try:
                     robot.start_cartesian_impedance()  # PATCH: match DROID env.step (cartesian impedance + joint pos updates)
@@ -654,7 +886,9 @@ def main():
 
     cache = _StateCache()
     poller = threading.Thread(target=_state_poller, args=(robot, cache), daemon=True)
-    t1 = threading.Thread(target=_control_handler, args=(ctrl_sock, robot, gripper, True, dense_exec), daemon=True)
+    streamer = _TrajectoryStreamer(robot)
+    t1 = threading.Thread(target=_control_handler,
+                          args=(ctrl_sock, robot, gripper, True, dense_exec, streamer), daemon=True)
     t2 = threading.Thread(target=_gripper_handler, args=(grip_sock, gripper), daemon=True)
     t3 = threading.Thread(target=_state_handler, args=(state_sock, cache), daemon=True)
     poller.start(); t1.start(); t2.start(); t3.start()

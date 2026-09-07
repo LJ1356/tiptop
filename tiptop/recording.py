@@ -18,7 +18,7 @@ from jaxtyping import Bool, Float, UInt8
 from PIL import Image
 
 import tiptop
-from tiptop.config import tiptop_config_path
+from tiptop.config import tiptop_cfg, tiptop_config_path
 from tiptop.perception.cameras.zed_camera import ZedCamera, convert_svo_to_mp4
 from tiptop.perception.utils import get_o3d_pcd
 from tiptop.perception.visualization import visualize_detections, visualize_masks
@@ -81,9 +81,93 @@ def _get_git_diff() -> str | None:
         return None
 
 
+class _Mp4FrameWriter:
+    """Pipe RGB frames straight to ffmpeg (H.264 / yuv420p), the format the ZED path also produces.
+
+    A camera with no SDK-side recorder — a RealSense — is captured by grabbing frames and encoding
+    them as they arrive. H.264 rather than OpenCV's default MPEG-4 Part 2 because the
+    data-collection UI streams these mp4s into a browser ``<video>`` element, which will not decode
+    the latter.
+    """
+
+    def __init__(self, path: Path, width: int, height: int, fps: float, crf: int = 20):
+        import shutil
+        import subprocess
+
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg not found on PATH, required to record a non-ZED camera to MP4")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.frames = 0
+        self._proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", f"{max(fps, 1.0):g}",
+                "-i", "pipe:0",
+                "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+                # faststart puts the moov atom first so the UI can seek without the whole file.
+                "-movflags", "+faststart",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Drain stderr continuously. It is a 64K OS pipe and this process lives for the whole
+        # episode, so a chatty encoder would fill it and then block ffmpeg on write -- which stalls
+        # the grab thread feeding it and truncates the recording. Keep only the tail, which is what
+        # a failure message needs.
+        self._stderr_tail: list[bytes] = []
+        threading.Thread(target=self._drain_stderr, name=f"ffmpeg-err-{path.stem}", daemon=True).start()
+
+    def _drain_stderr(self) -> None:
+        for line in iter(self._proc.stderr.readline, b""):
+            self._stderr_tail.append(line)
+            del self._stderr_tail[:-40]
+
+    def write(self, rgb: np.ndarray) -> None:
+        try:
+            self._proc.stdin.write(np.ascontiguousarray(rgb, dtype=np.uint8).tobytes())
+            self.frames += 1
+        except BrokenPipeError:
+            _log.error(f"ffmpeg closed early while writing {self.path.name}; stopping this recording")
+            raise
+
+    def close(self) -> int:
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+        self._proc.wait()
+        if self._proc.returncode != 0:
+            tail = b"".join(self._stderr_tail).decode("utf-8", "replace")[-2000:]
+            _log.error(f"ffmpeg failed for {self.path.name}: {tail}")
+        return self.frames
+
+
+def _camera_fps(camera) -> float:
+    """Nominal capture rate for a camera, for the mp4 container header.
+
+    Only affects playback speed in a video player: the LeRobot export derives the real rate from
+    the frame count over the recording window (``_meta.json``'s record_start/record_stop), so a
+    camera that ran slightly off its nominal rate still aligns to the control timeline correctly.
+    """
+    for slot_cfg in (tiptop_cfg().cameras or {}).values():
+        if slot_cfg is not None and str(slot_cfg.get("serial", "")) == str(camera.serial):
+            return float(slot_cfg.get("fps", 30))
+    return 30.0
+
+
 @contextmanager
-def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Generator[dict, None, None]:
-    """Context manager for recording multiple ZED cameras simultaneously.
+def record_cameras(recordings: list[tuple[object, Path, Path | None]]) -> Generator[dict, None, None]:
+    """Context manager for recording multiple cameras simultaneously.
+
+    Each entry is ``(camera, raw_path, mp4_path)``. A **ZED** records to ``raw_path`` (an SVO) via
+    the SDK and is converted to ``mp4_path`` on exit. Any **other** camera (a RealSense) has no
+    SDK-side recorder, so its frames are grabbed and encoded to ``mp4_path`` as they arrive and
+    ``raw_path`` is unused — same yielded window, same output file, so callers and the LeRobot
+    export cannot tell the two apart.
 
     All cameras stop collecting frames at the same time on exit, then MP4
     conversion runs sequentially afterwards.
@@ -98,7 +182,8 @@ def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Gen
     Args:
         recordings: List of (camera, svo_path, mp4_path) tuples
     """
-    started: list[tuple[ZedCamera, Path, Path | None, threading.Event, threading.Thread]] = []
+    started: list[tuple[object, Path, Path | None, threading.Event, threading.Thread]] = []
+    writers: dict[str, _Mp4FrameWriter] = {}
     window: dict[str, float] = {}
 
     def stop_all():
@@ -106,26 +191,54 @@ def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Gen
         for _, _, _, stop_event, _ in started:
             stop_event.set()
         for camera, _, _, _, thread in started:
-            thread.join(timeout=3.0)
-            camera.stop_recording()
+            thread.join(timeout=5.0)
+            if isinstance(camera, ZedCamera):
+                camera.stop_recording()
             _log.info(f"Stopped recording camera {camera.serial}")
+        for serial, writer in writers.items():
+            frames = writer.close()
+            _log.info(f"Wrote {frames} frames to {writer.path.name} (camera {serial})")
 
     try:
         for camera, svo_path, mp4_path in recordings:
             stop_event = threading.Event()
 
-            def recording_loop(cam=camera, event=stop_event):
-                while not event.is_set():
-                    try:
-                        cam.read_camera()
-                    except Exception as e:
-                        _log.error(f"Error grabbing frame during recording: {e}")
-                        break
+            if isinstance(camera, ZedCamera):
+                # The SDK records the SVO itself; the loop only has to keep grabbing.
+                def recording_loop(cam=camera, event=stop_event):
+                    while not event.is_set():
+                        try:
+                            cam.read_camera()
+                        except Exception as e:
+                            _log.error(f"Error grabbing frame during recording: {e}")
+                            break
 
-            camera.start_recording(str(svo_path))
-            thread = threading.Thread(target=recording_loop)
+                camera.start_recording(str(svo_path))
+                _log.info(f"Started recording camera {camera.serial} to {svo_path}")
+            else:
+                # No SDK recorder: grab and encode in the same thread. Encoding a 720p frame to
+                # H.264 costs a few ms against a 33 ms frame period, so the grab loop keeps up; if
+                # it ever does not, frames are dropped rather than queued, and the export stays
+                # correct because it maps frames onto the recording window by count, not by index.
+                if mp4_path is None:
+                    raise ValueError(f"camera {camera.serial} has no SDK recorder, so mp4_path is required")
+                probe = camera.read_camera()
+                height, width = probe.rgb.shape[:2]
+                writer = _Mp4FrameWriter(mp4_path, width, height, fps=_camera_fps(camera))
+                writers[camera.serial] = writer
+
+                def recording_loop(cam=camera, event=stop_event, w=writer, first=probe.rgb):
+                    try:
+                        w.write(first)
+                        while not event.is_set():
+                            w.write(cam.read_camera().rgb)
+                    except Exception as e:
+                        _log.error(f"Error recording camera {cam.serial}: {e}")
+
+                _log.info(f"Started recording camera {camera.serial} to {mp4_path} ({width}x{height})")
+
+            thread = threading.Thread(target=recording_loop, name=f"record-{camera.serial}")
             thread.start()
-            _log.info(f"Started recording camera {camera.serial} to {svo_path}")
             started.append((camera, svo_path, mp4_path, stop_event, thread))
     except BaseException:
         # A camera failing to start leaves the earlier ones recording with live grab threads, which
@@ -143,8 +256,11 @@ def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Gen
         # count as recording time, so stamp t_stop before it.
         window["t_stop"] = time.time()
 
-        # Convert to MP4 after all cameras have stopped
-        for _, svo_path, mp4_path, _, _ in started:
+        # Convert to MP4 after all cameras have stopped. Only the ZEDs need this — a directly
+        # encoded camera closed its writer inside stop_all() and its mp4 is already on disk.
+        for camera, svo_path, mp4_path, _, _ in started:
+            if not isinstance(camera, ZedCamera):
+                continue
             if mp4_path is None:
                 continue
             actual_svo_path = svo_path
@@ -256,8 +372,16 @@ def save_run_metadata(
     planning_success: bool | None,
     planning_failure_reason: str | None,
     planning_duration: float | None,
+    cleared: list[str] | None = None,
 ) -> None:
-    """Save structured run metadata to metadata.json."""
+    """Save structured run metadata to metadata.json.
+
+    ``cleared`` names the objects this episode moved out of the way BEFORE doing what the instruction
+    asked (``tiptop.goal_clearing``). Those steps are part of the recorded episode while the
+    instruction says nothing about them, so an episode with a non-empty ``cleared`` opens with motion
+    the language does not account for -- recorded here so a dataset build can find or filter them
+    without re-deriving it from the plan.
+    """
     git_info = _collect_git_info()
     if git_info["dirty"]:
         diff = _get_git_diff()
@@ -279,6 +403,7 @@ def save_run_metadata(
             "success": planning_success,
             "failure_reason": planning_failure_reason,
             "duration": round(planning_duration, 3) if planning_duration is not None else None,
+            "cleared": list(cleared or []),
         },
         "version": "1.0.0",
         "tiptop_version": tiptop.__version__,

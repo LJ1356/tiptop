@@ -10,6 +10,7 @@ Detect and return bounding boxes for objects in the image.
 - Format: normalized coordinates 0-1000 as integers
 
 Be very careful to identify objects and name them in a way that's relevant to the task. If the task involves picking up a red apple, make sure that 'red' appears in the name of the apple.
+{extra_objects}
 
 
 TASK 2 - TASK TRANSLATION:

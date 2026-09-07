@@ -9,6 +9,13 @@ import trimesh
 # Set up logging
 _log = logging.getLogger(__name__)
 
+# The table collision box is sunk this far BELOW the RANSAC plane (see segment_table_with_ransac),
+# which is what lets a flat object lying on the table be grasped at all -- the fingers have to reach
+# under its centre line without the box rejecting the configuration. The consequence is that the
+# cuboid's top face is NOT the surface objects rest on, so anything that treats it as a placement
+# height must add this back. Exported for that reason; see tiptop_run.create_tamp_environment.
+TABLE_BOX_CLEARANCE = 0.02
+
 
 def aabb_to_cuboid(aabb: np.ndarray, name: str) -> trimesh.primitives.Box:
     """Convert AABB to trimesh Box.
@@ -192,7 +199,7 @@ def segment_table_with_ransac(
     extents = table_box.extents
     table_center = table_box.center_mass
     # Offset the box down so its top surface aligns with the detected plane
-    height_offset = surface_z - table_center[2] - extents[2] / 2 - 0.02  # small offset
+    height_offset = surface_z - table_center[2] - extents[2] / 2 - TABLE_BOX_CLEARANCE
     table_box.apply_translation([0, 0, height_offset])
 
     # Set color from point cloud
@@ -227,6 +234,51 @@ def augment_with_base_projections(
         augmented_colors = None
 
     return augmented_points, augmented_colors
+
+
+def resolve_mask_overlaps(masks_2d: np.ndarray, labels: list[str]) -> np.ndarray:
+    """Make the object masks disjoint by giving each contested pixel to the SMALLEST claimant.
+
+    SAM2 is seeded from Gemini's boxes, and a box drawn around a container necessarily contains
+    whatever is sitting on it -- so the mask for a book comes back covering the marker lying on it,
+    the mask for a tray covers the toy inside it. Nothing downstream separates them: each mask is
+    turned into its own point cloud and then its own convex hull, so the container's hull swallows
+    the object on top of it. On the 2026-09-06_23-06-41 run 81% of the marker's pixels were also
+    book pixels, which put the book's collision box at z <= 0.052 against a marker spanning
+    0.036-0.051 -- the marker was entirely inside an obstacle, every pick pose was in collision, and
+    collision-aware IK found 1 of 512 seeds. Planning then failed on the pick's pos_err.
+
+    Smallest-area-wins is the resolution because the containment is one-directional: the thing on
+    top is the more specific detection, and it is the one that must keep its points. Mutually
+    subtracting would delete the overlap from BOTH masks and erase the small object entirely.
+
+    Args:
+        masks_2d: (num_objects, H, W) boolean masks, one per entry of ``labels``.
+        labels: Object labels, only used for logging.
+
+    Returns:
+        (num_objects, H, W) boolean masks in which no pixel is set for more than one object.
+    """
+    if len(masks_2d) < 2:
+        return masks_2d
+
+    areas = masks_2d.sum(axis=(1, 2))
+    # Paint largest first so the smallest claimant is written last and wins every contested pixel.
+    owner = np.full(masks_2d.shape[1:], -1, dtype=np.int16)
+    for idx in np.argsort(-areas):
+        owner[masks_2d[idx]] = idx
+
+    disjoint = np.zeros_like(masks_2d)
+    for idx in range(len(masks_2d)):
+        disjoint[idx] = owner == idx
+        lost = int(areas[idx]) - int(disjoint[idx].sum())
+        if lost > 0:
+            label = labels[idx] if idx < len(labels) else f"mask {idx}"
+            _log.info(
+                f"{label}: dropped {lost}/{int(areas[idx])} px ({lost / max(int(areas[idx]), 1):.0%}) "
+                f"claimed by a smaller object's mask"
+            )
+    return disjoint
 
 
 def segment_pointcloud_by_masks(
@@ -341,6 +393,12 @@ def segment_pointcloud_by_masks(
             selected_masks[i, 0] = masks[idx, 0]
         masks = selected_masks
         masks_2d = masks.squeeze(1).astype(bool)  # Update masks_2d with selected masks
+
+    # Give every contested pixel to exactly one object before any of them becomes geometry, so a
+    # container's mask cannot carry the object resting on it into its own hull. Done BEFORE the
+    # erosion below, so the hole this opens in the container gets the same edge clearance as its
+    # outer boundary.
+    masks_2d = resolve_mask_overlaps(masks_2d, [bbox["label"] for bbox in bboxes[: len(masks_2d)]])
 
     # Process each mask and create a mesh for each object
     for mask_2d, bbox in zip(masks_2d, bboxes):

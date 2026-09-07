@@ -5,7 +5,7 @@ deterministic learned) time law, it **samples a full human-like stroke** from a 
 model trained on DROID teleop — so every generated episode draws a different, plausible human timing.
 
 **Code:** `flow_timing.py` (model + `FlowModel`), `extract_stroke_flow.py` (data), `train_flow.py`,
-`eval_flow.py`, and `../flow_blending.py` (the `blend_mode: flow` backend). Checkpoint: `../checkpoints/flow_net.pt`.
+`eval_flow.py`, and `../flow_blending.py` (the `blend_mode: flow` backend). Checkpoint: `../checkpoints/flow_net_t64.pt`.
 
 ---
 
@@ -21,11 +21,11 @@ The evolution of fixes:
 1. **Analytic spline blend** (`../trajectory_blending.py`) — smooths the segments into one continuous stroke
    with a min-jerk / asymmetric quintic time law. Fixes the discontinuity, but the *timing* is an
    **arbitrary hand-chosen** profile, not measured from humans.
-2. **Deterministic learned timing** (`../neural_blending.py`, `timing_net.py`) — predicts a human speed
-   profile from geometry. Better, but it is MSE-trained, so it learns the **conditional mean**. Different
-   teleoperators time the same motion differently (some *decelerate into a grasp*, some hold *constant
-   velocity*); the mean of those is a blurred profile **neither operator produces**, and it strips the
-   diversity that makes imitation data useful.
+2. **Deterministic learned timing** (removed) — predicted a human speed profile from geometry. Better, but
+   it was MSE-trained, so it learned the **conditional mean**. Different teleoperators time the same motion
+   differently (some *decelerate into a grasp*, some hold *constant velocity*); the mean of those is a
+   blurred profile **neither operator produces**, and it strips the diversity that makes imitation data
+   useful. Superseded by (3), and deleted along with its network and training scripts.
 3. **Flow matching (this)** — a *generative* model of the human stroke distribution. Sampling reproduces the
    **spread of teleoperator styles**, not their mean. On held-out DROID the end-speed-ratio distribution
    matches to Wasserstein-1 **0.055** (deterministic-mean baseline: 0.48), with 64% of samples decelerating
@@ -40,7 +40,7 @@ Per **operation group** (the trajectory segments between two gripper events):
 1. **Condition** on the group's path (timing-stripped) and its endpoint.
 2. **Sample** a full stroke by integrating the flow ODE from Gaussian noise (`t: 0 → 1`).
 3. **Constrain**: feed the sample's geometry + its own speed profile into the shared engine
-   `neural_blending._neural_stroke`, which enforces the FR3 vel/accel caps, pins rest ends to zero, lifts
+   `flow_blending._retime_stroke`, which enforces the FR3 vel/accel caps, pins rest ends to zero, lifts
    gripper-adjacent ends to the non-idle boundary speed, pins the endpoint, and resamples to the plan `dt`.
 
 So the model supplies the (multimodal, human) geometry + timing; the hard constraints stay analytic and
@@ -116,7 +116,7 @@ saved and executed plans are the identical blended object. Enable per `cfg/tamp/
 tamp_overrides:
   blend_trajectory: true
   blend_mode: flow
-  blend_model_path: "checkpoints/flow_net.pt"   # optional; defaults to flow_net.pt
+  blend_model_path: "checkpoints/flow_net_t64.pt"   # optional; defaults to flow_net_t64.pt
   blend_flow_steps: 60                           # Euler ODE steps per sample
   blend_boundary_speed: 0.3                       # non-idle boundary at gripper events
   blend_ops: [Pick, Place, GoToInitial]
@@ -128,7 +128,7 @@ Dispatch path: `planning.run_planning` → `_apply_blend` (on `blend_mode == "fl
 - Gripper steps pass through untouched and **delimit** the operation groups (`config.ops` restricts which
   operations are blended).
 - For each group (`flow_blend_group`): sample the flow conditioned on the group's joined path → `x_flow`;
-  take **its** geometry + speed profile and run `neural_blending._neural_stroke` with the boundary speeds —
+  take **its** geometry + speed profile and run `flow_blending._retime_stroke` with the boundary speeds —
   **rest (0)** at the plan's start/end, **`boundary_speed`** at gripper events — plus the **FR3 vel/accel
   caps**, endpoint pinning, and resample to the control `dt`. Emit as the group's single trajectory step.
 - **Robustness:** a per-stroke failure falls back to the analytic `blend_group` for that stroke; a model-load
@@ -149,4 +149,4 @@ gripper ends non-idle, vel/accel within caps, and multimodality survives the con
 
 ### Related files
 `flow_timing.py` · `extract_stroke_flow.py` · `train_flow.py` · `eval_flow.py` · `../flow_blending.py` ·
-`../trajectory_blending.py` (spline, shared constraint engine) · `../neural_blending.py` (deterministic backend)
+`../trajectory_blending.py` (spline, shared constraint engine)

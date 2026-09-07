@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from functools import cache
@@ -49,6 +50,7 @@ class RealsenseCamera:
         start_time = time.perf_counter()
         self._enable_depth = enable_depth
         self._enable_ir = enable_ir
+        self._read_lock = threading.Lock()
 
         # Enable streams
         config = rs.config()
@@ -75,15 +77,29 @@ class RealsenseCamera:
         device = self._profile.get_device()
         self.serial = device.get_info(rs.camera_info.serial_number)
 
-        # Cache the intrinsics call
-        self.get_intrinsics()
+        # Cache the intrinsics call. Skipped for a record-only camera, which has no IR streams and
+        # therefore no stereo intrinsics to compute.
+        if enable_ir:
+            self.get_intrinsics()
 
         init_dur = time.perf_counter() - start_time
         _log.info(f"Realsense camera (s/n: {self.serial}) initialization complete, took {init_dur:.2f}s")
 
     @cache
     def get_intrinsics(self) -> RealsenseIntrinsics:
+        """Color + IR intrinsics and the IR->color extrinsic.
+
+        Requires the IR streams: the IR pair and its baseline are what FoundationStereo needs, and
+        ``T_color_from_ir`` is what warps the result onto the color grid. A record-only camera
+        (``enable_ir=False``) never estimates depth, so it never calls this.
+        """
         import pyrealsense2 as rs
+
+        if not self._enable_ir:
+            raise ValueError(
+                f"camera {self.serial}: intrinsics need the IR streams, but it was opened with "
+                "enable_ir=False (record-only). Open it with enable_ir=True to run perception on it."
+            )
 
         # Color intrinsics
         color_profile = self._profile.get_stream(rs.stream.color)
@@ -135,19 +151,28 @@ class RealsenseCamera:
     def read_camera(self) -> RealsenseFrame:
         import pyrealsense2 as rs
 
-        frames = self.pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        rgb = np.asanyarray(color_frame.get_data())
-        timestamp = frames.get_timestamp()
+        # Serialised because a bimanual YAM rollout reads the perception camera from TWO threads:
+        # the video recorder grabs continuously for the whole episode, and perception pulls its own
+        # burst from the same camera partway through. librealsense's pipeline is not safe for
+        # concurrent wait_for_frames, so without this the two steal each other's frames or fault.
+        # Under the lock they simply alternate, and each still gets whole, valid frames.
+        with self._read_lock:
+            frames = self.pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            rgb = np.asanyarray(color_frame.get_data())
+            timestamp = frames.get_timestamp()
+            return self._build_frame(frames, rgb, timestamp, rs)
 
-        # IR streams required for RealsenseFrame
-        if not self._enable_ir:
-            raise ValueError("IR streams must be enabled for RealsenseFrame")
-
-        ir_left_frame = frames.get_infrared_frame(1)
-        ir_right_frame = frames.get_infrared_frame(2)
-        ir_left = np.asanyarray(ir_left_frame.get_data())
-        ir_right = np.asanyarray(ir_right_frame.get_data())
+    def _build_frame(self, frames, rgb, timestamp, rs) -> RealsenseFrame:
+        """Turn one grabbed frameset into a RealsenseFrame. Called with the read lock held."""
+        # A record-only camera (enable_ir=False) yields a colour-only frame. Perception never
+        # reaches one -- get_depth_estimator would fail on its missing intrinsics long before -- but
+        # the video recorder reads exactly this path for the wrist cameras, and opening two extra
+        # IR pairs it never looks at is USB bandwidth spent for nothing.
+        ir_left = ir_right = None
+        if self._enable_ir:
+            ir_left = np.asanyarray(frames.get_infrared_frame(1).get_data())
+            ir_right = np.asanyarray(frames.get_infrared_frame(2).get_data())
 
         # Optional depth
         depth_float = None
@@ -163,17 +188,24 @@ class RealsenseCamera:
             aligned_depth_frame = aligned_frames.get_depth_frame()
             depth_float = (np.asanyarray(aligned_depth_frame.get_data()) / 1000.0).astype(np.float32)
 
-        intrinsics = self.get_intrinsics()
         return RealsenseFrame(
             serial=self.serial,
             timestamp=timestamp,
             rgb=rgb,
-            intrinsics=intrinsics.K_color,
+            intrinsics=self.get_intrinsics().K_color if self._enable_ir else self._color_matrix(),
             depth=depth_float,
             ir_left=ir_left,
             ir_right=ir_right,
             depth_raw=depth_raw,
         )
+
+    @cache
+    def _color_matrix(self) -> Float[np.ndarray, "3 3"]:
+        """Colour camera matrix alone, for a record-only camera with no IR streams."""
+        import pyrealsense2 as rs
+
+        intr = self._profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        return np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]], dtype=np.float32)
 
     def close(self):
         """Stop the camera pipeline."""

@@ -11,21 +11,32 @@ import numpy as np
 from bamboo.client import BambooFrankaClient
 from cutamp.robots import (
     RerunRobot,
+    load_bimanual_yam_rerun,
     load_fr3_franka_rerun,
     load_fr3_robotiq_rerun,
     load_franka_rerun,
     load_panda_robotiq_rerun,
     load_ur5_rerun,
+    YAM_ARMS,
 )
 from jaxtyping import Bool
 from PIL import Image
 
 from tiptop.config import config_dir, tiptop_cfg
 from tiptop.ur5.ur5_client import UR5Client
+from tiptop.yam.yam_client import YamClient, build_yam_client
 
 gripper_mask_path = config_dir / "assets" / "gripper_mask.png"
 
 REQUIRED_CUTAMP_VERSION = "0.0.5"
+
+# One robot type per YAM arm: cuTAMP plans a single kinematic chain, so which arm is active is part
+# of the embodiment (it picks the cuRobo config's ee_link and lock_joints). Lives here rather than in
+# motion_planning.py because workspace.py needs it too, and motion_planning already imports workspace.
+# "bimanual_yam_dual" is the third member: both arms as one 12-DOF chain (simultaneous dual-arm /
+# handover planning, see cuTAMP's bimanual_yam_dual.yml), added explicitly rather than via YAM_ARMS
+# since cuTAMP's own per-arm ARMS constant deliberately excludes "dual" too.
+YAM_ROBOT_TYPES = frozenset(f"bimanual_yam_{arm}" for arm in YAM_ARMS) | {"bimanual_yam_dual"}
 
 
 def check_cutamp_version() -> None:
@@ -86,7 +97,18 @@ def get_bamboo_client() -> BambooFrankaClient:
     return _build_bamboo_client()
 
 
-RobotClient = BambooFrankaClient | UR5Client
+@cache
+def get_yam_client() -> YamClient:
+    """Shared YamClient for the bimanual YAM arm server.
+
+    Cached like get_bamboo_client: one process-wide connection that the warm session holds for its
+    whole life. It is deliberately NOT keyed on the arm — a single client owns both arms and follows
+    ``robot.type``, so a sequential-bimanual rollout switching arms mid-episode reuses it.
+    """
+    return build_yam_client()
+
+
+RobotClient = BambooFrankaClient | UR5Client | YamClient
 
 
 def get_robot_client() -> RobotClient:
@@ -98,6 +120,8 @@ def get_robot_client() -> RobotClient:
         from tiptop.ur5.ur5_client import get_ur5_client
 
         return get_ur5_client()
+    elif cfg.robot.type in YAM_ROBOT_TYPES:
+        return get_yam_client()
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -115,6 +139,8 @@ def new_robot_client() -> RobotClient:
         return _build_bamboo_client()
     elif cfg.robot.type == "ur5":
         return UR5Client(cfg.robot.host)
+    elif cfg.robot.type in YAM_ROBOT_TYPES:
+        return build_yam_client()
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -265,6 +291,12 @@ def get_robot_rerun(robot_type: str | None = None) -> RerunRobot:
         return load_fr3_franka_rerun()
     elif robot_type == "ur5":
         return load_ur5_rerun()
+    elif robot_type == "bimanual_yam_dual":
+        # No per-hand viz distinction worth making here; cuTAMP's own robot_to_fns["bimanual_yam_dual"]
+        # makes the same call for its rerun loader.
+        return load_bimanual_yam_rerun("left")
+    elif robot_type in YAM_ROBOT_TYPES:
+        return load_bimanual_yam_rerun(robot_type.rsplit("_", 1)[1])
     else:
         raise ValueError(f"Unknown robot type: {robot_type}")
 

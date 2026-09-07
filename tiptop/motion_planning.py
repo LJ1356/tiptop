@@ -12,6 +12,8 @@ from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGen
 from cutamp.motion_solver import MotionPlanningError
 from cutamp.robots import (
     get_panda_robotiq_ik_solver,
+    load_bimanual_yam_container,
+    load_bimanual_yam_dual_container,
     load_fr3_robotiq_container,
     load_panda_container,
     load_panda_robotiq_container,
@@ -24,40 +26,62 @@ from cutamp.robots.franka import (
     get_fr3_franka_ik_solver,
     get_franka_ik_solver,
 )
+from cutamp.robots.bimanual_yam import bimanual_yam_curobo_cfg, get_bimanual_yam_ik_solver
 from cutamp.robots.franka_robotiq import fr3_robotiq_curobo_cfg, get_fr3_robotiq_ik_solver
 from cutamp.robots.ur5 import get_ur5_ik_solver, ur5_curobo_cfg
 from cutamp.utils.common import sample_between_bounds
 from jaxtyping import Float
 
 from tiptop.config import tiptop_cfg
-from tiptop.utils import get_robot_client, patch_log_level
+from tiptop.utils import YAM_ROBOT_TYPES, get_robot_client, patch_log_level
 from tiptop.workspace import workspace_cuboids
 
 _log = logging.getLogger(__name__)
 
 
-def get_ik_solver(world_cfg: WorldConfig, num_particles: int, warmup_iters: int = 8):
-    """Get the IKSolver and warm it up."""
+def get_ik_solver(
+    world_cfg: WorldConfig, num_particles: int, warmup_iters: int = 8, num_seeds: int | None = None
+):
+    """Get the IKSolver and warm it up.
+
+    ``num_seeds`` overrides how many seeds cuRobo optimizes per IK problem (its own per-robot
+    default otherwise). Configs that turn on teleop-posture branch selection need it raised, since
+    ``return_seeds`` cannot exceed it and branch diversity thins as the two converge -- see
+    ``resolve_ik_num_seeds``.
+    """
     if warmup_iters < 0:
         raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
+    seed_kw = {} if num_seeds is None else {"num_seeds": num_seeds}
 
     cfg = tiptop_cfg()
     with patch_log_level("curobo", logging.ERROR):
         if cfg.robot.type == "fr3_robotiq":
-            ik_solver = get_fr3_robotiq_ik_solver(world_cfg)
+            ik_solver = get_fr3_robotiq_ik_solver(world_cfg, **seed_kw)
             container = load_fr3_robotiq_container(TensorDeviceType())
         elif cfg.robot.type == "fr3":
-            ik_solver = get_fr3_franka_ik_solver(world_cfg)
+            ik_solver = get_fr3_franka_ik_solver(world_cfg, **seed_kw)
             container = load_fr3_robotiq_container(TensorDeviceType())
         elif cfg.robot.type == "panda_robotiq":
-            ik_solver = get_panda_robotiq_ik_solver(world_cfg)
+            ik_solver = get_panda_robotiq_ik_solver(world_cfg, **seed_kw)
             container = load_panda_robotiq_container(TensorDeviceType())
         elif cfg.robot.type == "panda":
-            ik_solver = get_franka_ik_solver(world_cfg)
+            ik_solver = get_franka_ik_solver(world_cfg, **seed_kw)
             container = load_panda_container(TensorDeviceType())
         elif cfg.robot.type == "ur5":
-            ik_solver = get_ur5_ik_solver(world_cfg)
+            ik_solver = get_ur5_ik_solver(world_cfg, **seed_kw)
             container = load_ur5_container(TensorDeviceType())
+        elif cfg.robot.type in YAM_ROBOT_TYPES:
+            # The bimanual YAM is registered once per arm; the suffix picks which arm plans and
+            # which one is locked as an obstacle. See cutamp/robots/bimanual_yam.py. "dual" is a
+            # different container entirely (both arms as one 12-DOF chain, not a per-arm
+            # parameterization of the single-arm one) -- get_bimanual_yam_ik_solver already accepts
+            # it via _check_arm(allow_dual=True), but the RobotContainer loader does not.
+            arm = cfg.robot.type.rsplit("_", 1)[1]
+            ik_solver = get_bimanual_yam_ik_solver(world_cfg, arm)
+            if arm == "dual":
+                container = load_bimanual_yam_dual_container(TensorDeviceType())
+            else:
+                container = load_bimanual_yam_container(arm, TensorDeviceType())
         else:
             raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -138,6 +162,13 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
         vm = cost.setdefault("vae_manifold_cfg", {"weight": 0.0, "n_joints": 7, "source_dt": 0.15})
         if overrides.get("vae_manifold_weight") is not None:
             vm["weight"] = float(overrides["vae_manifold_weight"])
+        # vae_retiming promotes each waypoint interval's duration to a trajopt decision variable,
+        # optimized by the same LBFGS pass as the waypoints. The three guard knobs are optional.
+        if resolve_vae_retiming(overrides):
+            vm["retiming"] = True
+            for key in ("retime_scale", "retime_smooth_weight", "retime_limit_weight"):
+                if overrides.get(key) is not None:
+                    vm[key] = float(overrides[key])
         # vae_path selects WHICH checkpoint the manifold cost loads (encoder + DROID latent stats),
         # overriding the VAE_MANIFOLD_CKPT env default. Resolved to an absolute path so it is cwd-safe.
         if overrides.get("vae_path") is not None:
@@ -221,14 +252,45 @@ def _scale_kwargs(overrides: dict | None, n_cspace_joints: int) -> dict:
     return kw
 
 
+def resolve_vae_retiming(overrides: dict | None) -> bool:
+    """Whether the VAE manifold cost owns the trajectory clock (the ``vae_retiming`` override).
+
+    When on, the per-interval durations are decision variables of the cuRobo gradient trajopt (see
+    curobo cost/vae_manifold_cost.py) and every OTHER retiming stage is suppressed: the
+    time_dilation_factor, cuRobo's own time-optimal ``optimize_dt`` rescale, and trajectory
+    blending (both the analytic spline and the flow model). Requires a nonzero
+    ``vae_manifold_weight`` -- with the cost disabled there is nothing optimizing the clock, and
+    silently suppressing every retimer would just emit raw trajopt output at base_dt."""
+    ov = overrides or {}
+    if not ov.get("vae_retiming"):
+        return False
+    if not ov.get("vae_manifold_weight"):
+        _log.warning(
+            "vae_retiming is set but vae_manifold_weight is 0/absent -- nothing would optimize the "
+            "trajectory clock, so vae_retiming is IGNORED."
+        )
+        return False
+    return True
+
+
 def resolve_time_dilation_factor(overrides: dict | None, config_default: float) -> float:
     """Effective time_dilation_factor from UI/sweep overrides.
 
     ``time_dilation_factor_literal`` bypasses the 1.0 sentinel (used by the parameter sweep) so a
     requested value is applied verbatim. Otherwise a ``time_dilation_factor`` of None or 1.0 means
     "no extra scaling" and we fall back to the config default (tiptop.yml robot.time_dilation_factor).
+
+    ``vae_retiming`` wins over both: the VAE owns the clock, so returning anything but 1.0 would
+    rescale the timing it just optimized. 1.0 is cuRobo's no-op sentinel (MotionGenResult.
+    retime_trajectory returns immediately), whereas falling back to ``config_default`` would NOT be
+    a no-op -- tiptop.yml ships robot.time_dilation_factor: 0.2.
     """
     overrides = overrides or {}
+    if resolve_vae_retiming(overrides):
+        requested = overrides.get("time_dilation_factor_literal", overrides.get("time_dilation_factor"))
+        if requested is not None:
+            _log.info(f"vae_retiming active: time_dilation_factor={requested} IGNORED (forced to 1.0)")
+        return 1.0
     if overrides.get("time_dilation_factor_literal") is not None:
         return float(overrides["time_dilation_factor_literal"])
     tdf = overrides.get("time_dilation_factor")
@@ -259,6 +321,116 @@ def resolve_traj_length_norm(overrides: dict | None, default: float = 2.0) -> fl
     return float(val)
 
 
+def resolve_transit_apex(overrides: dict | None) -> tuple[float, float]:
+    """Effective (apex height, min horizontal distance) for the transit apex waypoint, in metres.
+
+    Read from the ``transit_apex_height`` / ``transit_apex_min_dist`` keys of a cfg/tamp
+    ``tamp_overrides`` block. A nonzero height makes cuTAMP plan each Pick/Place free-space transit as
+    retract -> apex -> pre-grasp instead of retract -> pre-grasp, where the apex sits that far above
+    the higher of the two end-effector positions (see cuTAMP ``TAMPConfiguration.transit_apex_height``).
+    That is what turns the planner's low lateral sweep into a lift-traverse-descend arc; no cuRobo cost
+    weight can do it, because the trajopt objective never reads the end-effector's Cartesian path.
+
+    Height 0 (the default) disables the apex entirely and the transit is planned exactly as before.
+    """
+    ov = overrides or {}
+    height = float(ov.get("transit_apex_height") or 0.0)
+    min_dist = ov.get("transit_apex_min_dist")
+    # cuTAMP's own default for the guard, kept here so a config setting only the height gets it.
+    min_dist = 0.10 if min_dist is None else float(min_dist)
+    return height, min_dist
+
+
+def resolve_posture_selection(overrides: dict | None) -> dict:
+    """Teleop-posture IK branch selection, from cfg/tamp ``tamp_overrides``.
+
+    Every plan endpoint comes from ``ik_solver.solve_batch(..., seed_config=None)`` with cuRobo's
+    default ``return_seeds=1``, and cuRobo ranks its seeds by ``pose_error + null_space_error`` with
+    ``null_space_cfg.weight`` at 0.001 against a generic home retract -- so the redundant arm's
+    branch is picked by pose error alone, independently at every endpoint. That between-endpoint
+    scatter is 80-90% of why TAMP visits joint configurations teleoperation never does, and being
+    between-segment it is exactly the part no cuRobo trajopt cost can reach with pinned endpoints
+    (which is why ``joint_density_weight`` never moved it).
+
+    ``posture_selection_seeds: k`` makes each endpoint's IK return k branches and keeps the one with
+    the lowest posture penalty. The penalty itself is fully data-derived and has nothing to tune:
+    cuTAMP's baked ``posture_ref.npz`` holds a per-joint-pair human band (5-95 of q_i - q_j over
+    DROID) weighted by how much that pair's direction lies in the Jacobian null space, so pairs that
+    would fight the pose goal contribute ~nothing. Re-bake it with
+    ``cutamp/scripts/bake_posture_ref.py`` for a different robot or corpus.
+
+    ``posture_ref`` optionally points at a different baked file. 0 or 1 (the default) is off.
+    """
+    ov = overrides or {}
+    seeds = int(ov.get("posture_selection_seeds") or 0)
+    out: dict = {"posture_selection_seeds": seeds}
+    if seeds <= 1:
+        return out
+    if ov.get("posture_ref") is not None:
+        out["posture_ref"] = str(ov["posture_ref"])
+    if ov.get("posture_grasp_roll") is not None:
+        out["posture_grasp_roll"] = bool(ov["posture_grasp_roll"])
+    for tol in ("posture_pos_tol", "posture_rot_tol"):
+        if ov.get(tol) is not None:
+            out[tol] = float(ov[tol])
+    return out
+
+
+def resolve_require_m2t2_grasps(overrides: dict | None) -> bool:
+    """Whether a zero-candidate object should FAIL planning instead of taking heuristic grasps.
+
+    With ``m2t2_grasps`` on, an object M2T2 proposed nothing for is not dropped: cuTAMP's
+    ``_sample_grasps`` falls through to the 4-/6-DOF heuristic sampler, which draws grasps from the
+    object's COLLISION-SPHERE approximation rather than from perception. Measured over shipped runs'
+    ``scene_objects.json``, 18-43% of picked objects took that path, and it is a direct mechanism
+    for closing on empty air (analysis_dataset_diff/TELEOP_VS_APEX.md, Finding 5).
+
+    Off by default so existing configs keep their planning outcomes -- the fallback is warned about
+    either way. Data-collection configs should set ``require_m2t2_grasps: true``, where a guessed
+    grasp that misses costs a whole mislabelled episode; raise ``m2t2_num_runs`` alongside it so
+    objects actually get candidates rather than just failing more.
+    """
+    return bool((overrides or {}).get("require_m2t2_grasps"))
+
+
+def resolve_ik_num_seeds(overrides: dict | None) -> int | None:
+    """How many seeds the IKSolver optimizes per problem.
+
+    cuRobo's ``return_seeds`` cannot exceed the solver's ``num_seeds``, and branch diversity dries
+    up as the two converge, so a config that turns on posture selection needs headroom. Measured at
+    512 particles: num_seeds 24 / return_seeds 8 costs 31.7 ms per solve against 38.9 ms for the
+    stock 12 / 1, i.e. the extra seeds are free at the batch sizes cuTAMP actually uses.
+
+    Returns None when posture selection is off, so every robot keeps its own factory default
+    (12 for the Franka/UR5 solvers, 24 for the bimanual YAM) and this change is a no-op for every
+    existing config.
+    """
+    ov = overrides or {}
+    if ov.get("ik_num_seeds") is not None:
+        return int(ov["ik_num_seeds"])
+    seeds = int(ov.get("posture_selection_seeds") or 0)
+    return max(12, 3 * seeds) if seeds > 1 else None
+
+
+def resolve_max_motion_refine_attempts(overrides: dict | None, default: int | None = 32) -> int | None:
+    """Effective cap on how many satisfying particles cuTAMP tries motion refinement on.
+
+    cuTAMP works through satisfying particles in cost order until one motion-refines successfully or
+    this cap is reached (cutamp/config.py's own default is ``None`` = try all of them). TiPToP bounds
+    it at 32 by default to cap planning time when a scene has many satisfying particles. A
+    dual/handover scene can need more tries than that: with few grasp candidates on the object (a
+    thin M2T2 harvest), most satisfying particles share a similar, hard approach geometry, so a run
+    can exhaust 32 attempts -- all failing at the same TRAJOPT_FAIL step -- while satisfying particles
+    it never tried might have succeeded. Set ``max_motion_refine_attempts`` in cfg/tamp
+    ``tamp_overrides`` to raise the cap, or to ``null`` to try every satisfying particle.
+    """
+    overrides = overrides or {}
+    if "max_motion_refine_attempts" not in overrides:
+        return default
+    val = overrides["max_motion_refine_attempts"]
+    return None if val is None else int(val)
+
+
 def resolve_grasp_orientation_cost(overrides: dict | None) -> bool:
     """Whether to enable cuTAMP's grasp orientation-change soft cost, from cfg/tamp tamp_overrides.
 
@@ -267,6 +439,88 @@ def resolve_grasp_orientation_cost(overrides: dict | None) -> bool:
     its multiplier. A zero/absent weight leaves it off.
     """
     return bool((overrides or {}).get("grasp_pose_change_weight"))
+
+
+def resolve_grasp_center_cost(overrides: dict | None) -> bool:
+    """Whether to enable cuTAMP's off-center grasp soft cost, from cfg/tamp tamp_overrides.
+
+    Enabled iff a truthy ``grasp_center_weight`` is present (the same key run_planning reads for the
+    weight), so a single YAML knob both gates the cost (this bool -> TAMPConfiguration) and sets its
+    multiplier. A zero/absent weight leaves it off.
+    """
+    return bool((overrides or {}).get("grasp_center_weight"))
+
+
+# cfg/tamp `tamp_overrides` keys that retune PERCEPTION rather than the solver, mapped to their
+# path in tiptop.yml. Everything else in tamp_overrides is a cuRobo cost weight or a TAMP-config
+# knob; these are the exceptions, because the grasp candidates perception hands cuTAMP bound what
+# any downstream cost can choose between. Add a key here to make it settable per data-gen config.
+_PERCEPTION_OVERRIDE_KEYS = {
+    # Max distance from an M2T2 grasp's contact point to a reconstructed object point for that
+    # grasp to be associated with the object (tiptop_run.process_scene). Grasps beyond it are
+    # dropped outright, so raising this recovers candidates on objects whose surface reconstructs
+    # imprecisely -- plush/fuzzy toys especially, where the stock 0.01 can leave an object with a
+    # single usable grasp and nothing for GraspCost to select between. Raising it too far starts
+    # stealing grasps from a neighbouring object, since the association is nearest-point over the
+    # combined cloud.
+    "contact_threshold_m": (("perception", "contact_threshold_m"), float),
+    # M2T2's own confidence floor for emitting a grasp (its `mask_thresh`). This is the knob that
+    # actually controls how many candidates each object gets: replayed on the 2026-08-22_01-56-41
+    # scene, dropping it from the stock 0.035 to 0.02 took the blue toy from 9 candidates to 32 and
+    # the tan toy from 5 to 84, while widening contact_threshold_m over the same range moved each by
+    # one or two. Lower admits grasps M2T2 is less sure of, so it trades candidate count against
+    # per-grasp quality -- and M2T2 confidence appears nowhere in cuTAMP's objective, it only ranks
+    # particle initialization, so a low-confidence but well-centered grasp can now win.
+    "grasp_threshold": (("perception", "m2t2", "grasp_threshold"), float),
+    # How many stochastic M2T2 passes are POOLED into one grasp set. This is the strongest lever on
+    # candidate count and, unlike grasp_threshold, it is quality-neutral -- it samples the same
+    # distribution more times rather than lowering the bar. Replayed on the 2026-08-22_02-25-22
+    # scene at grasp_threshold 0.02, three plush toys got 0 / 0 / 0 candidates at the stock 5 passes
+    # and 8 / 3 / 21 at 15. Cost is linear wall-clock: ~0.9 s at 5, ~3.2 s at 20, ~4.7 s at 30.
+    "m2t2_num_runs": (("perception", "m2t2", "num_runs"), int),
+    # Voxel size the scene cloud is downsampled to BEFORE it is handed to M2T2 (it feeds nothing
+    # else -- the object meshes and point clouds are built from the full xyz_map). Uniform voxels
+    # mean a small object collapses to very few points: on the 2026-08-22_02-35-00 scene the three
+    # toys held ~118-141 points each at the stock 0.0075 against the plate's 982, and M2T2 proposed
+    # roughly nothing on them. Halving it to 0.005 raised the toys' grasp count 4.7x (10 -> 47,
+    # mean of 3 calls) for ~0.2 s. Note the gain was uneven -- one toy went 9 -> 44, the other two
+    # stayed near zero -- so this raises the floor, it does not guarantee any given object.
+    "voxel_downsample_size": (("perception", "voxel_downsample_size"), float),
+}
+
+
+def apply_perception_overrides(cfg, overrides: dict | None) -> dict:
+    """Apply cfg/tamp ``tamp_overrides`` perception knobs onto the live tiptop config, in place.
+
+    Returns ``{key: (old, new)}`` for what changed, for logging. Mutating the cached DictConfig is
+    how tiptop already retargets process-wide config (see ``config.as_robot_type``); doing it here,
+    before any perception runs, is what makes the value take effect for the whole session.
+
+    NOTE ON PROVENANCE: ``recording.save_run_outputs`` copies tiptop.yml into the run directory as a
+    raw file, so that copy shows the ON-DISK value, not the override. The effective value is
+    recorded in the run's ``curobo_config.json`` (which carries the raw tamp_overrides dict) and
+    logged at INFO here.
+    """
+    applied = {}
+    for key, (path, cast) in _PERCEPTION_OVERRIDE_KEYS.items():
+        value = (overrides or {}).get(key)
+        if value is None:
+            continue
+        # Cast before comparing: an int knob given 20.0 by JSON must land as 20, not 20.0.
+        value = cast(value)
+        if value <= 0:
+            raise ValueError(f"{key} must be positive, got {value}")
+        node = cfg
+        for part in path[:-1]:
+            node = node[part]
+        # OmegaConf raises on an unknown key in a struct node, which is what we want: a key listed
+        # here but missing from tiptop.yml is a bug in this table, not something to swallow.
+        previous = node.get(path[-1])
+        if previous == value:
+            continue
+        node[path[-1]] = value
+        applied[key] = (previous, value)
+    return applied
 
 
 def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dict:
@@ -291,6 +545,16 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
             "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
             "vae_path": c.get("vae_manifold_cfg", {}).get("checkpoint_path"),
+            # With retiming on, the per-interval durations were trajopt decision variables and every
+            # other retimer was suppressed -- without this the record would be indistinguishable
+            # from a stock run.
+            "vae_retiming": c.get("vae_manifold_cfg", {}).get("retiming", False),
+            "vae_retime_scale": c.get("vae_manifold_cfg", {}).get("retime_scale"),
+            "retiming_suppressed": (
+                ["time_dilation_factor", "optimize_dt", "blending"]
+                if c.get("vae_manifold_cfg", {}).get("retiming", False)
+                else []
+            ),
             "rnd_novelty_weight": c.get("rnd_novelty_cfg", {}).get("weight", 0.0),
             "rnd_novelty_log": c.get("rnd_novelty_cfg", {}).get("use_log", True),
             "joint_density_weight": c.get("joint_density_cfg", {}).get("weight", 0.0),
@@ -313,6 +577,14 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             # planning-time knobs (read by tiptop_gt_plan.py), echoed for a self-describing record.
             "num_particles": ov.get("num_particles"),
             "opt_steps_per_skeleton": ov.get("opt_steps_per_skeleton"),
+            # Transit apex (cuTAMP-side geometry, not a cuRobo cost) -- resolved rather than echoed so
+            # the record shows the guard distance a config that set only the height actually got.
+            "transit_apex_height": resolve_transit_apex(ov)[0],
+            "transit_apex_min_dist": resolve_transit_apex(ov)[1],
+            # Teleop-posture IK branch selection (cuTAMP-side endpoint choice, not a cuRobo cost) --
+            # resolved rather than echoed so the record shows the band/seed count actually used.
+            **resolve_posture_selection(ov),
+            "ik_num_seeds": resolve_ik_num_seeds(ov),
         },
         "plan_overrides": {"enable_finetune_trajopt": False, "time_dilation_factor": time_dilation_factor},
     }
@@ -350,11 +622,21 @@ def get_motion_gen(
         robot_cfg = franka_curobo_cfg()
     elif cfg.robot.type == "ur5":
         robot_cfg = ur5_curobo_cfg()
+    elif cfg.robot.type in YAM_ROBOT_TYPES:
+        robot_cfg = bimanual_yam_curobo_cfg(cfg.robot.type.rsplit("_", 1)[1])
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
     if num_spheres is not None:
-        robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]["attached_object"] = num_spheres
+        extra_spheres = robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]
+        if cfg.robot.type == "bimanual_yam_dual":
+            # The dual config has one attachment slot PER HAND (bimanual_yam_dual.yml:
+            # left_attached_object / right_attached_object), not the single "attached_object" every
+            # other robot (including the single-arm YAM configs) uses -- both need the same budget.
+            extra_spheres["left_attached_object"] = num_spheres
+            extra_spheres["right_attached_object"] = num_spheres
+        else:
+            extra_spheres["attached_object"] = num_spheres
         _log.debug(f"Setting number of spheres for attachments to {num_spheres}")
 
     # Apply UI cuRobo cost overrides by substituting a modified gradient-trajopt config DICT
@@ -451,7 +733,9 @@ def build_curobo_solvers(
         Cuboid(name="table", dims=[0.01, 0.01, 0.01], pose=[99.9, 99.9, 99.9, 1.0, 0.0, 0.0, 0.0]),
     ]
     world_cfg = WorldConfig(cuboid=cuboids)
-    ik_solver = get_ik_solver(world_cfg, num_particles)
+    # Extra IK seeds when a config turns on teleop-posture branch selection: return_seeds cannot
+    # exceed num_seeds and branch diversity thins as they converge. See resolve_ik_num_seeds.
+    ik_solver = get_ik_solver(world_cfg, num_particles, num_seeds=resolve_ik_num_seeds(cost_overrides))
     # use_cuda_graph=False: MotionGen is built with a minimal world (1 placeholder cuboid when
     # include_workspace=False), so update_world() must be able to GROW the collision cache when
     # the real scene (table + surfaces + movables) is loaded. CUDA graphs pin the cache size
@@ -469,8 +753,17 @@ def go_to_q(
     time_dilation_factor: float,
     dist_tol: float = 0.05,
     motion_gen: MotionGen | None = None,
-) -> None:
-    """Move the robot to the target joint positions using motion planning against the workspace."""
+) -> dict | None:
+    """Move the robot to the target joint positions using motion planning against the workspace.
+
+    Returns ``{"positions", "velocities", "dt", "t_start", "t_end"}`` describing the trajectory that
+    was actually executed, or ``None`` when the arm was already at the target and nothing ran.
+
+    A bimanual YAM episode needs that: parking one arm before the other plans is a real commanded
+    motion inside the recorded window, so it has to reach the action channel like any plan segment
+    (``tiptop.yam.capture.segment_from_motion``). Callers that only want the motion can keep
+    ignoring the return value.
+    """
     dof = tiptop_cfg().robot.dof
     if isinstance(q_target, np.ndarray) and (q_target.ndim != 1 or len(q_target) != dof):
         raise ValueError(f"Expected q_target to be a ({dof},) np.ndarray, but got {q_target.shape}")
@@ -495,7 +788,7 @@ def go_to_q(
     dist = torch.norm(q_start - q_target)
     if dist <= dist_tol:
         _log.info(f"Robot already at target joint positions with {dist=:.2f}")
-        return
+        return None
 
     # Motion plan!
     js_start, js_target = JointState.from_position(q_start), JointState.from_position(q_target)
@@ -516,22 +809,122 @@ def go_to_q(
     plan = result.interpolated_plan
     dt = result.interpolation_dt
     timings = [dt] * plan.position.shape[0]
+    # NOTE: do NOT close the client here. `get_robot_client()` is a process-wide cached singleton
+    # (utils.get_bamboo_client is @cache'd) that the warm session holds for the rest of its life --
+    # tiptop_run's container, execute_cutamp_plan's gripper commands, the LeRobot samplers. Closing
+    # it terminated the shared ZMQ context, and only the CONTROL path recovers from that: a control
+    # send hits ZMQError -> _recreate_control_socket -> the terminated context refuses a new socket
+    # -> it rebuilds context + gripper socket. The gripper path (_send_robotiq_command) has no such
+    # recovery, so a gripper call landing before the next control call raised ENOTSOCK. That is why
+    # "return home, then open the gripper" silently failed at the start of every episode.
+    # _sync_entrypoint's finally owns the teardown.
+    positions = plan.position.cpu().numpy()
+    velocities = plan.velocity.cpu().numpy()
+    t_start = time.time()
     result = client.execute_joint_impedance_path(
-        joint_confs=plan.position.cpu().numpy(), joint_vels=plan.velocity.cpu().numpy(), durations=timings
+        joint_confs=positions, joint_vels=velocities, durations=timings
     )
-    client.close()
+    t_end = time.time()
     if not result["success"]:
         raise RuntimeError(f"Failed to execute trajectory on robot. {result['error']}")
     _log.info("Executed trajectory on the robot")
+    return {"positions": positions, "velocities": velocities, "dt": dt, "t_start": t_start, "t_end": t_end}
 
 
-def go_to_home(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> None:
-    """Go to home configuration"""
+def go_to_home(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> dict | None:
+    """Go to home configuration. Returns the executed trajectory (see :func:`go_to_q`)."""
     cfg = tiptop_cfg()
-    go_to_q(q_target=list(cfg.robot.q_home), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+    return go_to_q(q_target=list(cfg.robot.q_home), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
 
 
-def go_to_capture(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> None:
-    """Go to capture configuration"""
+def go_to_capture(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> dict | None:
+    """Go to capture configuration. Returns the executed trajectory (see :func:`go_to_q`)."""
     cfg = tiptop_cfg()
-    go_to_q(q_target=list(cfg.robot.q_capture), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+    return go_to_q(q_target=list(cfg.robot.q_capture), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+
+
+def go_to_dual_q(
+    q_target: Float[np.ndarray, "12"] | list[float],
+    time_dilation_factor: float,
+    dist_tol: float = 0.05,
+    motion_gen: MotionGen | None = None,
+) -> dict | None:
+    """12-DOF analogue of :func:`go_to_q`, for the ``bimanual_yam_dual`` embodiment only.
+
+    Moves BOTH arms to one shared target configuration at once. This is a separate function, not a
+    branch inside ``go_to_q``, because execution genuinely differs: ``YamClient.execute_joint_impedance_path``
+    drives whichever ONE arm ``client.arm`` currently names (meaningless in dual mode, where there is
+    no single active arm -- see ``YamClient.arm``'s docstring), so this goes through
+    ``execute_plan._DualQueuedArm`` instead, the same dual queued-submission path
+    ``execute_cutamp_dual_plan`` uses for a cuTAMP plan's trajectory steps. Planning itself
+    (``motion_gen.plan_single_js``) is unchanged -- it is DOF-agnostic and already works correctly
+    against a 12-DOF ``motion_gen`` built for ``bimanual_yam_dual``.
+    """
+    from tiptop.yam import BIMANUAL_ARM_DOF
+
+    if len(q_target) != BIMANUAL_ARM_DOF:
+        raise ValueError(f"Expected a {BIMANUAL_ARM_DOF}-wide q_target for the dual embodiment, got {len(q_target)}")
+    if not 0 < time_dilation_factor <= 1:
+        raise ValueError(f"time_dilation_factor must be between 0 and 1, but got {time_dilation_factor}")
+
+    client = get_robot_client()
+    if motion_gen is None:
+        world_cfg = WorldConfig(cuboid=list(workspace_cuboids()))
+        motion_gen = get_motion_gen(world_cfg, collision_activation_distance=0.01, warmup_iters=0)
+
+    tensor_args = TensorDeviceType()
+    q_start = tensor_args.to_device(client.get_dual_joint_positions())
+    q_target = tensor_args.to_device(list(q_target))
+
+    dist = torch.norm(q_start - q_target)
+    if dist <= dist_tol:
+        _log.info(f"Both arms already at target joint positions with {dist=:.2f}")
+        return None
+
+    js_start, js_target = JointState.from_position(q_start), JointState.from_position(q_target)
+    plan_config = MotionGenPlanConfig(time_dilation_factor=time_dilation_factor)
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    result = motion_gen.plan_single_js(js_start[None], js_target[None], plan_config)
+    torch.cuda.synchronize()
+    mp_duration = time.perf_counter() - start_time
+    _log.info(f"Dual-arm motion planning took {mp_duration:.2f}s")
+    if not result.success.all():
+        raise MotionPlanningError(
+            f"Could not motion plan both arms to target joint positions. Reason: {result.status}.\n"
+            "You could try moving an arm in 'Programming' mode to more feasible initial joint positions."
+        )
+
+    plan = result.interpolated_plan
+    dt = result.interpolation_dt
+    positions = plan.position.cpu().numpy()
+    velocities = plan.velocity.cpu().numpy()
+
+    from tiptop.execute_plan import ExecutionFailure, _DualQueuedArm
+
+    dual = _DualQueuedArm()
+    if not dual.available:
+        raise ExecutionFailure(
+            "go_to_dual_q requires the arm server's trajectory queue -- there is no blocking "
+            "fallback for driving both arms at once."
+        )
+    t_start = time.time()
+    try:
+        dual.submit(positions, velocities, float(dt))
+        drained = dual.wait_done()
+        if not drained.get("success"):
+            dual.abort()
+            raise RuntimeError(f"Failed to execute dual-arm trajectory on the robot. {drained.get('error')}")
+    finally:
+        dual.close()
+    t_end = time.time()
+    _log.info("Executed dual-arm trajectory on the robot")
+    return {"positions": positions, "velocities": velocities, "dt": dt, "t_start": t_start, "t_end": t_end}
+
+
+def go_to_dual_home(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> dict | None:
+    """Move both arms to home configuration. Returns the executed trajectory (see :func:`go_to_dual_q`)."""
+    cfg = tiptop_cfg()
+    return go_to_dual_q(
+        q_target=list(cfg.robot.q_home), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen
+    )

@@ -1,0 +1,14 @@
+{
+  "254622075770": {
+    "pose": [
+      0.39,
+      -0.055,
+      0.9300,
+      -2.9670597283903604,
+      0.0,
+      -1.5707963267948966
+    ],
+    "timestamp": 1785706584.496672,
+    "source": "sim design pose (droid-sim-evals bimanual_yam.top_camera_cfg) \u2014 NOT a measurement"
+  }
+}
