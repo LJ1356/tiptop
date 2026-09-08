@@ -1432,6 +1432,99 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
     return resolve
 
 
+async def _hitl_task_plan(env, rgb, session) -> tuple[list | None, dict]:
+    """Ask the VLM for this leg's sequence of picks and places, for cuTAMP to VERIFY.
+
+    Returns ``(skeleton, record)``: the plan to hand to ``run_planning`` as its task plan, and what
+    to write into hitl.json about it. ``skeleton`` is None whenever the leg should be planned the way
+    it was planned before this feature existed.
+
+    Called from here, after perception, rather than from inside the goal resolver, because this is
+    the first point at which ``env`` exists -- and the env is what makes the plan checkable. The
+    model's order is validated against ``environment_initial_state(env)`` and ``env.goal_state``, by
+    the very function cuTAMP's reuse door is gated on, INSIDE the reprompt loop: a plan that reaches
+    the wrong surface or stops half way is corrected by the model rather than discovered on the GPU.
+
+    Nothing here raises, for the reason _hitl_goal_resolver gives: an exception out of this branch
+    unwinds past the label prompt, and that label is what ends a handed-off trajectory and merges its
+    legs. A model that cannot be reached is a reason to plan the leg the old way, not to lose the
+    teleoperator's work on the legs before it.
+    """
+    from tiptop.hitl.grounding import to_pil
+    from tiptop.hitl.task_plan import describe_steps, propose_task_plan
+    from tiptop.planning import environment_initial_state, skeleton_reuse_rejection
+
+    record: dict = {"model": _hitl_cfg.task_plan_model}
+    try:
+        initial_state = environment_initial_state(env)
+        # Exactly what create_tamp_environment typed for THIS rollout, so the two lists the model is
+        # offered are the two cuTAMP will ground against. Surfaces are tested first there, so a label
+        # in both sets is a surface only and can never be picked -- which is why these are read off
+        # the env rather than recomputed from the session.
+        movables = sorted(obj.name for obj in env.type_to_objects.get("Movable", []))
+        surfaces = sorted(obj.name for obj in env.type_to_objects.get("Surface", []))
+        plan = await propose_task_plan(
+            image=to_pil(rgb),
+            goal_state=env.goal_state,
+            movables=movables,
+            surfaces=surfaces,
+            descriptions=[phase.description for phase in session.robot_run()],
+            cfg=_hitl_cfg,
+            goal_rejection=lambda skeleton: skeleton_reuse_rejection(skeleton, initial_state, env.goal_state),
+            label=f"robot steps phase {session.index}",
+        )
+    except Exception as exc:
+        # Includes the timeout, a missing GEMINI_API_KEY, and a proposal that never validated in
+        # `max_attempts` tries -- query_json re-raises the last rejection, which is the one worth
+        # recording. Logged with a traceback because this is the audit trail for a leg the feature
+        # did not get to plan.
+        _log.exception("HITL: the VLM could not write a task plan for this leg")
+        record.update({"verdict": "vlm_error", "error": f"{type(exc).__name__}: {exc}"})
+        return None, record
+    record["reasoning"] = plan.reasoning
+    if plan.declined:
+        record.update({"verdict": "vlm_declined", "problem": plan.problem})
+        _log.warning(f"HITL: no task plan for this leg -- {plan.problem}")
+        return None, record
+    record.update({"steps": describe_steps(plan.steps), "skeleton": [op.name for op in plan.skeleton]})
+    return list(plan.skeleton), record
+
+
+def _hitl_task_plan_verdict(plan_out: dict) -> str:
+    """How cuTAMP judged the plan the model wrote.
+
+    Split finely on purpose: "the order was wrong" and "the order was right but this scene admits no
+    grasp for it" are the two things this feature is being measured on, and collapsing them into one
+    bucket loses the only signal that separates a model problem from a world problem.
+
+    Read from ``supplied_plan_failure`` rather than from run_planning's returned reason, because a
+    fallback search that succeeded clears the latter -- the leg then looks like a clean run and the
+    verdict on the model's plan is lost, which is the one thing this feature is measured on.
+    """
+    if plan_out.get("reused"):
+        return "verified"
+    if plan_out.get("rejection"):
+        # skeleton_reuse_rejection refused it inside run_planning. Only reachable when the scene moved
+        # between the check inside the reprompt loop and this one, since they ask the same question.
+        return "rejected_symbolically"
+    # Specific before general: two of cuTAMP's strings carry more than one of these markers.
+    # "Motion planning failed for all skeletons with satisfying particles" and "No satisfying
+    # particles found after optimizing 0/1 plan(s) (time budget 60s exceeded)" both contain
+    # "satisfying particles", so testing that first would file a cuRobo failure and a spent time
+    # budget as "this scene admits no grasp for this order" -- the exact confusion the fine split
+    # exists to prevent.
+    reason = plan_out.get("supplied_plan_failure") or ""
+    if "time budget" in reason:
+        return "timed_out"  # the optimizer ran out of time; the plan was never really judged
+    if "Motion planning failed" in reason:
+        return "no_motion_plan"  # reachable in principle, but the arm cannot get there
+    if "particle initialization" in reason:
+        return "particle_init_failed"
+    if "satisfying particle" in reason:
+        return "no_satisfying_particles"  # no grasp, or no room on the surface, for this order
+    return "no_plan"
+
+
 def _await_human_phase(message: str) -> str:
     """Show the human what to do and block until they say how they did it.
 
@@ -3250,6 +3343,11 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 reuse_skeleton = _reuse_plan_skeleton if resuming_from_handoff else None
                 _reuse_plan_skeleton = None
                 _last_plan_skeleton = None
+                # Kept apart from `reuse_skeleton`, which a VLM-written task plan may replace below.
+                # The "task plan reuse" event this rollout emits is worded for the hand-off ("could
+                # not keep the task plan from before the hand-off"), and firing it about a plan a
+                # model just wrote would put a sentence in the operator's session log that is not true.
+                handoff_skeleton = reuse_skeleton
                 # A resumed rollout continues the SAME trajectory as the leg that handed off; any
                 # other rollout starts a fresh one. Deliberately keyed on continuing_trajectory rather
                 # than on either reset-skip flag: a HITL robot->robot continuation resumes the
@@ -3501,6 +3599,10 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     planning_duration = None
                     failure_reason = None
                     cleared: list[str] = []
+                    # Bound out here, beside the three above, because the HITL bookkeeping below sits
+                    # outside this rollout's try/finally and reads it: with TIPTOP_DRY_RUN set, the
+                    # planning block raises on its first line and never reaches its own assignment.
+                    plan_out: dict = {}
                     if os.environ.get("TIPTOP_DRY_RUN"):
                         _log.info("PATCH: TIPTOP_DRY_RUN=1 -> skipping planning/execute (perception-only)")
                         failure_reason = "dry_run"
@@ -3510,7 +3612,6 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         if os.environ.get("TIPTOP_DRY_RUN"):
                             raise RuntimeError("dry_run skip")
                         _log.info("Running Planning...")
-                        plan_out: dict = {}
                         # An out-of-reach goal object is unplannable, so don't spend a cuTAMP pass
                         # discovering that. Reported as an ordinary planning failure rather than
                         # raised: the rollout keeps going down the "no plan found" path and still
@@ -3550,6 +3651,26 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     "HITL: more phases follow this one, so the plan will stop at the "
                                     "retract instead of driving the arm home"
                                 )
+                            # WHO WRITES THE TASK PLAN. A skeleton kept across a teleop hand-off
+                            # WINS: the operator handed the arm back part-way through a plan that was
+                            # already chosen and partly executed, and a model asked afresh would
+                            # re-author it from a scene it cannot see the history of (the symbolic
+                            # initial state always says the hand is empty and nothing has moved).
+                            vlm_task_plan = None
+                            clear_goal_surfaces = resolve_clear_goal_surfaces(container.cost_overrides)
+                            if (
+                                not clear_goal_surfaces
+                                and reuse_skeleton is None
+                                and hitl_session_now is not None
+                                and _hitl_cfg.vlm_task_plan
+                            ):
+                                reuse_skeleton, vlm_task_plan = await _hitl_task_plan(
+                                    env, observation.frame.rgb, hitl_session_now
+                                )
+                            # cuTAMP is here to VERIFY the plan the model wrote, so it must not
+                            # quietly search for a different one and have that recorded as this
+                            # plan's success. Only in force when there IS a model's plan to verify.
+                            verify_only = vlm_task_plan is not None and not _hitl_cfg.task_plan_fallback
                             # `clear_goal_surfaces` in cfg/tamp tamp_overrides opts into planning the
                             # blockers off the goal surfaces first and concatenating that plan with the
                             # task's, so both run inside this one recorded episode. Off -> exactly the
@@ -3564,7 +3685,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             # does not carry HITL's surface/movable restrictions. No cfg/tamp config
                             # sets clear_goal_surfaces and hitl.enabled together today; this is the
                             # place to wire the rest through if one ever does.
-                            if resolve_clear_goal_surfaces(container.cost_overrides):
+                            if clear_goal_surfaces:
                                 cutamp_plan, planning_duration, failure_reason, cleared = plan_clear_then_task(
                                     config,
                                     processed_scene,
@@ -3576,6 +3697,17 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     cost_overrides=container.cost_overrides,
                                     return_home=plan_return_home,
                                 )
+                            elif reuse_skeleton is None and verify_only:
+                                # Nothing to verify and no fallback: report it as an ordinary
+                                # planning failure so the rollout still reaches the label prompt.
+                                planned = False
+                                cutamp_plan, planning_duration = None, 0.0
+                                failure_reason = (
+                                    f"the VLM wrote no usable task plan for this leg "
+                                    f"({vlm_task_plan.get('problem') or vlm_task_plan.get('error')}) "
+                                    f"and task_plan_fallback is off"
+                                )
+                                _log.error(f"Not planning: {failure_reason}")
                             else:
                                 cutamp_plan, planning_duration, failure_reason = run_planning(
                                     env,
@@ -3590,6 +3722,35 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     reuse_plan_skeleton=reuse_skeleton,
                                     plan_out=plan_out,
                                     return_home=plan_return_home,
+                                    fallback_to_search=not verify_only,
+                                )
+                            if vlm_task_plan is not None:
+                                if "verdict" not in vlm_task_plan:
+                                    vlm_task_plan["verdict"] = _hitl_task_plan_verdict(plan_out)
+                                vlm_task_plan["rejection"] = plan_out.get("rejection")
+                                vlm_task_plan["cutamp_failure_reason"] = plan_out.get("supplied_plan_failure")
+                                vlm_task_plan["fell_back_to_search"] = (
+                                    vlm_task_plan["verdict"] != "verified" and cutamp_plan is not None
+                                )
+                                plan_out["vlm_task_plan"] = vlm_task_plan
+                                steps = ", ".join(vlm_task_plan.get("steps", [])) or "(no plan)"
+                                _emit_event(
+                                    {
+                                        "event": "vlm_task_plan",
+                                        "verdict": vlm_task_plan["verdict"],
+                                        "plan": vlm_task_plan.get("steps", []),
+                                        # `message` is what puts this in the operator's session log:
+                                        # the server mirrors any event carrying one.
+                                        "message": (
+                                            f"the VLM's task plan ({steps}) was "
+                                            f"{vlm_task_plan['verdict'].replace('_', ' ')}"
+                                            + (
+                                                "; planned the task with cuTAMP's own search instead"
+                                                if vlm_task_plan["fell_back_to_search"]
+                                                else ""
+                                            )
+                                        ),
+                                    }
                                 )
                         # Remember this rollout's task plan in case it hands off to teleop, and tell
                         # the UI whether the one we were given was actually reused (run_planning
@@ -3599,16 +3760,16 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # place for the next attempt rather than clearing it.
                         if planned:
                             _last_plan_skeleton = plan_out.get("plan_skeleton")
-                        if reuse_skeleton is not None and planned:
+                        if handoff_skeleton is not None and planned:
                             reused = bool(plan_out.get("reused"))
-                            plan_str = ", ".join(op.name for op in reuse_skeleton)
+                            plan_str = ", ".join(op.name for op in handoff_skeleton)
                             # `message` is what puts this in the operator's session log: the server
                             # mirrors any event carrying one, and has no case for this event itself.
                             _emit_event(
                                 {
                                     "event": "task_plan_reuse",
                                     "reused": reused,
-                                    "plan": [op.name for op in reuse_skeleton],
+                                    "plan": [op.name for op in handoff_skeleton],
                                     "message": (
                                         f"replanned the motion for the task plan from before the hand-off ({plan_str})"
                                         if reused
@@ -3713,6 +3874,21 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             # None, so the last phase of an all-robot plan still falls through to
                             # the label prompt and still ends the session.
                             next_robot_phase = nxt is not None and not nxt.is_human
+                        elif plan_out.get("vlm_task_plan"):
+                            # The leg did not run to completion, but a model wrote a plan for it and
+                            # cuTAMP judged that plan -- which is the data point this feature exists
+                            # to collect, and which nothing else records: the branch above is the
+                            # only other writer and it never runs for a leg that plans nothing.
+                            #
+                            # Reached two ways. Usually the plan was not verified and no fallback
+                            # search rescued it. Sometimes it WAS verified and the arm was taken for
+                            # teleop part-way through; recording it here is what keeps that verdict
+                            # when the operator ends the trajectory rather than handing back.
+                            #
+                            # No advance either way: the phase is only done when a plan for it ran to
+                            # the end, and a resumed leg re-plans and re-records it (see
+                            # HITLSession.record_tamp_plan on what survives that).
+                            hitl_session.record_tamp_plan(hitl_session.index, plan_out)
                         hitl_state["human"] = human_phase
                         if human_phase is not None:
                             handoff_pending = True

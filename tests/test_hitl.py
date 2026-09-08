@@ -731,6 +731,105 @@ def test_config_defaults_to_off_and_rejects_typos():
         resolve_hitl_config([1, 2])
 
 
+class _Op:
+    """A stand-in for a cuTAMP ground operator: record_tamp_plan only ever reads its name."""
+
+    def __init__(self, name):
+        self.name = name
+
+
+def _verified(steps=("pick(blue_toy)", "place(blue_toy, table)")):
+    """What tiptop_run puts in plan_out when cuTAMP verified the model's own plan."""
+    return {
+        "plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")],
+        "reused": True,
+        "vlm_task_plan": {"verdict": "verified", "steps": list(steps), "reasoning": "because"},
+    }
+
+
+def test_a_verified_task_plan_is_credited_to_the_model_in_the_record():
+    session = _session()  # robot, human, robot
+    session.record_tamp_plan(0, _verified())
+    record = session.to_json()
+    assert record["phases"][0]["vlm_task_plan"]["verdict"] == "verified"
+    assert "sequence of picks and places" in record["phases"][0]["planned_by"]
+    assert record["provenance"]["robot_phases"].startswith("vlm --")
+
+
+def test_a_leg_the_model_did_not_plan_is_not_credited_to_it():
+    # The case the audit trail exists for: task_plan_fallback let cuTAMP's search rescue a leg whose
+    # plan the model got wrong. Saying "vlm" at the top of the file would describe that leg falsely.
+    session = _session()
+    session.record_tamp_plan(0, _verified())
+    session.index = 2
+    session.record_tamp_plan(2, {
+        "plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": False,
+        "vlm_task_plan": {"verdict": "no_satisfying_particles", "steps": ["pick(blue_toy)"]},
+    })
+    record = session.to_json()
+    provenance = record["provenance"]["robot_phases"]
+    assert provenance.startswith("mixed --") and "phase(s) 0" in provenance and "phase(s) 2" in provenance
+    assert "sequence of picks and places" in record["phases"][0]["planned_by"]
+    assert record["phases"][2]["planned_by"] == "vlm (order and sub-goal); cuTAMP (how)"
+
+
+def test_a_task_planned_entirely_by_the_search_reads_exactly_as_it_did_before():
+    session = _session()
+    session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": False})
+    assert session.to_json()["provenance"]["robot_phases"].startswith("cuTAMP --")
+
+
+def test_a_leg_that_found_no_plan_at_all_is_credited_to_neither():
+    # It is recorded (it is the outcome the feature is measured on) but nothing ran, so saying either
+    # "the model wrote the sequence that ran" or "cuTAMP's search wrote it" would be false.
+    session = _session()
+    session.record_tamp_plan(0, {
+        "plan_skeleton": [], "reused": False,
+        "vlm_task_plan": {"verdict": "no_satisfying_particles", "steps": ["pick(blue_toy)"]},
+    })
+    record = session.to_json()
+    assert record["phases"][0]["vlm_task_plan"]["verdict"] == "no_satisfying_particles"
+    assert record["provenance"]["robot_phases"].startswith("cuTAMP --")
+
+
+def test_a_leg_resumed_after_a_hand_off_keeps_the_model_s_authorship():
+    # The interrupted leg records what it had; the leg that resumes it is deliberately NOT asked for a
+    # task plan (it re-solves the one it was handed), so its plan_out names no author. Replacing the
+    # record outright would credit cuTAMP's search with the plan the model wrote and the arm ran.
+    session = _session()
+    skeleton = [_Op("Pick(blue_toy, grasp1, q1)")]
+    session.record_tamp_plan(0, {"plan_skeleton": skeleton, "reused": True, "vlm_task_plan":
+                                 {"verdict": "verified", "steps": ["pick(blue_toy)"]}})
+    session.record_tamp_plan(0, {"plan_skeleton": skeleton, "reused": True})  # the resumed leg
+    record = session.to_json()
+    assert record["phases"][0]["vlm_task_plan"]["verdict"] == "verified"
+    assert record["provenance"]["robot_phases"].startswith("vlm --")
+
+
+def test_a_resumed_leg_that_fell_back_to_a_search_is_not_credited_to_the_model():
+    # The other half of the same rule: the resumed leg's skeleton was refused and cuTAMP searched for
+    # a different one, so what ran is cuTAMP's plan and the model must not be credited with it.
+    session = _session()
+    session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": True,
+                                 "vlm_task_plan": {"verdict": "verified", "steps": ["pick(blue_toy)"]}})
+    session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(white_box, grasp1, q1)")], "reused": False})
+    record = session.to_json()
+    assert "vlm_task_plan" not in record["phases"][0]
+    assert record["provenance"]["robot_phases"].startswith("cuTAMP --")
+
+
+def test_a_robot_leg_s_task_plan_is_the_vlm_s_by_default_with_the_search_as_the_net():
+    # The feature this config block turns on: the VLM writes the picks and places and cuTAMP verifies
+    # them. The fallback is on with it, so a model that cannot be reached costs the run a search, not
+    # the teleoperator's work on the legs before this one.
+    cfg = resolve_hitl_config({"enabled": True})
+    assert cfg.vlm_task_plan is True and cfg.task_plan_fallback is True
+    assert cfg.task_plan_timeout_s > 0
+    assert resolve_hitl_config({"enabled": True, "vlm_task_plan": False}).vlm_task_plan is False
+    with pytest.raises(ValueError, match="unknown hitl config key"):
+        resolve_hitl_config({"enabled": True, "vlm_task_plans": True})
+
+
 def test_the_shipped_hitl_configs_resolve():
     # The configs this feature ships with; their hitl blocks have to survive resolve_hitl_config or
     # the run turns the feature off without saying so.
