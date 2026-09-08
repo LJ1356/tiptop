@@ -393,6 +393,70 @@ def resolve_require_m2t2_grasps(overrides: dict | None) -> bool:
     return bool((overrides or {}).get("require_m2t2_grasps"))
 
 
+def resolve_placement_support(overrides: dict | None) -> dict:
+    """cuTAMP placement-region settings from a cfg/tamp yml's ``tamp_overrides``.
+
+    Off by default, in which case the placement region is the surface's oriented bounding box and an
+    object's bottom goes at the box's TOP -- the highest vertex of the surface's convex hull. That is
+    right for a slab and wrong for anything with structure: for an open box it is the top of the
+    folded-back lid, for a plate it is the rim rather than the dish. Run
+    ``failure/2026-09-07_13-39-40`` released the bread at z = 0.196, a hand's width above the tray
+    and out over the box's far wall, and it fell.
+
+    ``placement_support: true`` switches to a region fitted to the surface's observed points: the
+    places a flat-bottomed object of THIS object's footprint would come to rest with support all
+    around it, at that resting height (see cutamp/utils/support.py). It brings two more knobs, and
+    turns on the container-collision exemption that placing INSIDE anything needs:
+
+    ``placement_support_margin``   surface the object must keep around it, on top of its own
+                                   footprint. This is the "the surface is bigger than the object"
+                                   clearance. Metres, default 0.01.
+    ``placement_flatness_tol``     how much the surface under an object may vary and still count as
+                                   one level patch. Metres, default 0.008. This absorbs stereo noise
+                                   as well as real relief, so a noisy reconstruction needs it raised
+                                   -- measured on the 2026-09-07_14-56-40 box, the tray floor came
+                                   back with a 1.7 cm spread over a 7 cm window, and nothing on it
+                                   qualified until this reached ~0.012. Raise it knowingly: it is
+                                   also how much genuine slope a placement may sit on.
+    ``placement_support_required`` what happens when NOWHERE on a surface would hold the object.
+                                   True (default) fails the plan with that as the reason, which is
+                                   what turns the bread's fall into a clean failure the operator is
+                                   asked about. False falls back to the bounding box and logs.
+    ``placement_fill_occluded``    whether the unobserved cells enclosed by a surface's own outline
+                                   count as floor. A camera looking ACROSS a container cannot see
+                                   its floor -- on the 2026-09-07_14-56-40 box only a 3.5 cm strip of
+                                   a ~10 cm tray came back, so every placement in it "rested" on the
+                                   lid and the phase never planned. Off by default: this is the one
+                                   setting that places an object onto surface the robot never saw.
+                                   ``placement_min_seen_frac`` (default 0.25) is the guard -- that
+                                   much of every footprint must be genuinely observed.
+    ``placement_into_surface``     whether a placed object may overlap the surface it was placed on
+                                   in the collision cost. Perception reconstructs an open container
+                                   as a filled convex hull, so without this nothing can be placed in
+                                   a box or in the dish of a plate at all. Defaults to on with
+                                   ``placement_support``, which is what keeps the object on real
+                                   geometry once the container stops rejecting it; setting it false
+                                   restricts placements to surfaces the object can sit on TOP of.
+
+    Off by default so existing configs keep their planning outcomes. Opt in per task.
+    """
+    overrides = overrides or {}
+    if not overrides.get("placement_support"):
+        return {}
+    return {
+        "placement_check": "support",
+        # The support region applies placement_support_margin against the object's real footprint;
+        # cuTAMP rejects the two together (see validate_tamp_config).
+        "placement_shrink_dist": None,
+        "support_margin": float(overrides.get("placement_support_margin", 0.01)),
+        "support_flatness_tol": float(overrides.get("placement_flatness_tol", 0.008)),
+        "placement_support_required": bool(overrides.get("placement_support_required", True)),
+        "placement_ignores_target_surface": bool(overrides.get("placement_into_surface", True)),
+        "support_fill_occluded": bool(overrides.get("placement_fill_occluded", False)),
+        "support_min_seen_frac": float(overrides.get("placement_min_seen_frac", 0.25)),
+    }
+
+
 def resolve_ik_num_seeds(overrides: dict | None) -> int | None:
     """How many seeds the IKSolver optimizes per problem.
 

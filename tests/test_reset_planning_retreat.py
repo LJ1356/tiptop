@@ -36,6 +36,9 @@ class _Scene:
             "pink_toy": _mesh("pink_toy", (0.50, 0.05, 0.06)),
         }
         self.grasps = {label: {"poses": [None] * n} for label, n in grasp_counts.items()}
+        # No observed points: every surface then falls back to the bounding-box placement region,
+        # which is what these meshes-only fixtures describe anyway.
+        self.object_support_points = {}
 
 
 class _Container:

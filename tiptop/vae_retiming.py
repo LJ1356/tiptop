@@ -65,7 +65,7 @@ WHAT IS DELIBERATELY ABSENT (each was in an earlier version, each was ablated ou
 The graph is two parameters, one sampler, one mask and two loss terms. Removing the following
 made the score BETTER on both test plans, not merely equal, so do not reintroduce them:
 
-* An in-loop velocity/acceleration hinge. ``_emit``'s hard check already decides feasibility.
+* An in-loop velocity/acceleration hinge. ``_emit_raw``'s hard check already decides feasibility.
 * A sigmoid mask taper. ``clamp(span - i, 0, 1)`` scores better and drops a width constant.
 * Boundary speeds measured at the executor timestep, which needed a ``dt / duration`` branch and a
   second progress convention. One 15 Hz frame in from each end is as good.
@@ -108,7 +108,7 @@ _KNOTS = 64
 #:    2.5   6.54 / 22.11    1/16          0.005
 #:    4.0  74.1  / 433      0/16          0.0007   (every start infeasible)
 #: Past ~1.5 the softmax starves an interval toward zero time, which is an unbounded acceleration
-#: that _emit then throws away. Dropping the tanh entirely (unbounded softmax logits) gives
+#: that _emit_raw then throws away. Dropping the tanh entirely (unbounded softmax logits) gives
 #: 6.31 / 13.29 at 5/16 -- worse than 1.0 on both plans, so the rail is not merely a safety net.
 _RAIL = 1.0
 
@@ -157,7 +157,7 @@ _N_STARTS = 16
 #:    band   @ 0.10    7 frames < 0.10 rad/s, longest run 5             junction acc 1.16x limit
 #: So the VALUE is the whole fix. Replacing the target with a floor (or a [floor, 3x floor] band) was
 #: tried and rejected: it does not reduce the stall further, and the extra end speed it permits pushes
-#: the reversal's acceleration -- which spans TWO strokes and is therefore invisible to _emit's
+#: the reversal's acceleration -- which spans TWO strokes and is therefore invisible to _emit_raw's
 #: per-stroke cap check -- past the FR3's 15 rad/s^2 at two of six junctions. 0.10 already sits at
 #: 0.91x, so it is close to the ceiling: raising `blend_boundary_speed` further trades a stall the
 #: robot can track for a commanded reversal it cannot.
@@ -182,6 +182,11 @@ _VAE_RATE_HZ = 15.0
 # mean target, 0.350 sampled with no guard, but only 0.207 when the 2 cap-failing strokes dropped
 # straight to the mean. Shrinking keeps those strokes sampled, just less far out.
 _TARGET_SCALES = (1.0, 0.6, 0.3, 0.0)
+
+#: Passes _stretch_to_caps gets to slow a stroke into the caps. Each pass divides the overshoot by
+#: roughly itself, so this is many more than the two or three it takes; it exists only so a pathology
+#: (a caps array with a zero in it, say) terminates instead of looping.
+_STRETCH_TRIES = 12
 
 
 class _Scorer:
@@ -390,13 +395,18 @@ def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target=None)
     return [(float(spans[b] / _VAE_RATE_HZ), tau[b : b + 1].detach()) for b in range(_N_STARTS)]
 
 
-def _emit(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
-    """Resample one optimized stroke at the control timestep. Returns (pos, vel, acc) or None if the
-    EMITTED signal violates the caps.
+def _emit_raw(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
+    """Resample one optimized stroke at the control timestep. -> (pos, vel, acc, over).
 
-    This check is the ONLY thing enforcing the robot's limits. An in-loop hinge was tried and
-    removed: it scored strictly worse (6.62 -> 6.34 and 13.12 -> 12.37 total maha^2 without it) and
-    changed how many starts survive this test by less than one.
+    ``over`` is the factor the DURATION would have to grow by for this stroke to fit inside the caps;
+    <= 1 means it already does. The geometry is fixed and only the clock changes, so spreading the
+    same path over ``k`` times the wall-clock divides velocity by ``k`` and acceleration by ``k^2`` --
+    hence ``max(v/v_cap, sqrt(a/a_cap))``, and hence a long enough duration ALWAYS exists. See
+    :func:`_stretch_to_caps`, which is what makes that guarantee good.
+
+    This is the ONLY thing enforcing the robot's limits. An in-loop hinge was tried and removed: it
+    scored strictly worse (6.62 -> 6.34 and 13.12 -> 12.37 total maha^2 without it) and changed how
+    many starts survive this test by less than one.
     """
     n_out = max(3, int(round(duration / dt)) + 1)
     dt_out = duration / (n_out - 1)
@@ -405,9 +415,37 @@ def _emit(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
         pos = _sample(q_knots, tau, frac)[0].cpu().numpy().astype(np.float64)
     vel = np.gradient(pos, dt_out, axis=0)
     acc = np.gradient(vel, dt_out, axis=0)
-    if (np.abs(vel) > vel_cap_np).any() or (np.abs(acc) > acc_cap_np).any():
-        return None
-    return pos, vel, acc
+    over = max(
+        float(np.max(np.abs(vel) / vel_cap_np)),
+        float(np.sqrt(np.max(np.abs(acc) / acc_cap_np))),
+    )
+    return pos, vel, acc, over
+
+
+def _stretch_to_caps(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
+    """Slow one candidate stroke down until it fits inside the caps. -> (pos, vel, acc, duration).
+
+    The last resort when no duration inside the searched range produced an admissible stroke -- an
+    optimizer that lands on a peaked time-warp can want a dash the robot cannot make in twice the
+    planner's wall-clock. Resampling makes ``over`` only approximately the exact scale factor (the
+    frame count changes with the duration), so this iterates on the measured value rather than
+    trusting one step of it; each pass overshoots by 2% so it converges from above rather than
+    creeping up on the cap. Two or three passes in practice.
+
+    Returning a slow stroke matters more than it looks: the alternative is an exception, and
+    ``blend_cutamp_plan`` answers an exception by passing that operation's ORIGINAL cuRobo segments
+    through at the plan's time-dilation factor -- untouched by any of these caps, and by far the most
+    aggressive motion in the episode.
+    """
+    for _ in range(_STRETCH_TRIES):
+        pos, vel, acc, over = _emit_raw(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np)
+        if over <= 1.0:
+            return pos, vel, acc, duration
+        duration *= over * 1.02
+    raise RuntimeError(
+        f"VAE re-timing could not fit a stroke inside the velocity/acceleration caps even at "
+        f"{duration:.2f}s over {_STRETCH_TRIES} passes (last overshoot {over:.2f}x)"
+    )
 
 
 def vae_retime_group(
@@ -476,28 +514,43 @@ def vae_retime_group(
     # None (the default) reproduces the original mode-seeking objective exactly.
     #
     # A sampled target can ask for a stroke no admissible clock realizes -- it is a draw from the
-    # human cluster, not a feasibility statement, and _emit rejects anything past the robot's caps
+    # human cluster, not a feasibility statement, and _emit_raw rejects anything past the robot's caps
     # (measured 1 stroke in 10 at _TARGET_SCALE 1.0). Falling back to the mean target is strictly
     # better than losing the plan: that stroke keeps the old, over-typical timing while every other
     # stroke keeps its sampled one.
     def _best_for(target):
+        """-> (best admissible candidate or None, cheapest candidate to SLOW into the caps).
+
+        The second is the material for the fallback below, and is tracked here because it is only
+        available where the optimizer's candidates are: ranked by ``duration * over``, the wall-clock
+        each one would end up at once slowed, so the fallback stretches the candidate that needs the
+        least stretching rather than whichever happened to come last.
+        """
         best = None
+        relax = None
         for duration, tau in _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target):
-            emitted = _emit(q_knots, tau, duration, dt, np.abs(vel_cap), np.abs(acc_cap))
-            if emitted is None:
+            pos, vel, acc, over = _emit_raw(q_knots, tau, duration, dt, np.abs(vel_cap), np.abs(acc_cap))
+            if over > 1.0:
+                stretched = duration * over
+                if relax is None or stretched < relax[0]:
+                    relax = (stretched, duration, tau)
                 continue
             # Ranked against the SAME target the optimizer used. Ranking by distance to the cluster
             # mean instead would re-select the most typical candidate and undo the sampling entirely.
-            m2 = scorer.score_emitted(emitted[0], duration, target)
+            m2 = scorer.score_emitted(pos, duration, target)
             if best is None or m2 < best[0]:
-                best = (m2, duration, emitted)
-        return best
+                best = (m2, duration, (pos, vel, acc))
+        return best, relax
 
     scales = _TARGET_SCALES if sample_target else (0.0,)
-    best, target = None, None
+    best, relax, target = None, None, None
     for scale in scales:
         target = target_latent(scorer, knots_np, sample_target, scale)
-        best = _best_for(target)
+        best, scale_relax = _best_for(target)
+        # Keep the cheapest stretch seen across scales; the last scale is the mean target, whose
+        # candidates are the most typical, so its relax is normally also the mildest.
+        if scale_relax is not None and (relax is None or scale_relax[0] < relax[0]):
+            relax = scale_relax
         if best is not None:
             if scale not in (scales[0], 0.0):
                 _log.info("VAE re-timing: sampled target shrunk to %.1fx to meet the caps", scale)
@@ -506,10 +559,30 @@ def vae_retime_group(
             _log.debug("VAE re-timing: target scale %.1f had no admissible clock; shrinking", scale)
 
     if best is None:
-        raise RuntimeError(
-            f"VAE re-timing found no duration in [{d_lo:.2f}, {d_hi:.2f}]s that meets the velocity/"
-            f"acceleration caps for this stroke"
+        # No clock inside [d_lo, d_hi] fits the caps. Slow the mildest candidate past d_hi until it
+        # does, rather than raising: an exception here is not "no re-timing", it is
+        # blend_cutamp_plan falling back to this operation's raw cuRobo segments at the plan's
+        # time-dilation factor -- the fastest motion in the episode, and the one nothing has checked
+        # against the caps. A stroke slower than max_duration_mult asked for is the lesser cost, and
+        # it is announced loudly enough to be tuned (raise blend_max_duration_mult, or the slacks).
+        if relax is None:
+            raise RuntimeError(
+                f"VAE re-timing produced no candidate clock at all in [{d_lo:.2f}, {d_hi:.2f}]s"
+            )
+        _, duration, tau = relax
+        out_pos, out_vel, out_acc, duration = _stretch_to_caps(
+            q_knots, tau, duration, dt, np.abs(vel_cap), np.abs(acc_cap)
         )
+        _log.warning(
+            "VAE re-timing found no clock in [%.2f, %.2f]s within the velocity/acceleration caps; "
+            "slowed this stroke to %.2fs (%.1fx the planner's %.2fs) to stay inside them. Raise "
+            "blend_max_duration_mult above %.1f if strokes like this should be searched, not slowed.",
+            d_lo, d_hi, duration, duration / max(orig_duration, 1e-6), orig_duration, max_duration_mult,
+        )
+        from tiptop.trajectory_blending import _finish_stroke
+
+        return _finish_stroke(out_pos, out_vel, out_acc, duration, lead_speed, trail_speed)
+
     m2, duration, (out_pos, out_vel, out_acc) = best
     _log.debug(
         "VAE stroke re-timing: %.2f s -> %.2f s (%s %.2f, %d waypoints, %.1f s to fit)",

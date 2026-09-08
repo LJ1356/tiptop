@@ -706,6 +706,68 @@ def _blend_trajectory_steps(
     return {"type": "trajectory", "plan": plan, "dt": dt_out, "label": steps[0]["label"]}
 
 
+def _slow_to_caps(
+    steps: list[dict],
+    config: BlendConfig,
+    vel_limit: np.ndarray | None,
+    acc_limit: np.ndarray | None,
+) -> list[dict]:
+    """The run's ORIGINAL segments, time-scaled if they exceed the velocity/acceleration caps.
+
+    The passthrough taken when blending a run fails. Passing the segments through as they are hands
+    the robot this operation at the plan's time-dilation factor while every blended operation around
+    it obeys these caps -- so the one motion nothing could re-time is also the fastest in the
+    episode. Scaling the clock by ``max(v/v_cap, sqrt(a/a_cap))`` costs the same segments a slower
+    run and nothing else: geometry, waypoints and collision status are untouched, and each step's
+    velocity/acceleration are divided by the matching power of the scale so the controller is handed
+    a consistent profile (see execute_plan: ``dt`` is the per-waypoint duration).
+
+    A no-op when the segments already fit, which is the common case -- cuRobo plans inside the
+    robot's limits, and this only bites where the plan's dilation factor or the configured slacks put
+    the caps below what it produced.
+    """
+    from curobo.types.state import JointState  # lazy: keep the module importable without cuRobo
+
+    dt = float(steps[0]["dt"])
+    velocity = np.concatenate(
+        [s["plan"].velocity.detach().cpu().numpy().astype(np.float64) for s in steps], axis=0
+    )
+    vel_cap, acc_cap = _resolve_caps(
+        velocity, dt, vel_limit, acc_limit, config.vel_slack, config.acc_slack
+    )
+    acceleration = np.gradient(velocity, dt, axis=0) if len(velocity) > 2 else np.zeros_like(velocity)
+    scale = max(
+        float(np.max(np.abs(velocity) / vel_cap)),
+        float(np.sqrt(np.max(np.abs(acceleration) / acc_cap))),
+    )
+    if scale <= 1.0:
+        return steps
+
+    scale *= 1.02  # land just inside the caps rather than exactly on them
+    _log.warning(
+        "Unblended segments exceed the velocity/acceleration caps by %.2fx; slowing them %.2fx "
+        "(dt %.4f -> %.4f) rather than executing them at the plan's original timing.",
+        scale / 1.02, scale, dt, dt * scale,
+    )
+    slowed = []
+    for step in steps:
+        plan = step["plan"]
+        slowed.append(
+            {
+                **step,
+                "dt": float(step["dt"]) * scale,
+                "plan": JointState(
+                    position=plan.position,
+                    velocity=plan.velocity / scale,
+                    acceleration=plan.acceleration / scale**2,
+                    jerk=plan.jerk / scale**3 if plan.jerk is not None else None,
+                    joint_names=plan.joint_names,
+                ),
+            }
+        )
+    return slowed
+
+
 def blend_cutamp_plan(
     cutamp_plan: list[dict],
     config: BlendConfig,
@@ -753,9 +815,15 @@ def blend_cutamp_plan(
             stats["blended"] += 1
         except Exception:
             # Best-effort: on any numerical/shape surprise, keep the original segments for this run
-            # rather than failing the whole plan.
+            # rather than failing the whole plan -- but slowed into the same caps the blended strokes
+            # obey, so the one operation that could not be re-timed is not also the fastest thing the
+            # robot does in the episode. See _slow_to_caps.
             _log.exception("Trajectory blending failed for a segment run; keeping original segments")
-            out.extend(run)
+            try:
+                out.extend(_slow_to_caps(run, config, vel_limit, acc_limit))
+            except Exception:
+                _log.exception("Could not cap the unblended segments either; passing them through")
+                out.extend(run)
         run.clear()
 
     for idx, step in enumerate(cutamp_plan):

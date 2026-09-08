@@ -59,6 +59,7 @@ from tiptop.motion_planning import (
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
     resolve_posture_selection,
+    resolve_placement_support,
     resolve_require_m2t2_grasps,
     resolve_time_dilation_factor,
     resolve_trace_cfg,
@@ -659,6 +660,10 @@ class ProcessedScene:
     object_meshes: dict[str, Mesh]
     object_pcds: dict[str, o3d.geometry.PointCloud]
     grasps: dict[str, dict]  # Label -> grasp data with tensor versions
+    # Label -> (N, 3) world-frame points exactly as observed, before the near-table filter and
+    # before augment_with_base_projections. cuTAMP fits placement support regions to these; see
+    # segment_pointcloud_by_masks and TAMPEnvironment.support_points.
+    object_support_points: dict[str, np.ndarray]
 
 
 def perception_camera(container: _DemoContainer) -> Camera:
@@ -1692,6 +1697,7 @@ def create_tamp_environment(
     surface_labels: set[str] | None = None,
     extra_surface_labels: set[str] | None = None,
     movable_labels: set[str] | None = None,
+    support_points: dict[str, np.ndarray] | None = None,
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
     """Build the cuTAMP environment and goal for one rollout.
 
@@ -1719,6 +1725,10 @@ def create_tamp_environment(
     screwdriver up and one of them placed it on the tower. Anything excluded is still perceived and
     still collision-checked; it just moves from Movable into ``statics``, so the arm routes around it
     instead of grasping it.
+
+    ``support_points`` maps a label to its raw observed points, and is attached to the environment
+    for the SURFACES only. cuTAMP fits its placement support region to them when
+    ``placement_check="support"``; a surface missing from the map keeps the bounding-box region.
     """
     # Reject goals that reference objects not present in the perceived scene.
     # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
@@ -1824,6 +1834,13 @@ def create_tamp_environment(
     # is excluded because it is not
     # a reconstruction: segment_table_with_ransac already sinks it TABLE_BOX_CLEARANCE below the
     # detected plane for exactly this reason.
+    #
+    # Surfaces also carry their raw observed points, which is what cuTAMP fits a placement support
+    # region to under placement_check="support" -- the largest level patch big enough for the object,
+    # at that patch's own height, instead of the whole hull footprint at the hull's highest vertex.
+    # Only the DETECTED surfaces: the table is a RANSAC plane, already a slab, and its cuboid is
+    # deliberately not where its top face is (see TABLE_PLACEMENT_RAISE above), so a support fit over
+    # the table's points would fight that adjustment. Surfaces absent here fall back to the box.
     env = TAMPEnvironment(
         name="tiptop_cutamp",
         movables=movables,
@@ -1831,6 +1848,11 @@ def create_tamp_environment(
         pick_transparent=[surface.name for surface in surfaces],
         type_to_objects={"Movable": movables, "Surface": all_surfaces},
         goal_state=frozenset(goal_state),
+        support_points={
+            surface.name: support_points[surface.name]
+            for surface in surfaces
+            if support_points and surface.name in support_points
+        },
     )
     _log.info(
         f"Created TAMP environment with {len(movables)} movables, {len(all_surfaces)} surfaces"
@@ -1871,7 +1893,7 @@ def process_scene_geometry(
     # For filtering to table plane height
     config = TAMPConfiguration()
     table_top_z = table_trimesh.bounds[1, 2] + config.world_activation_distance + config.coll_sphere_radius * 2
-    object_trimeshes, object_pcds_computed = segment_pointcloud_by_masks(
+    object_trimeshes, object_pcds_computed, object_support_points = segment_pointcloud_by_masks(
         xyz_map,
         rgb_map,
         masks,
@@ -2010,6 +2032,7 @@ def process_scene_geometry(
         object_meshes=object_meshes,
         object_pcds=object_pcds,
         grasps=filtered_grasps,
+        object_support_points=object_support_points,
     )
 
 
@@ -2207,6 +2230,7 @@ async def run_perception(
         surface_labels=surface_labels,
         extra_surface_labels=extra_surface_labels,
         movable_labels=movable_labels,
+        support_points=processed_scene.object_support_points,
     )
     _log.info(f"Processing scene and perception results took {time.perf_counter() - proc_st:.2f}s")
     _log.info(f"Perception pipeline completed, took {time.perf_counter() - start_time:.2f}s")
@@ -2286,7 +2310,10 @@ def plan_clear_then_task(
 
     if not blockers:
         _log.info("No goal surface is blocked; planning the task directly")
-        env, all_surfaces = create_tamp_environment(meshes, table, detected_atoms, include_workspace=True)
+        env, all_surfaces = create_tamp_environment(
+            meshes, table, detected_atoms, include_workspace=True,
+            support_points=processed_scene.object_support_points,
+        )
         plan, duration, failure = _plan(
             env, all_surfaces, q_init, "cutamp", processed_scene.grasps, plan_return_home=return_home
         )
@@ -2294,7 +2321,12 @@ def plan_clear_then_task(
 
     _log.info(f"Goal surfaces are blocked by {blockers}; planning the clearing first, then the task")
     env, all_surfaces = create_tamp_environment(
-        meshes, table, clearing_atoms, include_workspace=True, extra_surface_labels=goal_surfaces
+        meshes,
+        table,
+        clearing_atoms,
+        include_workspace=True,
+        extra_surface_labels=goal_surfaces,
+        support_points=processed_scene.object_support_points,
     )
     clear_plan, clear_duration, failure = _plan(
         env, all_surfaces, q_init, "cutamp_clearing", processed_scene.grasps
@@ -2330,7 +2362,10 @@ def plan_clear_then_task(
     for label in placed:
         if label in task_grasps:
             task_grasps[label] = {**task_grasps[label], "grasps_obj": [], "confidences_pt": []}
-    env, all_surfaces = create_tamp_environment(moved, table, detected_atoms, include_workspace=True)
+    env, all_surfaces = create_tamp_environment(
+        moved, table, detected_atoms, include_workspace=True,
+        support_points=processed_scene.object_support_points,
+    )
     # q_return: the task plan STARTS from where the clearing handed over, so its own notion of
     # "initial" is that mid-episode pose -- without this the episode would end by driving back to
     # where the blocker was set down instead of to the pose it began at.
@@ -2398,6 +2433,7 @@ def _plan_largest_solvable_reset(
                 atoms,
                 include_workspace=True,
                 extra_surface_labels=surfaces,
+                support_points=processed_scene.object_support_points,
             )
         cutamp_plan, _, failure_reason = run_planning(
             env,
@@ -4029,6 +4065,9 @@ def _sync_entrypoint(
             # perception proposed nothing for (off unless the cfg sets it). See
             # resolve_require_m2t2_grasps.
             require_m2t2_grasps=resolve_require_m2t2_grasps(cost_overrides),
+            # Placement region: the surface's bounding box unless the cfg sets
+            # `placement_support: true`. See resolve_placement_support.
+            placement=resolve_placement_support(cost_overrides),
         )
         for robot_type in _planning_robot_types()
     }

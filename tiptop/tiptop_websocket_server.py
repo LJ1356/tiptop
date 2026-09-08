@@ -38,6 +38,7 @@ from tiptop.motion_planning import (
     resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
+    resolve_placement_support,
     resolve_posture_selection,
     resolve_time_dilation_factor,
     resolve_traj_length_norm,
@@ -158,6 +159,9 @@ class TiptopPlanningServer:
             # IK branch selection by teleop posture (off unless the cfg sets
             # posture_selection_seeds). See resolve_posture_selection.
             posture_selection=_posture_selection,
+            # Placement region: the surface's bounding box unless the cfg sets
+            # `placement_support: true`. See resolve_placement_support.
+            placement=resolve_placement_support(self._curobo_overrides),
             q_home=self._cfg.robot.q_home,
         )
         self._output_dir = Path("tiptop_server_outputs")
