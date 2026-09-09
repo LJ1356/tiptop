@@ -29,6 +29,7 @@ from tiptop.hitl.planning import (
     initial_state_for,
     phase_objects,
 )
+from tiptop.hitl.planners import Leg, planner_for, robot_planner, teleop_planner
 from tiptop.hitl.proposal import propose_plan
 from tiptop.hitl.structs import Phase, TaskSpecification, describe_atom
 
@@ -43,36 +44,6 @@ def _next_session_tag() -> int:
     global _session_counter
     _session_counter += 1
     return _session_counter
-
-
-_VLM_PROVENANCE = (
-    "the model wrote the sequence of picks and places from the workspace image and cuTAMP VERIFIED "
-    "it against a fresh perception pass rather than searching for one of its own, so vlm_task_plan "
-    "is what it wrote and cutamp_skeleton is that same plan as operators"
-)
-_SEARCH_PROVENANCE = (
-    "each phase is planned from its tamp_goal against a fresh perception pass, so cutamp_skeleton "
-    "is what ran"
-)
-
-
-def _robot_phase_provenance(verified: Sequence[int], searched: Sequence[int]) -> str:
-    """Who wrote the task plan each robot phase ran, over the phases that have run.
-
-    Three-way rather than a single ``any``: a task where the model's plan was verified on one leg and
-    rejected on the next -- with ``task_plan_fallback`` letting cuTAMP's search rescue it -- is
-    exactly the interesting case, and describing it as either one is a false statement in the record
-    the whole feature is read from.
-    """
-    if verified and not searched:
-        return f"vlm -- {_VLM_PROVENANCE}"
-    if not verified:
-        return f"cuTAMP -- {_SEARCH_PROVENANCE}"
-    return (
-        f"mixed -- for phase(s) {', '.join(str(i) for i in verified)}, {_VLM_PROVENANCE}. "
-        f"For phase(s) {', '.join(str(i) for i in searched)} the model's plan was not verified and "
-        f"cuTAMP's own search wrote the skeleton that ran; each phase's vlm_task_plan says which"
-    )
 
 
 @dataclass
@@ -139,49 +110,52 @@ class HITLSession:
         True for a finished session too, so a caller that asks before checking ``finished`` gets the
         conservative answer (plan the return home) rather than the surprising one.
         """
-        return self.index + max(1, len(self.robot_run())) >= len(self.phases)
+        leg = self.leg()
+        return self.index + (len(leg.phases) if leg else 1) >= len(self.phases)
+
+    def planner(self, phase: Phase | None = None):
+        """The planner that carries out ``phase``, or the current one.
+
+        The only place the session decides anything about HOW a phase is carried out, and it decides
+        it by asking: which planner claims this phase (planners.planner_for). Everything else here --
+        how far a leg runs, what goal it carries, who the record credits -- is read off what that
+        planner answers.
+        """
+        phase = self.current if phase is None else phase
+        assert phase is not None, "a finished session has no planner"
+        return planner_for(phase, self.cfg.robot_planner)
+
+    def leg(self) -> Leg | None:
+        """The phases this rollout carries out, and who carries them out. None when finished.
+
+        A leg is however many consecutive phases its planner takes at once. The teleop planner always
+        takes exactly one -- each human step is verified on its own. The cuTAMP planner takes a whole
+        run of consecutive robot phases as a single goal, stopping where a shared object would make
+        one plan unsatisfiable; ``planners.CuTAMPPhasePlanner`` is where that rule and its reasons
+        live now.
+        """
+        if self.finished:
+            return None
+        return self.planner().leg(self.phases[self.index :], self.spec.scene_types)
 
     def robot_run(self) -> tuple[Phase, ...]:
-        """The consecutive robot phases this leg plans and executes as ONE cuTAMP goal.
+        """The consecutive robot phases this leg plans and executes as ONE goal.
 
-        Empty when the plan is finished or the next phase is a human's.
-
-        A phase only ever says what must be TRUE at its end, and cuTAMP's initial state carries no
-        ``On`` atom at all (see planning.initial_state_for) -- every robot phase is planned from the
-        same clean state, so nothing symbolic ever enforced the proposer's ordering BETWEEN two robot
-        phases. Conjoining them is the same problem stated once, and it is exactly what the non-HITL
-        path already does with a two-clause instruction: one plan, one continuous motion, and no
-        re-perception in the middle for the object labels to drift across.
-
-        The run STOPS at a phase that moves an object an earlier phase in the run already moved.
-        cuTAMP's Pick requires and deletes ``HasNotPickedUp(obj)`` (tamp_domain.py), so a single plan
-        picks each object at most once: asking for On(toy, table) and On(toy, shelf) at once is
-        unsatisfiable rather than merely slow. Phases like that are genuinely sequential -- "take the
-        toy off the box ... put the toy back in" -- and stay separate legs, which is what the
-        robot->robot continuation in tiptop_run's rollout loop carries.
+        Empty when the plan is finished or the next phase is a human's, which is what callers that
+        only care about the robot's side test.
         """
-        run: list[Phase] = []
-        claimed: set[str] = set()
-        for phase in self.phases[self.index :]:
-            if phase.is_human:
-                break
-            moved = phase_objects(phase) & self.spec.scene_types.movables
-            if run and moved & claimed:
-                break
-            run.append(phase)
-            claimed |= moved
-        return tuple(run)
+        leg = self.leg()
+        return leg.phases if leg is not None and leg.executor == "robot" else ()
 
     def goal_dicts(self) -> list[dict]:
         """This leg's goal, in the form create_tamp_environment consumes.
 
-        Every phase in robot_run(), conjoined -- create_tamp_environment turns each ``on(...)`` into
-        its own goal atom and cuTAMP satisfies the set, so two pick-and-places are one plan.
+        Every phase in the leg, conjoined -- create_tamp_environment turns each ``on(...)`` into its
+        own goal atom and cuTAMP satisfies the set, so two pick-and-places are one plan.
         """
-        run = self.robot_run()
-        assert run, "goal_dicts is only for a robot phase"
-        atoms: frozenset[Atom] = frozenset().union(*(p.atoms for p in run))
-        return goal_atoms_to_dicts(atoms)
+        leg = self.leg()
+        assert leg is not None and leg.goal, "goal_dicts is only for a leg that has a goal to solve"
+        return list(leg.goal)
 
     def objects_named(self) -> set[str]:
         """Every object the remaining phases refer to, for the label-drift check.
@@ -268,34 +242,24 @@ class HITLSession:
     def advance(self) -> Phase | None:
         """Move past the work this leg carried out, and return the phase it started at.
 
-        A human phase is one step. A robot leg is the whole robot_run() its single cuTAMP goal
-        covered, so the plan does not stop between phases that were planned and executed together.
+        A human phase is one step. A robot leg is the whole run its single goal covered, so the plan
+        does not stop between phases that were planned and executed together.
         """
         phase = self.current
         if phase is not None:
-            self.index += max(1, len(self.robot_run()))
+            self.index += len(self.leg().phases)
         return phase
 
     def record_tamp_plan(self, index: int, plan_out: dict) -> None:
         """Note the task plan that was solved for this leg, against every phase it carried out.
 
-        One skeleton can cover several phases (robot_run), so each of them records it, and any phase
+        One skeleton can cover several phases (a leg), so each of them records it, and any phase
         sharing a skeleton also records which ones it was planned with -- otherwise hitl.json reads
         as though each phase had been solved on its own.
 
-        When a model WROTE the plan rather than cuTAMP's search finding it, ``vlm_task_plan`` carries
-        what it wrote -- in its own words as well as as operators -- and how cuTAMP judged it. That
-        includes the case where the judgement was no, which nothing else in this file would record:
-        a leg that plans nothing never advances, so without this the one outcome the feature exists
-        to measure is the one that leaves no trace.
-
         A phase can be recorded TWICE: a leg interrupted by a teleop hand-off records what it had,
-        and the leg that resumes it records again. The resumed leg is deliberately not asked for a
-        task plan -- it re-solves the one it was handed -- so its ``plan_out`` names no author, and
-        replacing the earlier record outright would credit cuTAMP's search with a plan a model wrote.
-        The earlier ``vlm_task_plan`` is therefore carried over, but only when the sequence that ran
-        the second time is the SAME one: a resumed leg whose skeleton was refused and replaced by a
-        search executed cuTAMP's plan, not the model's, and must not be credited with the model's.
+        and the leg that resumes it records again, having re-solved the skeleton it was handed. The
+        later record wins, since it is the one that describes the plan that actually ran.
         """
         skeleton = (plan_out or {}).get("plan_skeleton") or []
         covered = [index]
@@ -305,24 +269,16 @@ class HITLSession:
             "cutamp_skeleton": [op.name for op in skeleton],
             "cutamp_skeleton_reused": bool((plan_out or {}).get("reused")),
         }
-        vlm_task_plan = (plan_out or {}).get("vlm_task_plan")
-        if vlm_task_plan:
-            record["vlm_task_plan"] = dict(vlm_task_plan)
         if len(covered) > 1:
             record["cutamp_skeleton_covers_phases"] = covered
         for i in covered:
-            entry = dict(record)
-            earlier = self.tamp_plans.get(i, {})
-            same_plan_ran_again = earlier.get("cutamp_skeleton") == entry["cutamp_skeleton"]
-            if vlm_task_plan is None and earlier.get("vlm_task_plan") and same_plan_ran_again:
-                entry["vlm_task_plan"] = dict(earlier["vlm_task_plan"])
-            self.tamp_plans[i] = entry
+            self.tamp_plans[i] = dict(record)
 
     def phase_record(self, index: int) -> dict:
         """One phase, with exactly what was handed to whoever carried it out."""
         phase = self.phases[index]
         record = {"index": index, **phase.summary()}
-        record["planned_by"] = "vlm (order and sub-goal); cuTAMP (how)" if not phase.is_human else "vlm"
+        record["planned_by"] = self.planner(phase).authorship
         if not phase.is_human:
             # What TiPToP is actually given. Note it is ATOMS, not a sentence: the ordinary path runs
             # the instruction through Gemini to get these dicts, and a HITL phase substitutes them
@@ -335,29 +291,10 @@ class HITLSession:
             # Present once the phase has run: the skeleton is solved against a fresh perception pass,
             # so this is what executed.
             record.update(self.tamp_plans.get(index, {}))
-            # Set AFTER the update, because which of the two wrote the operator sequence is a
-            # property of the leg that actually ran, not of the plan. Left constant it is simply a
-            # false statement in the audit trail, and the audit trail is the deliverable.
-            if record.get("vlm_task_plan", {}).get("verdict") == "verified":
-                record["planned_by"] = (
-                    "vlm (order, sub-goal, and the sequence of picks and places); "
-                    "cuTAMP (it verified that sequence, then found the grasps, placements and trajectories)"
-                )
         return record
 
     def to_json(self) -> dict:
         phases = [self.phase_record(i) for i in range(len(self.phases))]
-        # Who wrote the sequences that ran, counted over the robot phases that HAVE run. A phase
-        # still to come has no author yet, and counting it as cuTAMP's would describe every task
-        # as mixed until its last leg. Three-way rather than `any`, because one verified leg does
-        # not make the leg beside it -- the one whose plan the model got wrong and cuTAMP's search
-        # rescued -- VLM-authored, and phase_record is already careful to say so per phase.
-        # `cutamp_skeleton` is the filter that matters, not merely having a record: a leg whose plan
-        # was refused and which nothing rescued is recorded with an EMPTY skeleton, and calling that
-        # one "planned by cuTAMP's search" would be the same false statement in the other direction.
-        planned = [(i, p) for i, p in enumerate(phases) if not self.phases[i].is_human and p.get("cutamp_skeleton")]
-        verified = [i for i, p in planned if p.get("vlm_task_plan", {}).get("verdict") == "verified"]
-        searched = [i for i, _ in planned if i not in verified]
         return {
             "instruction": self.instruction,
             "trajectory_id": self.trajectory_id,
@@ -374,9 +311,11 @@ class HITLSession:
                 "phase_sub_goals": "vlm -- the atoms each robot phase must establish",
                 "invented_predicates": "vlm -- name and the natural-language classifier behind it",
                 "human_instructions": "vlm -- the text the operator is shown",
-                "robot_phases": _robot_phase_provenance(verified, searched),
-                "grasps_placements_trajectories": "cuTAMP / cuRobo",
-                "human_steps": "the teleoperator, following the phase's instructions",
+                # Who carries out each half, read off the planners themselves rather than named
+                # here: which planner has the robot's phases is a config choice (hitl.robot_planner),
+                # and a record that hard-codes one is a false statement the moment it is changed.
+                "robot_phases": robot_planner(self.cfg.robot_planner).provenance,
+                "human_phases": teleop_planner().provenance,
             },
             "phases": phases,
             "phase_index": self.index,

@@ -224,7 +224,6 @@ def run_planning(
     plan_out: dict | None = None,
     return_home: bool = True,
     q_return: np.ndarray | list | None = None,
-    fallback_to_search: bool = True,
 ) -> tuple[list | None, float, str | None]:
     """Run cuTAMP planning and return (plan, planning_time_seconds, failure_reason).
 
@@ -234,22 +233,16 @@ def run_planning(
     trajectory-blending settings (``blend_trajectory`` etc. -- see resolve_blend_config). Blending is
     off unless the config opts in.
 
-    ``reuse_plan_skeleton`` is a task plan -- from an earlier call (see ``plan_out``), or written by
-    a model -- to solve instead of searching for one: grasps, placements and trajectories are all
-    still solved from scratch against this scene, only the symbolic search is skipped. It is rejected
-    outright if it no longer solves this problem (skeleton_reuse_rejection), and if it is accepted but
-    yields no plan, this falls back to a full search rather than returning empty-handed -- unless
-    ``fallback_to_search`` is False. Either way ``elapsed`` covers every cuTAMP call made.
+    ``reuse_plan_skeleton`` is a task plan from an earlier call (see ``plan_out``) -- the teleop-resume
+    path's, which carries on with the plan the arm was part-way through -- to solve instead of
+    searching for one: grasps, placements and trajectories are all still solved from scratch against
+    this scene, only the symbolic search is skipped. It is rejected outright if it no longer solves
+    this problem (skeleton_reuse_rejection), and if it is accepted but yields no plan, this falls back
+    to a full search rather than returning empty-handed, because the objects have moved and a
+    different plan may well work. Either way ``elapsed`` covers every cuTAMP call made.
 
     ``experiment_dir`` holds one `attempt_N` subdirectory per cuTAMP call (see attempt_dir), so the
     reuse attempt and the fallback search each get their own logs instead of colliding.
-
-    ``fallback_to_search`` is what separates a caller that OFFERS a task plan from one that wants a
-    given task plan VERIFIED. Left True (the default, and what the teleop-resume path wants), a
-    supplied plan that no longer applies -- or that yields no motion -- is replaced by a full search,
-    because the objects have moved and a different plan may well work. Set False when the question is
-    "is THIS plan feasible here": searching would answer a different question and record the answer
-    as a success, which is exactly what a VLM-written plan must not be credited with.
 
     ``plan_out``, if given, gets {"plan_skeleton": ..., "reused": bool, "rejection": str | None,
     "supplied_plan_failure": str | None} for the returned plan. ``rejection`` is why a supplied
@@ -393,27 +386,21 @@ def run_planning(
         else:
             _log.info(f"Using the given task plan: {[op.name for op in reuse_plan_skeleton]}")
 
-    if rejection is not None and not fallback_to_search:
-        # Verification mode: the plan we were handed does not apply here, and a search would answer a
-        # question nobody asked -- then report the answer as this plan's success.
-        cutamp_plan, final_skeleton = None, None
-        failure_reason = f"the task plan does not solve this problem: {rejection}"
-    else:
-        cutamp_plan, failure_reason, final_skeleton = solve(reuse_plan_skeleton)
-        if reuse_plan_skeleton is not None:
-            # Kept before any fallback overwrites it. Without this, a supplied plan that failed and
-            # was replaced by a successful search leaves no trace of WHY it failed: `failure_reason`
-            # ends up None (the search worked) and the one interesting outcome reads as a clean run.
-            supplied_failure = failure_reason
-        if cutamp_plan is not None:
-            reused = reuse_plan_skeleton is not None
-        elif reuse_plan_skeleton is not None and fallback_to_search and not starved:
-            # The task plan still applies symbolically, but this scene admits no grasp/placement/motion
-            # for it -- the objects have moved. A different skeleton may well work, so search after all.
-            _log.warning(
-                f"The given task plan produced no motion plan ({failure_reason}); falling back to a full task search"
-            )
-            cutamp_plan, failure_reason, final_skeleton = solve(None)
+    cutamp_plan, failure_reason, final_skeleton = solve(reuse_plan_skeleton)
+    if reuse_plan_skeleton is not None:
+        # Kept before any fallback overwrites it. Without this, a supplied plan that failed and was
+        # replaced by a successful search leaves no trace of WHY it failed: `failure_reason` ends up
+        # None (the search worked) and the one interesting outcome reads as a clean run.
+        supplied_failure = failure_reason
+    if cutamp_plan is not None:
+        reused = reuse_plan_skeleton is not None
+    elif reuse_plan_skeleton is not None and not starved:
+        # The task plan still applies symbolically, but this scene admits no grasp/placement/motion
+        # for it -- the objects have moved. A different skeleton may well work, so search after all.
+        _log.warning(
+            f"The given task plan produced no motion plan ({failure_reason}); falling back to a full task search"
+        )
+        cutamp_plan, failure_reason, final_skeleton = solve(None)
     elapsed = time.perf_counter() - start
     _log.info(f"cuTAMP planning took: {elapsed:.2f}s")
     if plan_out is not None:

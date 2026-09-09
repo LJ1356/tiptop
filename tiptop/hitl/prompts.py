@@ -1,5 +1,4 @@
-"""The three prompts: plan the task into phases, order one robot leg's picks and places, and check
-one statement against an image.
+"""The two prompts: plan the task into phases, and check one statement against an image.
 
 The robot is described to the model in ABSTRACT terms -- "pick up an object", "place it on a surface"
 -- rather than with cuTAMP's real operator signatures. Those carry motion-level parameters (``conf``,
@@ -7,12 +6,6 @@ The robot is described to the model in ABSTRACT terms -- "pick up an object", "p
 no business reasoning about, and shown them it writes goals over the alternation lock. Restricting
 the vocabulary to the three state predicates a sub-goal can be phrased in keeps every phase
 groundable by construction.
-
-``task_plan_prompt`` strikes the same bargain one level down. It asks for the ORDER of picks and
-places -- the thing that replaced cuTAMP's breadth-first search -- in exactly the vocabulary the plan
-prompt already uses, and it too never mentions ``MoveFree``, ``MoveHolding`` or a symbol.
-``task_plan.expand_task_plan`` supplies all of those, which is precisely why the model does not have
-to: the alternation is FORCED by the domain, so there is nothing in it to decide.
 """
 
 # The predicates a ROBOT phase may use. Exactly the cuTAMP fluents a goal can be stated over and that
@@ -112,35 +105,6 @@ PLAN_SCHEMA = {
         },
     },
     "required": ["phases"],
-}
-
-TASK_PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        # First and required, so the order is REASONED about before it is committed to -- the same job
-        # `coverage` does in PLAN_SCHEMA. It is also the most useful line in the audit trail when a
-        # plan turns out to be geometrically infeasible.
-        "reasoning": {"type": "string"},
-        "steps": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["pick", "place"]},
-                    "object": {"type": "string"},
-                    # Absent on a pick; the parser requires it on a place and says so.
-                    "surface": {"type": "string"},
-                },
-                "required": ["action", "object"],
-            },
-        },
-        # Where a goal that picks and places genuinely cannot reach goes -- one that needs an object
-        # moved twice, say. Without somewhere to put that, the only way to answer at all is to invent
-        # a plan that fails the goal check, and the reprompt loop then spends every attempt on a
-        # correct refusal restated three times.
-        "problem": {"type": "string"},
-    },
-    "required": ["reasoning", "steps"],
 }
 
 CLASSIFIER_SCHEMA = {
@@ -281,90 +245,6 @@ unrepresented clause.) Never invent an object to satisfy a clause, and never bin
 object that happens to be present. Saying you could not do it is always better than \
 quietly doing something else: a human is watching, and can put the missing object on the table and \
 start again."""
-
-
-def task_plan_prompt(goal: list[str], descriptions: list[str], movables: list[str], surfaces: list[str]) -> str:
-    """Order the picks and places that leave the workspace satisfying one robot leg's goal.
-
-    ``goal`` is the leg's atoms as the model must see them (``display_atom`` -- no session suffix),
-    ``descriptions`` the phase descriptions it covers, and the two lists are exactly what
-    ``create_tamp_environment`` typed as pickable and as surfaces for this rollout. Nothing outside
-    those lists exists as far as this call is concerned, and the parser refuses anything else.
-    """
-    work = "\n".join(f"- {text}" for text in descriptions) or "- (the goal below)"
-    goal_lines = "\n".join(f"- {text}" for text in goal)
-    movable_list = "\n".join(f"- {name}" for name in movables) or "- (nothing)"
-    surface_list = "\n".join(f"- {name}" for name in surfaces) or "- (none)"
-    return f"""\
-A robot and a person are sharing a workspace. The robot is about to carry out its next piece of the \
-task, and your job is to decide the ORDER in which it picks things up and puts them down.
-
-The image shows the workspace exactly as it is right now.
-
-WHAT THIS PIECE OF WORK IS:
-{work}
-
-WHEN IT IS DONE, all of these must be true:
-{goal_lines}
-
-where
-{STATE_PREDICATE_DESCRIPTION}
-
-Objects the robot may pick up:
-{movable_list}
-
-Surfaces it may put things down on:
-{surface_list}
-
-The robot does exactly two things, and it does them one at a time:
-  pick(object)            - close the gripper on that object and lift it
-  place(object, surface)  - put down the object it is holding, onto that surface
-
-Give `reasoning` first: one or two sentences saying why this order and not another. Then give \
-`steps`: the picks and places, in the order the robot should do them.
-
-WHY THE ORDER MATTERS. This is the whole question you are being asked, and it is a question about \
-the picture. The robot cannot reach through things, and it cannot put something down where something \
-else already is. Look at the image:
-- If an object is sitting ON something that has to move, or is sitting where something else has to \
-end up, move it out of the way FIRST.
-- If two things are going onto the same surface, put down first the one the other would otherwise \
-block or bury.
-- If nothing is in anything's way, the order does not matter. Say so, and pick either.
-
-Rules, all of which are checked before the arm moves:
-- The gripper holds one object at a time. Every `pick` is followed by the `place` of that SAME object \
-before anything else is picked up.
-- The robot may pick each object up ONCE in this list. There is no way to move something and then \
-move it again.
-- After the last step, every goal line above must be true. A goal line `HandEmpty()` means the last \
-step is a place. A goal line `Holding(x)` means the last step is a pick of x.
-- Give every goal line a step, EVEN IF the picture already shows it to be true. The robot does the \
-work again from where things are now, and a goal line with no step fails the check.
-- Spell object and surface names exactly as they are listed above. Anything not on those two lists \
-does not exist here.
-- Move something the goal does not mention only when it is physically in the way, and say in \
-`reasoning` which goal line it was blocking. Every extra move is another chance to fail.
-- Do not add steps the goal does not need. Two goal lines about two objects mean two picks and two \
-places.
-
-Worked example. Pickable: lid, red_toy. Surfaces: table, cardboard_box. \
-Goal: On(red_toy, cardboard_box), On(lid, table), HandEmpty(). \
-The picture shows the lid sitting on the cardboard_box and the toy on the table.
-  reasoning: "The lid is closing the box, so the toy cannot go into the box until the lid is off it. \
-Take the lid off onto the table first."
-  steps: pick(lid), place(lid, table), pick(red_toy), place(red_toy, cardboard_box)
-The wrong answer puts the toy in the box first and then has nowhere to put the lid.
-
-A second example, where the order is free. Goal: On(block, tray), On(cup, tray), HandEmpty(). The \
-picture shows the block and the cup side by side on the table, nothing on top of either, tray empty.
-  reasoning: "Neither is on top of the other and the tray has room for both, so either order works."
-  steps: pick(block), place(block, tray), pick(cup), place(cup, tray)
-
-If no order of picks and places can reach the goal -- something would have to be moved twice, or a \
-goal line names something that is not on the lists above -- leave `steps` EMPTY and say why in \
-`problem`. Do not offer the closest sequence you can find instead: a plan that does not reach the \
-goal is rejected, and saying plainly that it cannot be done is the more useful answer."""
 
 
 def classifier_prompt(statement: str) -> str:

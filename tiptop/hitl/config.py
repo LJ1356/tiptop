@@ -47,28 +47,11 @@ class HITLConfig:
     # On by default: when a HITL run goes wrong the question is almost always "what did the model
     # actually see, and what did it say", and that is unanswerable after the fact without this.
     save_vlm_io: bool = True
-    # Who writes a robot leg's TASK PLAN -- the sequence of picks and places. True (the default) asks
-    # the VLM for the order and hands it to cuTAMP to VERIFY, which is what the feature is for: the
-    # order is a question about what is resting on what and what is in the way of what, and cuTAMP's
-    # breadth-first search cannot see the scene (its symbolic initial state carries no On atom at
-    # all). False restores that search. Only ever consulted for a HITL robot leg.
-    vlm_task_plan: bool = True
-    # Step 6's model. The same default as the proposal, and for the same reason: ordering picks and
-    # places against a photo is reasoning, not localisation.
-    task_plan_model: str = DEFAULT_PROPOSAL_MODEL
-    # Plan the leg with cuTAMP's own search when the VLM's plan cannot be verified -- unparseable
-    # after `max_attempts`, refused by the symbolic check, or admitting no grasp/placement/motion in
-    # this scene. On by default: a failed leg advances no phase and drops the session at the start of
-    # the next rollout, so the whole task is re-proposed against a half-rearranged scene and the
-    # human is asked to redo the phase they just finished. That is a person's time, and it is the
-    # wrong price for a model that got the order wrong. The experiment is unharmed -- the verdict is
-    # recorded either way, in hitl.json's `vlm_task_plan`. Set false for a run in which cuTAMP
-    # verifies the model's plan and nothing else.
-    task_plan_fallback: bool = True
-    # Wall-clock bound on the task-plan call, in seconds. Every other failure here degrades to "plan
-    # the leg the old way", but a request that never returns leaves the arm idle with nothing said:
-    # neither the SDK client nor `query_json` sets a deadline of its own. Covers every reprompt.
-    task_plan_timeout_s: float = 120.0
+    # Which registered planner carries out the ROBOT phases (planners.register_robot_planner).
+    # The human's phases are always a teleop hand-off -- that is what makes a phase the human's --
+    # so only the robot half is selectable. cuTAMP is the only one this build ships, and naming one
+    # it does not have raises rather than quietly planning the task with a different one.
+    robot_planner: str = "cutamp"
     # SQLite cache for PROPOSAL responses only, keyed on the model, the prompt and a noise-robust
     # hash of the image (after prpl_llm_utils' SQLite3PretrainedLargeModelCache). Worth setting while
     # iterating on prompts, where the same scene and instruction are proposed over and over. Never

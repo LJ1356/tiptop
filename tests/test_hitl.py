@@ -738,96 +738,79 @@ class _Op:
         self.name = name
 
 
-def _verified(steps=("pick(blue_toy)", "place(blue_toy, table)")):
-    """What tiptop_run puts in plan_out when cuTAMP verified the model's own plan."""
-    return {
-        "plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")],
-        "reused": True,
-        "vlm_task_plan": {"verdict": "verified", "steps": list(steps), "reasoning": "because"},
-    }
-
-
-def test_a_verified_task_plan_is_credited_to_the_model_in_the_record():
+def test_the_planner_that_carries_out_a_phase_is_chosen_by_who_owns_it():
+    # The split the whole feature rests on: the proposal stage says WHICH phases are the human's,
+    # and that answer -- and nothing else -- decides which planner is asked to carry them out.
     session = _session()  # robot, human, robot
-    session.record_tamp_plan(0, _verified())
-    record = session.to_json()
-    assert record["phases"][0]["vlm_task_plan"]["verdict"] == "verified"
-    assert "sequence of picks and places" in record["phases"][0]["planned_by"]
-    assert record["provenance"]["robot_phases"].startswith("vlm --")
+    planners = [session.planner(phase).name for phase in session.phases]
+    assert planners == ["cutamp", "teleop", "cutamp"]
 
 
-def test_a_leg_the_model_did_not_plan_is_not_credited_to_it():
-    # The case the audit trail exists for: task_plan_fallback let cuTAMP's search rescue a leg whose
-    # plan the model got wrong. Saying "vlm" at the top of the file would describe that leg falsely.
+def test_a_human_phase_is_a_leg_on_its_own_with_no_goal_to_solve():
     session = _session()
-    session.record_tamp_plan(0, _verified())
-    session.index = 2
-    session.record_tamp_plan(2, {
-        "plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": False,
-        "vlm_task_plan": {"verdict": "no_satisfying_particles", "steps": ["pick(blue_toy)"]},
-    })
-    record = session.to_json()
-    provenance = record["provenance"]["robot_phases"]
-    assert provenance.startswith("mixed --") and "phase(s) 0" in provenance and "phase(s) 2" in provenance
-    assert "sequence of picks and places" in record["phases"][0]["planned_by"]
-    assert record["phases"][2]["planned_by"] == "vlm (order and sub-goal); cuTAMP (how)"
+    session.index = 1
+    leg = session.leg()
+    assert leg.executor == "human" and leg.planner == "teleop"
+    assert len(leg.phases) == 1 and leg.goal == ()
+    # robot_run() is the robot-side question, so a human leg answers it with nothing.
+    assert session.robot_run() == ()
 
 
-def test_a_task_planned_entirely_by_the_search_reads_exactly_as_it_did_before():
+def test_a_robot_leg_carries_only_its_own_phases_goal():
+    # TAMP is never handed the whole task: a leg's goal is the phases that leg covers and no more,
+    # so the phases on the far side of the human's step are not in the problem cuTAMP solves.
+    session = _session()
+    leg = session.leg()
+    assert leg.executor == "robot" and leg.planner == "cutamp"
+    assert [p.description for p in leg.phases] == ["take the toy off the box and put it on the table"]
+    assert leg.goal == ({"predicate": "on", "args": ["blue_toy", "table"]},)
+    assert session.goal_dicts() == list(leg.goal)
+
+
+def test_an_unknown_robot_planner_is_refused_rather_than_silently_cutamp():
+    from tiptop.hitl.planners import planner_for, robot_planner
+
+    assert robot_planner("cutamp").executor == "robot"
+    with pytest.raises(ValueError, match="unknown hitl robot_planner"):
+        robot_planner("nope")
+    session = _session()
+    session.cfg = resolve_hitl_config({"enabled": True, "robot_planner": "nope"})
+    with pytest.raises(ValueError, match="unknown hitl robot_planner"):
+        session.leg()
+    # A human phase still needs the robot planner resolved -- naming one that does not exist is a
+    # broken config however the plan happens to be shaped, and it must not pass silently.
+    with pytest.raises(ValueError, match="unknown hitl robot_planner"):
+        planner_for(session.phases[1], "nope")
+
+
+def test_the_record_credits_each_half_to_the_planner_that_carried_it_out():
     session = _session()
     session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": False})
-    assert session.to_json()["provenance"]["robot_phases"].startswith("cuTAMP --")
-
-
-def test_a_leg_that_found_no_plan_at_all_is_credited_to_neither():
-    # It is recorded (it is the outcome the feature is measured on) but nothing ran, so saying either
-    # "the model wrote the sequence that ran" or "cuTAMP's search wrote it" would be false.
-    session = _session()
-    session.record_tamp_plan(0, {
-        "plan_skeleton": [], "reused": False,
-        "vlm_task_plan": {"verdict": "no_satisfying_particles", "steps": ["pick(blue_toy)"]},
-    })
     record = session.to_json()
-    assert record["phases"][0]["vlm_task_plan"]["verdict"] == "no_satisfying_particles"
+    assert record["phases"][0]["planned_by"] == "vlm (order and sub-goal); cuTAMP (how)"
+    assert record["phases"][0]["cutamp_skeleton"] == ["Pick(blue_toy, grasp1, q1)"]
+    assert record["phases"][1]["planned_by"] == "vlm"
     assert record["provenance"]["robot_phases"].startswith("cuTAMP --")
+    assert record["provenance"]["human_phases"].startswith("the teleoperator")
 
 
-def test_a_leg_resumed_after_a_hand_off_keeps_the_model_s_authorship():
-    # The interrupted leg records what it had; the leg that resumes it is deliberately NOT asked for a
-    # task plan (it re-solves the one it was handed), so its plan_out names no author. Replacing the
-    # record outright would credit cuTAMP's search with the plan the model wrote and the arm ran.
+def test_a_resumed_leg_records_the_plan_that_actually_ran_the_second_time():
+    # A leg interrupted by a hand-off records what it had; the leg that resumes it re-solves the
+    # skeleton it was handed and records again. The later record is the one that describes the arm.
     session = _session()
-    skeleton = [_Op("Pick(blue_toy, grasp1, q1)")]
-    session.record_tamp_plan(0, {"plan_skeleton": skeleton, "reused": True, "vlm_task_plan":
-                                 {"verdict": "verified", "steps": ["pick(blue_toy)"]}})
-    session.record_tamp_plan(0, {"plan_skeleton": skeleton, "reused": True})  # the resumed leg
-    record = session.to_json()
-    assert record["phases"][0]["vlm_task_plan"]["verdict"] == "verified"
-    assert record["provenance"]["robot_phases"].startswith("vlm --")
-
-
-def test_a_resumed_leg_that_fell_back_to_a_search_is_not_credited_to_the_model():
-    # The other half of the same rule: the resumed leg's skeleton was refused and cuTAMP searched for
-    # a different one, so what ran is cuTAMP's plan and the model must not be credited with it.
-    session = _session()
-    session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": True,
-                                 "vlm_task_plan": {"verdict": "verified", "steps": ["pick(blue_toy)"]}})
+    session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": True})
     session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(white_box, grasp1, q1)")], "reused": False})
     record = session.to_json()
-    assert "vlm_task_plan" not in record["phases"][0]
-    assert record["provenance"]["robot_phases"].startswith("cuTAMP --")
+    assert record["phases"][0]["cutamp_skeleton"] == ["Pick(white_box, grasp1, q1)"]
+    assert record["phases"][0]["cutamp_skeleton_reused"] is False
 
 
-def test_a_robot_leg_s_task_plan_is_the_vlm_s_by_default_with_the_search_as_the_net():
-    # The feature this config block turns on: the VLM writes the picks and places and cuTAMP verifies
-    # them. The fallback is on with it, so a model that cannot be reached costs the run a search, not
-    # the teleoperator's work on the legs before this one.
+def test_the_robot_phases_go_to_cutamp_unless_the_config_says_otherwise():
     cfg = resolve_hitl_config({"enabled": True})
-    assert cfg.vlm_task_plan is True and cfg.task_plan_fallback is True
-    assert cfg.task_plan_timeout_s > 0
-    assert resolve_hitl_config({"enabled": True, "vlm_task_plan": False}).vlm_task_plan is False
+    assert cfg.robot_planner == "cutamp"
+    assert resolve_hitl_config({"enabled": True, "robot_planner": "other"}).robot_planner == "other"
     with pytest.raises(ValueError, match="unknown hitl config key"):
-        resolve_hitl_config({"enabled": True, "vlm_task_plans": True})
+        resolve_hitl_config({"enabled": True, "robot_planners": "cutamp"})
 
 
 def test_the_shipped_hitl_configs_resolve():

@@ -7,9 +7,6 @@ could not express.
 
     python -m tiptop.hitl.demo --image workspace.png --goal "open the box and put the toy in it"
 
-Add --task-plan to go one level further and ask for each robot phase's picks and places -- the
-sequence that replaced cuTAMP's search -- and check symbolically that it reaches the phase's goal.
-
 Objects default to whatever Gemini detects in the image, so this exercises the same labels a rollout
 would see. Pass --objects to pin them instead, e.g. when reproducing a run from its saved perception.
 """
@@ -32,54 +29,6 @@ from tiptop.hitl.structs import describe_atom, display_name
 from tiptop.perception.gemini import detect_and_translate_async
 
 _log = logging.getLogger(__name__)
-
-
-async def _print_task_plans(image, spec, initial_state, cfg: HITLConfig) -> None:
-    """Ask for, expand and symbolically check each robot phase's picks and places.
-
-    Offline only: this says whether the ORDER solves the problem, which is the half of verification
-    that needs no scene geometry. Whether a grasp exists, whether the placement fits and whether the
-    arm can get there are cuTAMP's answer on the robot, and nothing here stands in for it.
-
-    Each phase is planned on its own, which is not quite what a rollout does -- it merges consecutive
-    robot phases into one leg (HITLSession.robot_run) and asks once for the merged goal. Close enough
-    to iterate on the prompt, and the difference is stated rather than hidden.
-    """
-    from cutamp.tamp_domain import HandEmpty, Holding
-
-    from tiptop.hitl.task_plan import describe_steps, propose_task_plan
-    from tiptop.planning import skeleton_reuse_rejection
-
-    print("\nTASK PLANS (symbolically valid only -- grasps, placements and motion are not checked here)")
-    for i, phase in enumerate(spec.phases):
-        if phase.is_human:
-            continue
-        # What create_tamp_environment would build for this phase: its atoms, plus HandEmpty unless
-        # the phase ends mid-manipulation.
-        goal = set(phase.atoms)
-        if not any(atom.name == Holding.name for atom in phase.atoms):
-            goal.add(HandEmpty.ground())
-        goal_state = frozenset(goal)
-        try:
-            plan = await propose_task_plan(
-                image=image,
-                goal_state=goal_state,
-                movables=sorted(spec.scene_types.movables),
-                surfaces=sorted(spec.scene_types.surfaces),
-                descriptions=[phase.description],
-                cfg=cfg,
-                goal_rejection=lambda sk: skeleton_reuse_rejection(sk, initial_state, goal_state),
-                label=f"robot steps phase {i}",
-            )
-        except Exception as exc:
-            print(f"  phase {i}: no task plan -- {type(exc).__name__}: {exc}")
-            continue
-        if plan.declined:
-            print(f"  phase {i}: the model would not plan this -- {plan.problem}")
-            continue
-        print(f"  phase {i}: {' -> '.join(describe_steps(plan.steps))}")
-        print(f"    why: {plan.reasoning}")
-        print(f"    as cuTAMP operators: {', '.join(op.name for op in plan.skeleton)}")
 
 
 async def _detect_objects(image: Image.Image, goal: str) -> list[str]:
@@ -147,9 +96,6 @@ async def _run(args: argparse.Namespace) -> int:
     if not spec.needs_human:
         print("\n  (no human phases: the robot can do this whole task on its own)")
 
-    if args.task_plan:
-        await _print_task_plans(image, spec, initial_state, cfg)
-
     if args.json:
         Path(args.json).write_text(json.dumps(spec.to_json(), indent=2))
         print(f"\nWrote {args.json}")
@@ -165,11 +111,6 @@ def main() -> None:
     parser.add_argument("--hitl-config", help="the cfg/tamp `hitl` block as JSON or a path to it")
     parser.add_argument("--cache", help="SQLite path to cache proposal responses in, for prompt iteration")
     parser.add_argument("--vlm-io", help="directory to save every image sent to the VLM and its answer")
-    parser.add_argument(
-        "--task-plan",
-        action="store_true",
-        help="also ask for each robot phase's picks and places, and check them symbolically",
-    )
     parser.add_argument("--json", help="write the proposed plan here")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
