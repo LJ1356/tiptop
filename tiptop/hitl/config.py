@@ -47,11 +47,54 @@ class HITLConfig:
     # On by default: when a HITL run goes wrong the question is almost always "what did the model
     # actually see, and what did it say", and that is unanswerable after the fact without this.
     save_vlm_io: bool = True
-    # Which registered planner carries out the ROBOT phases (planners.register_robot_planner).
-    # The human's phases are always a teleop hand-off -- that is what makes a phase the human's --
-    # so only the robot half is selectable. cuTAMP is the only one this build ships, and naming one
-    # it does not have raises rather than quietly planning the task with a different one.
+    # Which registered planner carries out the ROBOT phases (planners.register_robot_planner);
+    # `policy_type` below is the same choice for the human's. cuTAMP is the only robot planner this
+    # build ships, and naming one it does not have raises rather than quietly planning the task with
+    # a different one.
     robot_planner: str = "cutamp"
+    # WHO CARRIES OUT THE PLAN'S HUMAN PHASES. "human" is the teleop hand-off this package was
+    # built around and is the default; any other value names a registered policy planner
+    # (planners.register_human_planner), which drives the arm through that phase itself.
+    #
+    # Nothing upstream of the hand-off is told. A phase is the human's because cuTAMP cannot express
+    # what it asks for -- "fold the cloth", "open the box" -- and that is true however the phase is
+    # then carried out, so the proposal stage, the phase's atoms and the verification afterwards are
+    # all unchanged. This selects the executor, never the plan.
+    policy_type: str = "human"
+    # The checkpoint that policy loads. Required for every policy_type but "human"; the path is the
+    # LeRobot checkpoint DIRECTORY (the one holding `pretrained_model/`), which is what
+    # `checkpoints/<task>/checkpoints/last` is.
+    policy_checkpoint: str | None = None
+    # Steps of one predicted action chunk executed before the policy is asked for another. This is
+    # LeRobot's `n_action_steps`, which is NOT baked into the model (the U-Net's output length is
+    # `horizon`), so it is retuned here at deploy time rather than at training time. It must stay
+    # within `horizon - n_obs_steps + 1`, which the policy server checks against the checkpoint it
+    # loaded -- LeRobot itself does not, and silently executes a shorter chunk when it is exceeded.
+    open_loop_horizon: int = 8
+    # Reverse-diffusion steps per prediction (LeRobot's `num_inference_steps`). Another deploy-time
+    # knob, and one that has to be set: LeRobot defaults it to `num_train_timesteps`, which is 100
+    # for DDPM and takes ~334 ms on these checkpoints. The driver asks for a new chunk every
+    # `open_loop_horizon` steps, so that default stalls the 15 Hz control loop for five periods on
+    # every eighth step -- the 2026-09-09 toy-puzzle leg averaged 9.2 Hz, well off the rate the
+    # policy was trained at. 10 steps costs 36 ms and, replayed over a full teleop leg of
+    # 1_toy_puzzle, predicts actions indistinguishable from the 100-step ones (cosine against the
+    # demonstrated action 0.867 vs 0.866, same mean magnitude). 0 keeps the checkpoint's own value.
+    policy_num_inference_steps: int = 10
+    # Hard stop for one policy leg, in control steps at 15 Hz (450 = 30 s). A behaviour-cloning
+    # policy has no idea when it is finished -- there is no termination head and no reward -- so
+    # something has to end the leg, and the phase verification that follows is what decides whether
+    # what it did counts. Sized from the teleop legs these policies were trained on, whose longest is
+    # 648 frames and whose median is ~300 (hitl-baseline/diffusion_policy/README.md).
+    policy_max_steps: int = 450
+    # Scales the policy's joint-velocity channels (not the gripper) before they reach the arm. The
+    # deploy knob for a policy that moves faster or slower than the demonstrations it learned from;
+    # 1.0 sends what it predicted, which is what the training data's units mean.
+    policy_velocity_scale: float = 1.0
+    # Interpreter for the policy SERVER, which loads the checkpoint. Its default is the venv of
+    # hitl-baseline/diffusion_policy, the project that trained these checkpoints: LeRobot and torch
+    # live only there, never in the DROID env that drives the arm. A machine that keeps them
+    # somewhere else sets this; nothing about a task decides it.
+    policy_python: str | None = None
     # SQLite cache for PROPOSAL responses only, keyed on the model, the prompt and a noise-robust
     # hash of the image (after prpl_llm_utils' SQLite3PretrainedLargeModelCache). Worth setting while
     # iterating on prompts, where the same scene and instruction are proposed over and over. Never
@@ -75,7 +118,54 @@ def resolve_hitl_config(raw: dict | None) -> HITLConfig:
         # Loud, unlike tamp_overrides: a misspelled key here silently disables the feature the config
         # was written to turn on.
         raise ValueError(f"unknown hitl config key(s): {', '.join(unknown)}. Known keys: {sorted(known)}")
-    return HITLConfig(**dict(raw))
+    cfg = HITLConfig(**dict(raw))
+    check_policy_config(cfg)
+    return cfg
+
+
+def check_policy_config(cfg: HITLConfig) -> None:
+    """Reject a policy-executed block that is wrong on its own terms, at parse time.
+
+    Everything here is a statement about the YAML and nothing about the machine, which is what lets
+    it run inside ``resolve_hitl_config``: a config is parsed in places that will never run it (the
+    data-collection server listing configs, a test over the shipped ones), and a check that reached
+    for the filesystem there would make a portable config fail on the wrong host.
+
+    Deliberately not a check of the planner NAME either -- planners.human_planner does that against
+    the registry, which is the only thing that knows what is registered.
+    """
+    if not cfg.enabled or cfg.policy_type == "human":
+        return
+    if not cfg.policy_checkpoint:
+        raise ValueError(
+            f"hitl.policy_type is {cfg.policy_type!r}, so hitl.policy_checkpoint must name the "
+            "checkpoint directory it runs (the one holding pretrained_model/)"
+        )
+    if cfg.open_loop_horizon < 1:
+        raise ValueError(f"hitl.open_loop_horizon must be at least 1, got {cfg.open_loop_horizon}")
+    if cfg.policy_num_inference_steps < 0:
+        raise ValueError(
+            "hitl.policy_num_inference_steps must be 0 (the checkpoint's own value) or more, got "
+            f"{cfg.policy_num_inference_steps}"
+        )
+    if cfg.policy_max_steps < 1:
+        raise ValueError(f"hitl.policy_max_steps must be at least 1, got {cfg.policy_max_steps}")
+    if cfg.policy_velocity_scale <= 0:
+        raise ValueError(f"hitl.policy_velocity_scale must be positive, got {cfg.policy_velocity_scale}")
+
+
+def check_policy_checkpoint(cfg: HITLConfig) -> None:
+    """Reject a checkpoint that is not on THIS machine. Called once, at session start.
+
+    Separate from check_policy_config because it is the half that only the host running the arm can
+    answer. Worth doing at startup rather than letting the policy server report it: it surfaces
+    minutes and a whole warm-up earlier, before any part of a trajectory has been collected against
+    a phase that was never going to run.
+    """
+    if not cfg.enabled or cfg.policy_type == "human" or not cfg.policy_checkpoint:
+        return
+    if not Path(cfg.policy_checkpoint).is_dir():
+        raise ValueError(f"hitl.policy_checkpoint is not a directory on this machine: {cfg.policy_checkpoint}")
 
 
 def load_hitl_config(spec: str | None) -> HITLConfig:

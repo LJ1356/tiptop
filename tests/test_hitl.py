@@ -13,7 +13,7 @@ from unittest import mock
 import pytest
 
 from tiptop.hitl import grounding, llm
-from tiptop.hitl.config import HITLConfig, load_hitl_config, resolve_hitl_config
+from tiptop.hitl.config import HITLConfig, check_policy_config, load_hitl_config, resolve_hitl_config
 from tiptop.hitl.grounding import Verdict
 from tiptop.hitl.planning import (
     ObjectGeometry,
@@ -740,17 +740,19 @@ class _Op:
 
 def test_the_planner_that_carries_out_a_phase_is_chosen_by_who_owns_it():
     # The split the whole feature rests on: the proposal stage says WHICH phases are the human's,
-    # and that answer -- and nothing else -- decides which planner is asked to carry them out.
+    # and that answer -- and nothing else -- decides which SIDE the phase goes to. Which planner on
+    # that side is the config's (`robot_planner` / `policy_type`); the planner's name IS that config
+    # value, so "human" here is the default teleop hand-off.
     session = _session()  # robot, human, robot
     planners = [session.planner(phase).name for phase in session.phases]
-    assert planners == ["cutamp", "teleop", "cutamp"]
+    assert planners == ["cutamp", "human", "cutamp"]
 
 
 def test_a_human_phase_is_a_leg_on_its_own_with_no_goal_to_solve():
     session = _session()
     session.index = 1
     leg = session.leg()
-    assert leg.executor == "human" and leg.planner == "teleop"
+    assert leg.executor == "human" and leg.planner == "human"
     assert len(leg.phases) == 1 and leg.goal == ()
     # robot_run() is the robot-side question, so a human leg answers it with nothing.
     assert session.robot_run() == ()
@@ -780,7 +782,88 @@ def test_an_unknown_robot_planner_is_refused_rather_than_silently_cutamp():
     # A human phase still needs the robot planner resolved -- naming one that does not exist is a
     # broken config however the plan happens to be shaped, and it must not pass silently.
     with pytest.raises(ValueError, match="unknown hitl robot_planner"):
-        planner_for(session.phases[1], "nope")
+        planner_for(session.phases[1], "nope", "human")
+
+
+def test_an_unknown_policy_type_is_refused_the_same_way(tmp_path):
+    # The human half is selectable too (`hitl.policy_type`), and a name this build does not have is
+    # refused rather than quietly falling back to the teleop hand-off -- a run whose output is a
+    # dataset must not collect a human leg while its config asked for a policy one.
+    from tiptop.hitl.planners import check_planners, human_planner, planner_for
+
+    assert human_planner("human").executor == "human"
+    assert human_planner("diffusion").executor == "human"
+    with pytest.raises(ValueError, match="unknown hitl policy_type"):
+        human_planner("nope")
+    session = _session()
+    with pytest.raises(ValueError, match="unknown hitl policy_type"):
+        planner_for(session.phases[1], "cutamp", "nope")
+    # A ROBOT phase never reaches the human registry, so a broken policy_type would otherwise sit
+    # there until the plan happened to reach a human phase. check_planners resolves both at startup.
+    assert planner_for(session.phases[0], "cutamp", "nope").name == "cutamp"
+    with pytest.raises(ValueError, match="unknown hitl policy_type"):
+        check_planners(resolve_hitl_config(
+            {"enabled": True, "policy_type": "nope", "policy_checkpoint": str(tmp_path)}
+        ))
+
+
+def test_a_policy_block_that_cannot_run_is_refused_at_parse_time(tmp_path):
+    # Every one of these is a mistake in the task's yml, and a run whose output is a dataset should
+    # not spend a warm-up and a rollout finding it.
+    ok = {"enabled": True, "policy_type": "diffusion", "policy_checkpoint": str(tmp_path)}
+    assert resolve_hitl_config(ok).open_loop_horizon == 8  # the default, unchanged
+    with pytest.raises(ValueError, match="policy_checkpoint must name"):
+        resolve_hitl_config({"enabled": True, "policy_type": "diffusion"})
+    with pytest.raises(ValueError, match="open_loop_horizon must be at least 1"):
+        resolve_hitl_config({**ok, "open_loop_horizon": 0})
+    with pytest.raises(ValueError, match="policy_max_steps must be at least 1"):
+        resolve_hitl_config({**ok, "policy_max_steps": 0})
+    with pytest.raises(ValueError, match="policy_velocity_scale must be positive"):
+        resolve_hitl_config({**ok, "policy_velocity_scale": 0})
+    # ...and none of it applies to the default, which is what keeps an ordinary HITL config alone.
+    assert resolve_hitl_config({"enabled": True}).policy_type == "human"
+    assert resolve_hitl_config({"enabled": True, "policy_checkpoint": None}).policy_checkpoint is None
+
+
+def test_whether_the_checkpoint_EXISTS_is_asked_only_of_the_machine_that_runs_it(tmp_path):
+    # A config naming a checkpoint is parsed in places that will never run it -- the data-collection
+    # server listing configs, the shipped-config test below -- so the filesystem check is separate
+    # and belongs to session start on the host with the arm. Otherwise a perfectly good config would
+    # fail to even list on any other machine.
+    from tiptop.hitl.config import check_policy_checkpoint
+
+    absent = resolve_hitl_config(
+        {"enabled": True, "policy_type": "diffusion", "policy_checkpoint": str(tmp_path / "nope")}
+    )
+    check_policy_config(absent)  # parse-time: fine, the block says what it means
+    with pytest.raises(ValueError, match="not a directory on this machine"):
+        check_policy_checkpoint(absent)
+    check_policy_checkpoint(resolve_hitl_config(
+        {"enabled": True, "policy_type": "diffusion", "policy_checkpoint": str(tmp_path)}
+    ))
+    # The default never looks at the disk at all.
+    check_policy_checkpoint(resolve_hitl_config({"enabled": True}))
+
+
+def test_a_policy_carries_out_the_same_human_phase_the_teleoperator_would(tmp_path):
+    # Switching policy_type changes WHO drives one leg and nothing about the plan: the same phase is
+    # claimed, as a leg of one with no goal to solve, and every robot phase is untouched.
+    session = _session()
+    session.cfg = resolve_hitl_config({
+        "enabled": True, "policy_type": "diffusion", "policy_checkpoint": str(tmp_path),
+    })
+    assert [session.planner(p).name for p in session.phases] == ["cutamp", "diffusion", "cutamp"]
+    session.index = 1
+    leg = session.leg()
+    assert leg.executor == "human" and leg.planner == "diffusion"
+    assert len(leg.phases) == 1 and leg.goal == ()
+    assert session.robot_run() == ()
+    # The record must not credit a teleoperator for a leg no teleoperator drove.
+    record = session.to_json()
+    assert "diffusion policy" in record["provenance"]["human_phases"]
+    assert record["phases"][1]["planned_by"] == "vlm (what the step must achieve); a diffusion policy (the motion)"
+    # ...and the robot half reads exactly as it did before.
+    assert record["provenance"]["robot_phases"].startswith("cuTAMP --")
 
 
 def test_the_record_credits_each_half_to_the_planner_that_carried_it_out():

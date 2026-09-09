@@ -11,13 +11,15 @@ This package keeps the fold in the goal. Given the workspace image and the instr
      (``IsFolded(cloth)``, grounded by a natural-language description a VLM checks in an image);
   2. breaks the instruction into an ORDERED list of phases, each one either a sub-goal for TiPToP or
      an action only a human can do;
-  3. hands each human phase over via the teleop hand-off this repo already has;
-  4. checks, from a fresh image, that the human's phase actually had the intended effect.
+  3. hands each human phase over -- via the teleop hand-off this repo already has, or, with
+     ``hitl.policy_type`` set, to a policy trained on the teleop legs of earlier runs of the task;
+  4. checks, from a fresh image, that the phase actually had the intended effect.
 
-Each robot phase becomes one ordinary TiPToP rollout aimed at that phase's sub-goal -- planned by
-whichever PhasePlanner owns it, cuTAMP today (``planners.py``) -- and each human phase becomes one
-teleop leg. Legs of one task share a trajectory_id, so collect/merge_trajectory.py
-joins them into a single episode exactly as it does for a hand-off today.
+Each robot phase becomes one ordinary TiPToP rollout aimed at that phase's sub-goal, and each human
+phase becomes one hand-off leg -- both planned by whichever PhasePlanner owns them (``planners.py``:
+cuTAMP for the robot's, a teleoperator or a policy for the human's). Legs of one task share a
+trajectory_id, so collect/merge_trajectory.py joins them into a single episode exactly as it does for
+a hand-off today.
 
 Everything here is inert unless a config turns it on (see ``config.resolve_hitl_config``); with it
 off, ``tiptop_run`` does not import this package at all.
@@ -28,7 +30,12 @@ marks as "meant to transfer" are ported: proposal, VLM grounding, and the outer 
 """
 
 from tiptop.hitl.config import HITLConfig, load_hitl_config, resolve_hitl_config
-from tiptop.hitl.planners import Leg, PhasePlanner, register_robot_planner
+from tiptop.hitl.planners import (
+    Leg,
+    PhasePlanner,
+    register_human_planner,
+    register_robot_planner,
+)
 from tiptop.hitl.structs import (
     HITLProposalError,
     Phase,
@@ -47,6 +54,7 @@ __all__ = [
     "TaskSpecification",
     "VLMPredicate",
     "load_hitl_config",
+    "register_human_planner",
     "register_robot_planner",
     "resolve_hitl_config",
 ]

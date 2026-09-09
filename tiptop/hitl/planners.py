@@ -10,6 +10,13 @@ and the planner decides how many consecutive phases it takes in one leg and what
 needs solved for them. Swapping cuTAMP for a different robot planner is registering another one and
 naming it in the config (``hitl.robot_planner``); nothing above this module mentions cuTAMP by name.
 
+The HUMAN half is selectable the same way (``hitl.policy_type``), and for a reason worth stating: a
+phase is the human's because cuTAMP cannot express what it asks for, not because a person is the only
+thing that could do it. A policy trained on the teleop legs of earlier runs of this very task can be
+handed the same phase -- so a task that once read tamp -> teleop -> tamp runs as tamp -> policy ->
+tamp, with the same sub-goals, the same verification afterwards and the same merged episode. What
+changes is who drives the arm for one leg; the plan does not know the difference.
+
 What a planner does NOT decide is the plan: the phase list, its order and each phase's goal atoms are
 fixed by the proposal stage before the arm moves. A planner is asked only how to carry out phases it
 has been given.
@@ -49,7 +56,9 @@ class PhasePlanner(Protocol):
     """How one kind of phase gets carried out.
 
     Three questions, and no more: does this planner claim the phase, how far does one leg of it run,
-    and who should the audit trail say wrote what ran.
+    and who should the audit trail say wrote what ran. "Planner" is the interface's name rather than
+    a claim about the work: a hand-off planner solves for nothing at all, and answers the three
+    questions anyway.
     """
 
     name: str
@@ -72,25 +81,59 @@ class PhasePlanner(Protocol):
         ...
 
 
-class TeleopPhasePlanner:
-    """A human phase: hand the arm over, then check from a photo that it happened.
+class HandoffPhasePlanner:
+    """Base for the human side: one phase per leg, and nothing to solve.
 
     One phase per leg, always. Two consecutive human steps are two hand-offs because each one is
     verified on its own -- merging them would make one failed check fail work that was done -- and
     there is no goal for anything to solve: ``tiptop_run`` skips planning entirely for this leg and
     goes straight to the hand-off (see ``_hitl_human_phase``).
+
+    ``executor`` stays ``"human"`` for every subclass, including the ones where no human touches the
+    arm. It is the PHASE's executor -- the proposal stage's judgement that this step is not something
+    cuTAMP can be given -- and that judgement is what makes the leg a hand-off at all. Who actually
+    drives it is ``name``, and ``provenance`` is where the record says so.
     """
 
-    name = "teleop"
     executor = "human"
-    provenance = "the teleoperator, following the phase's instructions"
-    authorship = "vlm"
 
     def handles(self, phase: Phase) -> bool:
         return phase.is_human
 
     def leg(self, phases: Sequence[Phase], scene_types: SceneTypes) -> Leg:
         return Leg(planner=self.name, executor=self.executor, phases=(phases[0],))
+
+
+class TeleopPhasePlanner(HandoffPhasePlanner):
+    """A human phase: hand the arm over to a teleoperator, then check from a photo that it happened."""
+
+    name = "human"
+    provenance = "the teleoperator, following the phase's instructions"
+    authorship = "vlm"
+
+
+class DiffusionPolicyPhasePlanner(HandoffPhasePlanner):
+    """A human phase driven by a trained diffusion policy instead of a person.
+
+    The policy is a LeRobot ``DiffusionPolicy`` behaviour-cloned on the TELEOP LEGS of earlier HITL
+    runs of this same task (hitl-baseline/diffusion_policy), so what it imitates is precisely the
+    phase it is being handed. ``tiptop_run._run_policy_phase`` releases the arm and the cameras
+    exactly as a teleop hand-off does and runs the policy's own driver in their place; the phase is
+    then verified by the same VLM check, against the same atoms, as if a person had done it.
+
+    It is imitation, not achievement: nothing in a BC policy knows what the phase's atoms say, so the
+    leg ends on ``hitl.policy_max_steps`` rather than on success, and the verification that follows is
+    the only thing that decides whether it worked.
+    """
+
+    name = "diffusion"
+    provenance = (
+        "a LeRobot diffusion policy trained on the teleop legs of earlier runs of this task "
+        "(hitl-baseline/diffusion_policy), run closed-loop in place of the teleoperator: it drives "
+        "the arm for a fixed number of control steps and the phase verification decides whether what "
+        "it did counts"
+    )
+    authorship = "vlm (what the step must achieve); a diffusion policy (the motion)"
 
 
 class CuTAMPPhasePlanner:
@@ -151,11 +194,13 @@ class CuTAMPPhasePlanner:
         )
 
 
-# Robot planners by name, so `hitl.robot_planner` can select one. Human phases are always the teleop
-# planner's: a hand-off is what makes a phase the human's in the first place, so there is nothing to
-# choose between.
+# Planners by name, one registry per side of the plan, so `hitl.robot_planner` and `hitl.policy_type`
+# each select from the half they are about. Two registries rather than one because the two halves are
+# not interchangeable: a robot planner is asked for a symbolic goal cuTAMP can solve, and a human
+# planner is asked for none at all, so a name from the wrong half would be a config that type-checks
+# and then cannot run.
 _ROBOT_PLANNERS: dict[str, PhasePlanner] = {}
-_TELEOP_PLANNER = TeleopPhasePlanner()
+_HUMAN_PLANNERS: dict[str, PhasePlanner] = {}
 
 
 def register_robot_planner(planner: PhasePlanner) -> None:
@@ -169,33 +214,73 @@ def register_robot_planner(planner: PhasePlanner) -> None:
     _ROBOT_PLANNERS[planner.name] = planner
 
 
+def register_human_planner(planner: PhasePlanner) -> None:
+    """Make a planner selectable as ``hitl.policy_type``.
+
+    The same extension point on the other side. A new one is a class here plus a driver for
+    ``tiptop_run._run_policy_phase`` to run; the plan, the hand-off and the verification are already
+    written and do not know which one they got.
+    """
+    assert planner.executor == "human", planner.executor
+    _HUMAN_PLANNERS[planner.name] = planner
+
+
 register_robot_planner(CuTAMPPhasePlanner())
+register_human_planner(TeleopPhasePlanner())
+register_human_planner(DiffusionPolicyPhasePlanner())
 
 
-def teleop_planner() -> PhasePlanner:
-    """The planner every human phase goes to."""
-    return _TELEOP_PLANNER
+def _lookup(registry: dict[str, PhasePlanner], name: str, key: str) -> PhasePlanner:
+    """The registered planner called ``name``, or a ValueError naming what there is.
 
-
-def robot_planner(name: str) -> PhasePlanner:
-    """The registered robot planner called ``name``.
-
-    Raises rather than falling back to cuTAMP: a config that names a planner this build does not have
-    is asking for something it will not get, and silently planning the task with a different one is
-    the wrong answer to that in a run whose output is a dataset.
+    Raises rather than falling back to the default: a config that names a planner this build does not
+    have is asking for something it will not get, and silently carrying the task out with a different
+    one is the wrong answer to that in a run whose output is a dataset.
     """
     try:
-        return _ROBOT_PLANNERS[name]
+        return registry[name]
     except KeyError:
         raise ValueError(
-            f"unknown hitl robot_planner {name!r}. Registered: {', '.join(sorted(_ROBOT_PLANNERS)) or '(none)'}"
+            f"unknown hitl {key} {name!r}. Registered: {', '.join(sorted(registry)) or '(none)'}"
         ) from None
 
 
-def planner_for(phase: Phase, robot_planner_name: str) -> PhasePlanner:
+def robot_planner(name: str) -> PhasePlanner:
+    """The registered robot planner called ``name`` (``hitl.robot_planner``)."""
+    return _lookup(_ROBOT_PLANNERS, name, "robot_planner")
+
+
+def human_planner(name: str) -> PhasePlanner:
+    """The registered human-phase planner called ``name`` (``hitl.policy_type``)."""
+    return _lookup(_HUMAN_PLANNERS, name, "policy_type")
+
+
+def teleop_planner() -> PhasePlanner:
+    """The one human-phase planner that needs a PERSON, so callers can test for it by identity.
+
+    ``tiptop_run._hitl_human_phase`` has to know whether to block on a prompt or to run a driver, and
+    that is a fact about this planner rather than about its config spelling: comparing against this
+    singleton keeps the branch correct if ``policy_type: human`` is ever spelled differently.
+    """
+    return _HUMAN_PLANNERS["human"]
+
+
+def check_planners(cfg) -> None:
+    """Resolve both of a config's planner names, so a typo fails at startup rather than mid-task.
+
+    A bad ``robot_planner`` used to surface on the first leg and a bad ``policy_type`` would surface
+    at the first HUMAN phase -- minutes of warm-up and a rollout's worth of arm motion after the run
+    began, and with a half-collected trajectory already on disk.
+    """
+    robot_planner(cfg.robot_planner)
+    human_planner(cfg.policy_type)
+
+
+def planner_for(phase: Phase, robot_planner_name: str, human_planner_name: str) -> PhasePlanner:
     """The planner that carries out ``phase``."""
     planner = robot_planner(robot_planner_name)
     if planner.handles(phase):
         return planner
-    assert _TELEOP_PLANNER.handles(phase), f"no planner claims {phase.executor} phases"
-    return _TELEOP_PLANNER
+    human = human_planner(human_planner_name)
+    assert human.handles(phase), f"no planner claims {phase.executor} phases"
+    return human

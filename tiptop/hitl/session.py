@@ -1,9 +1,10 @@
 """The HITL session: one task's phases, walked one rollout at a time.
 
 A HITL task is not one rollout. Each robot phase is an ordinary TiPToP rollout aimed at that phase's
-sub-goal, and each human phase is a teleop leg -- so the plan has to survive the hand-off between
-them. tiptop_run is a single long-lived process, so this state lives here and is keyed on the
-trajectory it belongs to; anything that ends the trajectory ends the session with it.
+sub-goal, and each human phase is a hand-off leg -- a teleoperator, or the policy standing in for one
+(``hitl.policy_type``) -- so the plan has to survive the hand-over between them. tiptop_run is a
+single long-lived process, so this state lives here and is keyed on the trajectory it belongs to;
+anything that ends the trajectory ends the session with it.
 """
 
 import logging
@@ -29,7 +30,7 @@ from tiptop.hitl.planning import (
     initial_state_for,
     phase_objects,
 )
-from tiptop.hitl.planners import Leg, planner_for, robot_planner, teleop_planner
+from tiptop.hitl.planners import Leg, human_planner, planner_for, robot_planner
 from tiptop.hitl.proposal import propose_plan
 from tiptop.hitl.structs import Phase, TaskSpecification, describe_atom
 
@@ -123,16 +124,16 @@ class HITLSession:
         """
         phase = self.current if phase is None else phase
         assert phase is not None, "a finished session has no planner"
-        return planner_for(phase, self.cfg.robot_planner)
+        return planner_for(phase, self.cfg.robot_planner, self.cfg.policy_type)
 
     def leg(self) -> Leg | None:
         """The phases this rollout carries out, and who carries them out. None when finished.
 
-        A leg is however many consecutive phases its planner takes at once. The teleop planner always
-        takes exactly one -- each human step is verified on its own. The cuTAMP planner takes a whole
-        run of consecutive robot phases as a single goal, stopping where a shared object would make
-        one plan unsatisfiable; ``planners.CuTAMPPhasePlanner`` is where that rule and its reasons
-        live now.
+        A leg is however many consecutive phases its planner takes at once. A human-phase planner --
+        the teleop hand-off, or a policy standing in for it -- always takes exactly one, since each
+        human step is verified on its own. The cuTAMP planner takes a whole run of consecutive robot
+        phases as a single goal, stopping where a shared object would make one plan unsatisfiable;
+        ``planners.CuTAMPPhasePlanner`` is where that rule and its reasons live now.
         """
         if self.finished:
             return None
@@ -315,7 +316,7 @@ class HITLSession:
                 # here: which planner has the robot's phases is a config choice (hitl.robot_planner),
                 # and a record that hard-codes one is a false statement the moment it is changed.
                 "robot_phases": robot_planner(self.cfg.robot_planner).provenance,
-                "human_phases": teleop_planner().provenance,
+                "human_phases": human_planner(self.cfg.policy_type).provenance,
             },
             "phases": phases,
             "phase_index": self.index,
@@ -406,13 +407,23 @@ def handoff_message(session: HITLSession, phase: Phase) -> str:
     return "\n".join(lines)
 
 
-def retry_message(missing: Sequence[str], attempts_left: int) -> str:
-    """What the operator is shown when the check says the phase is not done."""
+def retry_message(missing: Sequence[str], attempts_left: int, by: str = "human") -> str:
+    """What is printed when the check says the phase is not done.
+
+    ``by`` is the planner that carried the phase out (``HITLConfig.policy_type``). It changes only
+    the last line, which is an instruction to whoever gets another go: a person is asked to take the
+    arm again, and a policy is simply told it is being run again -- printing "take the arm" into a
+    log nobody is reading would be an instruction to nobody.
+    """
     lines = ["", "=" * 70, "The workspace does not look like that step was completed.", "Still expected:"]
     lines += [f"  - {text}" for text in missing]
     if attempts_left > 0:
         lines.append("")
-        lines.append("Take the arm again and finish it, or type 'done' if you believe it IS done.")
+        lines.append(
+            "Take the arm again and finish it, or type 'done' if you believe it IS done."
+            if by == "human"
+            else f"Running the {by} policy on this phase again ({attempts_left} attempt(s) left)."
+        )
     lines.append("=" * 70)
     return "\n".join(lines)
 

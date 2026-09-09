@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -394,61 +395,33 @@ def _reacquire_cameras(container: "_DemoContainer", *, had_external_cam_2: bool)
     object.__setattr__(container, "external_cam_2", external_cam_2)
 
 
-def _run_teleop_handoff(
-    container: "_DemoContainer", can_finish: bool = False, plan_next: str | None = None
-) -> bool:
-    """Hand the physical arm off to a human teleop session, then block until it's handed back.
+def _release_hardware(container: "_DemoContainer", to: str) -> bool:
+    """Let go of the arm and the cameras so another process can take them. Returns whether a second
+    external camera was open, which _reacquire_hardware needs to notice if it does not come back.
 
-    Returns True when the operator ended the trajectory from teleop ("resume_finish") rather than
-    handing it back to be replanned: their demonstration finished the task, so the caller closes the
-    trajectory out instead of queueing another rollout. Returns False for a plain "resume", which is
-    the unchanged behaviour -- replan the same task from the hand-off pose.
+    Steps 1-3 of the hand-off, shared by every kind of it -- a teleop session (``to="teleop"``) and a
+    policy leg (``to="policy"``) release exactly the same hardware, because what makes them
+    exclusive is the hardware, not who is driving it:
 
-    `can_finish` says whether the caller HAS a partial rollout to close out. Only the mid-rollout
-    hand-off does; the ones taken at a prompt or after a preempt have no leg to label and no
-    trajectory to end, so they advertise `can_finish: false` and downgrade a "resume_finish" to a
-    plain resume rather than stranding the operator.
+      1. release this process's RobotClient so a separate process can command the arm -- they talk to
+         the same NUC-side polymetis server and cannot hold it at once (data-collection/ARCHITECTURE.md).
+      2. confirm the arm has ACTUALLY stopped (wait_for_robot_stationary) before anyone is told it is
+         safe to touch: releasing our connection does not mean the shim is done -- it still has to
+         finish the in-flight trajectory segment and hand control back to polymetis's default hold
+         controller, which takes real time.
+      3. release the ZEDs, which the other process opens by the same serials. AFTER the stationary
+         check, so a "could not confirm the arm stopped" warning reaches the operator immediately
+         rather than behind several seconds of camera teardown.
 
-    `plan_next` says what a PLAIN "resume" will do, when something already knows -- "robot" (a phase
-    follows this one, so the arm carries on) or "end" (this was the plan's last phase, so handing
-    back closes the trajectory out and lands at the label prompt). A HITL human phase always knows;
-    a hand-off the operator took mid-rollout does not, and passes None. It is advisory, for the UI's
-    single "next" control: nothing here branches on it, because a plain "resume" already does the
-    right thing in both cases -- _hitl_human_phase advances the plan and labels when it is finished.
-
-    Called at a rollout checkpoint (see _sigusr1_teleop_switch), so the current plan step has already
-    finished and this rollout's partial episode is already on disk. From here:
-      1. release this process's RobotClient connection so a separate teleop process (DROID's
-         StableRobotEnv) can take over the arm -- they talk to the same NUC-side polymetis server and
-         cannot hold it at once (see data-collection/ARCHITECTURE.md).
-      2. confirm the arm has ACTUALLY stopped moving (wait_for_robot_stationary) before anyone is
-         told it's safe to touch the shim -- releasing our connection does not mean the shim is
-         done: it still has to finish the in-flight trajectory segment and hand control back to
-         polymetis's default hold controller, which takes real time. Skipping this check would let
-         an operator kill the shim (or start teleop) while the arm is still moving.
-      3. release the ZED cameras too (_release_cameras) -- teleop opens the same serials. This runs
-         AFTER the stationary check so a "could not confirm the arm stopped" warning reaches the
-         operator immediately, rather than behind several seconds of camera teardown.
-      4. emit "awaiting_teleop_resume" so the data-collection server knows it's safe to start the
-         teleop session, then block on stdin for "resume" (written once the operator hands control
-         back and the teleop process has exited, releasing the arm and the cameras).
-      5. re-open the cameras, reconnect the RobotClient, and queue the SAME task instruction with
-         _skip_episode_reset so the next loop iteration replans from the hand-off pose without
-         moving the arm first -- no return to home, no gripper open, no move to the capture pose.
-         The task plan this rollout was following is queued with it (_reuse_plan_skeleton), so the
-         resumed rollout re-solves the motion for the SAME plan rather than searching for another.
-         Skipped entirely when the operator chose to finish: nothing is queued, and the caller
-         labels the partial leg instead.
+    Marks the trajectory multi-leg on the way through: from here it has a leg that is not ours, so
+    its export waits for collect/merge_trajectory.py (see _spawn_postprocess).
     """
-    global _pending_instruction, _skip_episode_reset, _trajectory_handed_off, _reuse_plan_skeleton
-    global _continue_trajectory
-    _log.info("Teleop switch: releasing the robot connection for hand-off")
-    # This trajectory now spans several legs, so its export waits for the merge (see _spawn_postprocess).
+    global _trajectory_handed_off
+    _log.info(f"Releasing the robot connection for the {to} leg")
     _trajectory_handed_off = True
-    _emit_event({"event": "teleop_handoff_start"})
     release_robot_client(container.robot)
 
-    _log.info("Confirming the arm has come to a full stop before handing off to teleop...")
+    _log.info("Confirming the arm has come to a full stop before handing over...")
     if wait_for_robot_stationary():
         _log.info("Confirmed: the arm is stationary")
     else:
@@ -475,6 +448,63 @@ def _run_teleop_handoff(
         # save workers reaped, another process can claim the device about a second later
         # (measured). Leave a little slack and let the opener, which retries, confirm the rest.
         time.sleep(CAMERA_RELEASE_SETTLE_S)
+    return had_external_cam_2
+
+
+def _reacquire_hardware(container: "_DemoContainer", had_external_cam_2: bool) -> None:
+    """Take the arm and the cameras back once the other process has exited. The mirror of
+    _release_hardware, and the last step of every hand-off."""
+    _log.info("Resuming: taking the robot and cameras back")
+    # Slack in the other direction: the other process's capture children have just died (possibly by
+    # SIGKILL, without closing their cameras, so the SDK teardown never ran). ZedCamera retries on
+    # its own, but each retry costs a USB reboot -- a moment here is cheaper than a failed attempt.
+    time.sleep(CAMERA_RELEASE_SETTLE_S)
+    _reacquire_cameras(container, had_external_cam_2=had_external_cam_2)
+    object.__setattr__(container, "robot", reconnect_robot_client())
+    _restart_save_pool()
+
+
+def _run_teleop_handoff(
+    container: "_DemoContainer", can_finish: bool = False, plan_next: str | None = None
+) -> bool:
+    """Hand the physical arm off to a human teleop session, then block until it's handed back.
+
+    Returns True when the operator ended the trajectory from teleop ("resume_finish") rather than
+    handing it back to be replanned: their demonstration finished the task, so the caller closes the
+    trajectory out instead of queueing another rollout. Returns False for a plain "resume", which is
+    the unchanged behaviour -- replan the same task from the hand-off pose.
+
+    `can_finish` says whether the caller HAS a partial rollout to close out. Only the mid-rollout
+    hand-off does; the ones taken at a prompt or after a preempt have no leg to label and no
+    trajectory to end, so they advertise `can_finish: false` and downgrade a "resume_finish" to a
+    plain resume rather than stranding the operator.
+
+    `plan_next` says what a PLAIN "resume" will do, when something already knows -- "robot" (a phase
+    follows this one, so the arm carries on) or "end" (this was the plan's last phase, so handing
+    back closes the trajectory out and lands at the label prompt). A HITL human phase always knows;
+    a hand-off the operator took mid-rollout does not, and passes None. It is advisory, for the UI's
+    single "next" control: nothing here branches on it, because a plain "resume" already does the
+    right thing in both cases -- _hitl_human_phase advances the plan and labels when it is finished.
+
+    Called at a rollout checkpoint (see _sigusr1_teleop_switch), so the current plan step has already
+    finished and this rollout's partial episode is already on disk. From here:
+      1. release the arm and the cameras (_release_hardware) so a separate teleop process (DROID's
+         StableRobotEnv) can take both.
+      2. emit "awaiting_teleop_resume" so the data-collection server knows it's safe to start the
+         teleop session, then block on stdin for "resume" (written once the operator hands control
+         back and the teleop process has exited, releasing the arm and the cameras).
+      3. take the hardware back (_reacquire_hardware) and queue the SAME task instruction with
+         _skip_episode_reset so the next loop iteration replans from the hand-off pose without
+         moving the arm first -- no return to home, no gripper open, no move to the capture pose.
+         The task plan this rollout was following is queued with it (_reuse_plan_skeleton), so the
+         resumed rollout re-solves the motion for the SAME plan rather than searching for another.
+         Skipped entirely when the operator chose to finish: nothing is queued, and the caller
+         labels the partial leg instead.
+    """
+    global _pending_instruction, _skip_episode_reset, _trajectory_handed_off, _reuse_plan_skeleton
+    global _continue_trajectory
+    _emit_event({"event": "teleop_handoff_start"})
+    had_external_cam_2 = _release_hardware(container, "teleop")
 
     # trajectory_id rides along so the server can stamp the teleop leg it is about to spawn with the
     # same id, making the human's demonstration a segment of this trajectory rather than its own episode.
@@ -519,17 +549,10 @@ def _run_teleop_handoff(
     except EOFError:
         raise UserExitException("EOF while awaiting teleop resume")
 
-    _log.info("Resuming: taking the robot and cameras back")
     # Any switch-to-teleop pressed WHILE we were handed off is already satisfied by this hand-off;
     # leaving it armed would bounce the resumed rollout straight back out at its first step.
     _consume_teleop_request()
-    # Same slack in the other direction: teleop's capture processes have just died (possibly by
-    # SIGKILL, without closing their cameras, so the SDK teardown never ran). ZedCamera retries on
-    # its own, but each retry costs a USB reboot -- a moment here is cheaper than a failed attempt.
-    time.sleep(CAMERA_RELEASE_SETTLE_S)
-    _reacquire_cameras(container, had_external_cam_2=had_external_cam_2)
-    object.__setattr__(container, "robot", reconnect_robot_client())
-    _restart_save_pool()
+    _reacquire_hardware(container, had_external_cam_2)
     _emit_event({"event": "teleop_handoff_done"})
 
     if finish:
@@ -1471,8 +1494,163 @@ def _await_human_phase(message: str) -> str:
         _log.warning(f"Ignoring {raw!r}: type 'done' or 'abort', or press 'Switch to teleop' in the UI")
 
 
-async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool) -> bool:
-    """Hand one human phase over, then check from a fresh image that it happened.
+# Where the policy drivers live, relative to this checkout. Both are overridable from the environment
+# because the data-collection server already resolves them for the teleop and eval children
+# (settings.droidPython / droidDir) and is the one thing that knows how this machine is set up; the
+# defaults keep `tiptop-run` working when it is started by hand, off the repo layout alone.
+_REPO_ROOT = Path(__file__).resolve().parents[2]  # <repo>/tiptop/tiptop/tiptop_run.py -> <repo>
+#: hitl-baseline/diffusion_policy -- the project that trained the checkpoints and serves them.
+_DEFAULT_POLICY_DIR = _REPO_ROOT / "hitl-baseline" / "diffusion_policy"
+
+
+def _policy_driver_paths(cfg) -> tuple[str, str, str, str]:
+    """(droid python, droid dir, policy python, policy dir) for a policy leg.
+
+    Three interpreters are in play on a policy leg and none of them is this one: tiptop runs under
+    its pixi env, the leg driver needs the DROID conda env (droid + pyzed), and the checkpoint needs
+    the diffusion project's venv (LeRobot + torch). This resolves the two we have to spawn.
+    """
+    droid_dir = os.environ.get("TIPTOP_DROID_DIR") or str(_REPO_ROOT / "droid")
+    droid_python = os.environ.get("TIPTOP_DROID_PYTHON") or "python"
+    policy_dir = os.environ.get("TIPTOP_POLICY_DIR") or str(_DEFAULT_POLICY_DIR)
+    policy_python = cfg.policy_python or os.environ.get("TIPTOP_POLICY_PYTHON")
+    if not policy_python:
+        policy_python = str(Path(policy_dir) / ".venv" / "bin" / "python")
+    return droid_python, droid_dir, policy_python, policy_dir
+
+
+def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: str) -> dict:
+    """Carry out one human phase with a trained policy instead of a person. Returns its result dict.
+
+    The same hand-off as a teleop one, minus the human and minus the waiting: the arm and the cameras
+    are released (_release_hardware), ``droid/scripts/policy_capture.py`` drives the arm closed-loop
+    from the pose TAMP parked it at and writes its leg into this session's own output dir, and the
+    hardware comes straight back (_reacquire_hardware). The leg carries this trajectory's id and
+    ``segment_source: "policy"``, so collect/merge_trajectory.py joins it with the tamp legs exactly
+    as it joins a teleop one.
+
+    Nothing about the plan changes. The caller verifies the phase from a fresh image against the same
+    atoms, the operator labels the same trajectory, and the only thing that is different is who moved
+    the arm -- which is what ``hitl.policy_type`` selects and what the leg's provenance records.
+
+    Blocking, deliberately, and not on stdin: there is no operator in this loop to wait for and no UI
+    button to press. The driver ends its own leg on ``hitl.policy_max_steps``, so this returns when
+    that process exits. A driver that fails is reported and the phase carries on to verification,
+    which will say the phase did not happen -- the same outcome as a person who did not manage it,
+    handled by the retry path that already exists rather than by a second error path here.
+
+    The result dict is what the driver wrote: ``{ok, n_frames, dir, preempted}``, or ``{ok: False,
+    error}`` when it never got that far.
+    """
+    from tiptop.hitl.session import phase_summary
+
+    global _pending_instruction, _continue_trajectory
+    droid_python, droid_dir, policy_python, policy_dir = _policy_driver_paths(_hitl_cfg)
+    result_file = Path(tempfile.gettempdir()) / f"tiptop-policy-leg-{os.getpid()}-{int(time.time())}.json"
+    cmd = [
+        droid_python, "scripts/policy_capture.py",
+        "--output-root", output_dir,
+        "--instruction", phase.instructions or phase.description,
+        "--config-id", f"tamp/{planner.name}",
+        "--checkpoint", _hitl_cfg.policy_checkpoint,
+        "--policy-python", policy_python,
+        "--policy-dir", policy_dir,
+        "--open-loop-horizon", str(_hitl_cfg.open_loop_horizon),
+        "--num-inference-steps", str(_hitl_cfg.policy_num_inference_steps),
+        "--max-steps", str(_hitl_cfg.policy_max_steps),
+        "--velocity-scale", str(_hitl_cfg.policy_velocity_scale),
+        "--result-file", str(result_file),
+    ]
+    if _trajectory_id:
+        cmd += ["--trajectory-id", _trajectory_id]
+
+    _emit_event({
+        "event": "policy_phase_start",
+        "trajectory_id": _trajectory_id,
+        "policy_type": planner.name,
+        "checkpoint": _hitl_cfg.policy_checkpoint,
+        "max_steps": _hitl_cfg.policy_max_steps,
+        # The phase's own text, alongside where it sits in the plan. Carried for the same reason
+        # `awaiting_human_phase` carries it: the page shows what the driver printed, and here that
+        # is the only description of what the arm is about to do on its own.
+        "instructions": phase.instructions,
+        **phase_summary(_hitl_session, phase),
+    })
+    had_external_cam_2 = _release_hardware(container, planner.name)
+    result: dict = {"ok": False, "error": "the policy driver did not report a result"}
+    try:
+        _log.info(f"HITL: running the {planner.name} policy for this phase: {' '.join(cmd)}")
+        # The driver's stdout and stderr are ours, so its progress and the policy server's log stream
+        # into the session log with everything else rather than into a file nobody reads. Its stdin
+        # is NOT: ours is the pipe the data-collection server writes commands down, and a child that
+        # ever read from it would eat a line meant for this process.
+        completed = subprocess.run(
+            cmd, cwd=droid_dir, env=_policy_driver_env(droid_dir), stdin=subprocess.DEVNULL
+        )
+        if result_file.is_file():
+            result = json.loads(result_file.read_text())
+        elif completed.returncode != 0:
+            result = {"ok": False, "error": f"the policy driver exited with code {completed.returncode}"}
+    except OSError as exc:
+        # Almost always a droid python that is not where we think it is. Reported rather than raised:
+        # the arm is parked and the trajectory is still open, and the verification below is the
+        # honest verdict on a phase during which nothing moved.
+        result = {"ok": False, "error": f"could not run the policy driver ({droid_python}): {exc}"}
+    except json.JSONDecodeError as exc:
+        result = {"ok": False, "error": f"the policy driver wrote an unreadable result file: {exc}"}
+    finally:
+        result_file.unlink(missing_ok=True)
+        _reacquire_hardware(container, had_external_cam_2)
+
+    # Queue the SAME task so the rollout loop goes straight round into the next phase instead of
+    # dropping to the task prompt. This is the half of _run_teleop_handoff's resume that a policy leg
+    # still needs: an operator-driven phase can end at the prompt because there is an operator
+    # standing there to press continue, and here there is nobody. `_pending_instruction` is what
+    # _get_task_instruction consumes without blocking on stdin, and `_continue_trajectory` is what
+    # keeps the trajectory id -- without it the next leg mints a new one, HITLSession.matches() fails
+    # and the half-walked plan is dropped mid-task.
+    #
+    # Armed whether or not the leg succeeded. A failed policy leg is a phase that did not happen, and
+    # what decides that is the verification the caller is about to run, not this function; if it says
+    # the plan stops, the caller clears the instruction again on its way to the label prompt.
+    # _skip_episode_reset and _reuse_plan_skeleton are deliberately NOT set: the caller resolves both
+    # for a human phase (skip the homing, keep the gripper check, drop the stale skeleton) and a
+    # policy leg wants exactly the same treatment.
+    if _LAST_TASK:
+        _pending_instruction = _LAST_TASK
+        _continue_trajectory = True
+
+    if not result.get("ok"):
+        _log.error(f"HITL: the policy phase failed: {result.get('error')}")
+    else:
+        _log.info(f"HITL: the policy leg recorded {result.get('n_frames', 0)} frames in {result.get('dir')}")
+    _emit_event({
+        "event": "policy_phase_done",
+        "trajectory_id": _trajectory_id,
+        "policy_type": planner.name,
+        "ok": bool(result.get("ok")),
+        "n_frames": int(result.get("n_frames") or 0),
+        "dir": result.get("dir"),
+        "error": result.get("error"),
+    })
+    return result
+
+
+def _policy_driver_env(droid_dir: str) -> dict:
+    """The policy driver's environment: ours, with THIS checkout's droid first on PYTHONPATH.
+
+    Same fix the data-collection server applies to its own DROID children (sessions.js
+    droidPythonPath): `droid` is pip-installed editable from wherever it was first set up, which is
+    not necessarily this repo, so a driver run by path out of `droid_dir` would import `droid.*` from
+    a different clone.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [droid_dir, env.get("PYTHONPATH")]))
+    return env
+
+
+async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool, output_dir: str) -> bool:
+    """Carry out one human phase, then check from a fresh image that it happened.
 
     Returns True when this rollout should be labeled and the trajectory closed out. Three ways there,
     all the same thing to the caller -- a `labeled` event, which ends the trajectory and has the
@@ -1481,6 +1659,12 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
     the plan but must NOT cost the operator the demonstration. Returning False leaves the trajectory
     open, which is what lets a robot phase AFTER a human one still happen.
 
+    **Who carries the phase out is ``hitl.policy_type``, and it is the only branch here.** With
+    "human" (the default) the operator is shown what to do and takes the arm through the teleop
+    hand-off; with a policy planner, ``_run_policy_phase`` drives the leg and nothing is asked of
+    anybody. Everything after that point -- the verification, the retries, the advance, what the
+    caller does with the answer -- is shared, because the phase is the same phase either way.
+
     **The last phase is not checked at all.** Verification exists because every LATER phase is planned
     against the belief that this one happened -- and after the final phase there is no later phase.
     What there is instead is the operator, labeling the whole trajectory seconds later: a human
@@ -1488,41 +1672,59 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
     ends and the label prompt decides whether the episode is kept.
 
     Elsewhere a failed check is not silently accepted: the operator is told what is still missing and
-    given another go (``verify_retries``). Continuing on a false belief is the one outcome worth
-    avoiding -- but so is throwing away a demonstration a human just gave because one classifier call
-    went the wrong way, which is why a spent retry budget still ends at the label prompt rather than
-    dropping the legs unlabeled.
+    given another go (``verify_retries``); a policy is simply run again, from wherever its last
+    attempt left the arm. Continuing on a false belief is the one outcome worth avoiding -- but so is
+    throwing away a demonstration a human just gave because one classifier call went the wrong way,
+    which is why a spent retry budget still ends at the label prompt rather than dropping the legs
+    unlabeled.
     """
     from tiptop.hitl.grounding import missing_statements, verify_phase
+    from tiptop.hitl.planners import teleop_planner
     from tiptop.hitl.session import handoff_message, phase_summary, retry_message
 
     session = _hitl_session
     assert session is not None
+    planner = session.planner(phase)
+    # Identity, not a name: what decides the branch below is whether this planner needs a PERSON --
+    # a fact about the planner -- and not how `policy_type` happens to spell it.
+    by_hand = planner is teleop_planner()
     attempts_left = _hitl_cfg.verify_retries
     finished_from_teleop = False
 
     while True:
-        _emit_event({
-            "event": "awaiting_human_phase",
-            "instructions": phase.instructions,
-            **phase_summary(session, phase),
-        })
-        try:
-            answer = _await_human_phase(handoff_message(session, phase))
-        except TeleopHandoffRequested:
-            # "Switch to teleop" was pressed. Consume the request here so the hand-off we are about
-            # to run satisfies it, rather than leaving it armed to fire again in the next rollout.
-            _consume_teleop_request()
-            _log.info("HITL: handing the arm over for the human phase")
-            # The plan, not the operator, decides what a hand-back does here: the last phase closes
-            # the trajectory out (the advance() below finishes the session and returns True), any
-            # earlier one carries on into the next phase. Reported so the UI can say which.
-            finished_from_teleop = _run_teleop_handoff(
-                container,
-                can_finish=can_finish,
-                plan_next="end" if session.is_final_phase() else "robot",
-            )
+        if not by_hand:
+            # A policy leg asks nobody for anything, so it does NOT emit `awaiting_human_phase`:
+            # that event parks the data-collection UI on a prompt whose buttons write to a stdin
+            # nothing is reading here. _run_policy_phase emits its own start/done pair instead.
+            _run_policy_phase(container, phase, planner, output_dir)
+            # A failed leg is not an error path of its own. The arm is parked, the trajectory is
+            # open, and the verification below is the honest verdict on a phase during which the
+            # policy may have done nothing -- which is exactly the case `verify_retries` handles.
             answer = "done"
+        else:
+            _emit_event({
+                "event": "awaiting_human_phase",
+                "instructions": phase.instructions,
+                **phase_summary(session, phase),
+            })
+            try:
+                answer = _await_human_phase(handoff_message(session, phase))
+            except TeleopHandoffRequested:
+                # "Switch to teleop" was pressed. Consume the request here so the hand-off we are
+                # about to run satisfies it, rather than leaving it armed to fire again in the next
+                # rollout.
+                _consume_teleop_request()
+                _log.info("HITL: handing the arm over for the human phase")
+                # The plan, not the operator, decides what a hand-back does here: the last phase
+                # closes the trajectory out (the advance() below finishes the session and returns
+                # True), any earlier one carries on into the next phase. Reported so the UI can say
+                # which.
+                finished_from_teleop = _run_teleop_handoff(
+                    container,
+                    can_finish=can_finish,
+                    plan_next="end" if session.is_final_phase() else "robot",
+                )
+                answer = "done"
         if answer == "abort":
             _hitl_reset_session("the operator abandoned the human phase")
             return finished_from_teleop
@@ -1577,7 +1779,7 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
                 return True
             _log.info(
                 f"HITL: {len(session.phases) - session.index} phase(s) still to go; the robot "
-                "carries on once the arm is handed back"
+                "carries on from here"
             )
             if finished_from_teleop:
                 # Phases remain, but the operator chose "return & finish": their demonstration
@@ -1597,11 +1799,11 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
             # never merged. What the config promises ("the operator still labels the episode, so a
             # false negative is recoverable by answering the label prompt") is this: the label prompt
             # appears and they keep it, mark it suboptimal, or call it a failure.
-            print(retry_message(missing, 0), flush=True)
+            print(retry_message(missing, 0, planner.name), flush=True)
             _hitl_reset_session("the human phase could not be verified")
             return True
         attempts_left -= 1
-        print(retry_message(missing, attempts_left + 1), flush=True)
+        print(retry_message(missing, attempts_left + 1, planner.name), flush=True)
         if finished_from_teleop:
             # They already ended the trajectory; there is no leg left to hand off again.
             _hitl_reset_session("the human phase could not be verified")
@@ -3791,7 +3993,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # is still the operator's to start (the same "Switch to teleop" button), so
                         # nothing takes the arm out from under them.
                         global _pending_instruction
-                        finished = await _hitl_human_phase(container, human_phase, can_finish=True)
+                        finished = await _hitl_human_phase(
+                            container, human_phase, can_finish=True, output_dir=output_dir
+                        )
                         if finished:
                             # The task is over. _run_teleop_handoff queues the same instruction for
                             # the next iteration on a plain "resume", which would start the WHOLE
@@ -3830,7 +4034,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # drop to the bare prompt, and a motion skip left standing there would
                         # suppress the homing of the NEXT, unrelated task typed into it. This mirrors
                         # _skip_episode_reset's own arming, which is likewise inside the branch that
-                        # queues the instruction.
+                        # queues the instruction. A POLICY phase queues it from _run_policy_phase
+                        # instead -- there is no operator at the prompt to press continue -- so it
+                        # lands here armed and takes the same treatment as a teleop hand-back.
                         _skip_episode_arm_motion = not finished and _pending_instruction is not None
                         # Re-write the audit record: the verification verdicts only exist now, and
                         # for the LAST human step of a task there is no later rollout to record them.
@@ -3996,10 +4202,24 @@ def _sync_entrypoint(
 
         _hitl_cfg = load_hitl_config(hitl_config)
         if _hitl_cfg.enabled:
+            # Resolve both planner names now: a typo in either used to surface a warm-up and a
+            # rollout later, with a half-collected trajectory already on disk.
+            from tiptop.hitl.config import check_policy_checkpoint
+            from tiptop.hitl.planners import check_planners
+
+            check_planners(_hitl_cfg)
+            check_policy_checkpoint(_hitl_cfg)
             _log.info(
                 f"Human-in-the-loop planning is ON (proposal: {_hitl_cfg.proposal_model}, "
                 f"grounding: {_hitl_cfg.vlm_model})"
             )
+            if _hitl_cfg.policy_type != "human":
+                _log.info(
+                    f"HITL human phases are carried out by the {_hitl_cfg.policy_type} policy, not a "
+                    f"teleoperator: {_hitl_cfg.policy_checkpoint} "
+                    f"(open_loop_horizon={_hitl_cfg.open_loop_horizon}, "
+                    f"max_steps={_hitl_cfg.policy_max_steps})"
+                )
     # num_particles / opt_steps_per_skeleton may be set from the cfg/tamp yml (tamp_overrides) so a
     # data-gen config controls solver effort without CLI flags; an override wins over the CLI default.
     # (These key names are also echoed by summarize_curobo_config.)
