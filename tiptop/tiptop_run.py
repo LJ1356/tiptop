@@ -55,6 +55,7 @@ from tiptop.motion_planning import (
     go_to_capture,
     go_to_dual_home,
     go_to_home,
+    go_to_q,
     apply_perception_overrides,
     resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
@@ -1494,29 +1495,106 @@ def _await_human_phase(message: str) -> str:
         _log.warning(f"Ignoring {raw!r}: type 'done' or 'abort', or press 'Switch to teleop' in the UI")
 
 
-# Where the policy drivers live, relative to this checkout. Both are overridable from the environment
+# Where the policy drivers live, relative to this checkout. All are overridable from the environment
 # because the data-collection server already resolves them for the teleop and eval children
 # (settings.droidPython / droidDir) and is the one thing that knows how this machine is set up; the
 # defaults keep `tiptop-run` working when it is started by hand, off the repo layout alone.
 _REPO_ROOT = Path(__file__).resolve().parents[2]  # <repo>/tiptop/tiptop/tiptop_run.py -> <repo>
-#: hitl-baseline/diffusion_policy -- the project that trained the checkpoints and serves them.
-_DEFAULT_POLICY_DIR = _REPO_ROOT / "hitl-baseline" / "diffusion_policy"
 
 
-def _policy_driver_paths(cfg) -> tuple[str, str, str, str]:
-    """(droid python, droid dir, policy python, policy dir) for a policy leg.
+@dataclass(frozen=True)
+class _PolicyDriverPaths:
+    """Where the two processes of a policy leg come from. See _policy_driver_paths."""
+
+    droid_python: str
+    droid_dir: str
+    policy_python: str
+    policy_dir: str
+    # hitl_dp/wire.py's directory. The wire lives in the diffusion project whichever policy is served.
+    wire_dir: str
+
+
+def _policy_project_dir(planner) -> str:
+    """hitl-baseline/<planner.project>, or TIPTOP_<NAME>_POLICY_DIR when the server set it."""
+    return os.environ.get(f"TIPTOP_{planner.name.upper()}_POLICY_DIR") or str(
+        _REPO_ROOT / "hitl-baseline" / planner.project
+    )
+
+
+def _policy_driver_paths(cfg, planner) -> _PolicyDriverPaths:
+    """Where a policy leg's driver and server run from.
 
     Three interpreters are in play on a policy leg and none of them is this one: tiptop runs under
     its pixi env, the leg driver needs the DROID conda env (droid + pyzed), and the checkpoint needs
-    the diffusion project's venv (LeRobot + torch). This resolves the two we have to spawn.
+    its own project's venv (LeRobot + torch) -- hitl-baseline/diffusion_policy for a diffusion
+    checkpoint, hitl-baseline/action_chunk_transformer for an ACT one. This resolves the two we have
+    to spawn, plus where the driver imports the socket protocol from.
     """
-    droid_dir = os.environ.get("TIPTOP_DROID_DIR") or str(_REPO_ROOT / "droid")
-    droid_python = os.environ.get("TIPTOP_DROID_PYTHON") or "python"
-    policy_dir = os.environ.get("TIPTOP_POLICY_DIR") or str(_DEFAULT_POLICY_DIR)
-    policy_python = cfg.policy_python or os.environ.get("TIPTOP_POLICY_PYTHON")
-    if not policy_python:
-        policy_python = str(Path(policy_dir) / ".venv" / "bin" / "python")
-    return droid_python, droid_dir, policy_python, policy_dir
+    from tiptop.hitl.planners import human_planner
+
+    policy_dir = _policy_project_dir(planner)
+    policy_python = (
+        cfg.policy_python
+        or os.environ.get(f"TIPTOP_{planner.name.upper()}_POLICY_PYTHON")
+        or str(Path(policy_dir) / ".venv" / "bin" / "python")
+    )
+    return _PolicyDriverPaths(
+        droid_python=os.environ.get("TIPTOP_DROID_PYTHON") or "python",
+        droid_dir=os.environ.get("TIPTOP_DROID_DIR") or str(_REPO_ROOT / "droid"),
+        policy_python=policy_python,
+        policy_dir=policy_dir,
+        wire_dir=str(Path(_policy_project_dir(human_planner("diffusion"))) / "src"),
+    )
+
+
+def _policy_driver_command(cfg, planner, paths: _PolicyDriverPaths, *, output_dir: str, instruction: str,
+                           result_file: Path, trajectory_id: str | None) -> list[str]:
+    """The ``policy_capture.py`` command line for one policy leg (run from ``paths.droid_dir``)."""
+    cmd = [
+        paths.droid_python, "scripts/policy_capture.py",
+        "--output-root", output_dir,
+        "--instruction", instruction,
+        "--config-id", f"tamp/{planner.name}",
+        "--checkpoint", cfg.policy_checkpoint,
+        "--policy-python", paths.policy_python,
+        "--policy-dir", paths.policy_dir,
+        "--policy-module", planner.serve_module,
+        "--wire-dir", paths.wire_dir,
+        "--open-loop-horizon", str(cfg.open_loop_horizon),
+        # 0 is the driver's "leave the checkpoint alone", which is all a policy with no denoising
+        # schedule can be told -- its server would refuse the flag outright.
+        "--num-inference-steps", str(cfg.policy_num_inference_steps if planner.has_inference_steps else 0),
+        "--max-steps", str(cfg.policy_max_steps),
+        "--velocity-scale", str(cfg.policy_velocity_scale),
+        "--result-file", str(result_file),
+    ]
+    if trajectory_id:
+        cmd += ["--trajectory-id", trajectory_id]
+    return cmd
+
+
+def _move_to_policy_start(container: "_DemoContainer", planner) -> str | None:
+    """Drive the arm to ``hitl.policy_start_joint_angle`` before the policy takes over.
+
+    Returns None when the arm is there (or no start pose is configured), else why it could not get
+    there. Done HERE, through cuRobo against the workspace, rather than by the leg driver: this
+    process still holds the arm and the warm motion generator, and a direct joint interpolation from
+    wherever the last plan finished has no idea what is on the table.
+    """
+    start = _hitl_cfg.policy_start_joint_angle
+    if start is None:
+        return None
+    _log.info(f"HITL: moving the arm to the {planner.name} policy's start pose {list(start)}")
+    try:
+        go_to_q(
+            list(start),
+            time_dilation_factor=tiptop_cfg().robot.time_dilation_factor,
+            motion_gen=container.motion_gen,
+        )
+    except Exception as exc:  # noqa: BLE001 -- reported as the leg's failure, see _run_policy_phase
+        _log.exception("HITL: could not reach the policy's start pose")
+        return f"could not move the arm to hitl.policy_start_joint_angle: {exc}"
+    return None
 
 
 def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: str) -> dict:
@@ -1539,30 +1617,26 @@ def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: s
     which will say the phase did not happen -- the same outcome as a person who did not manage it,
     handled by the retry path that already exists rather than by a second error path here.
 
+    With ``hitl.policy_start_joint_angle`` set, the arm is first driven to that pose (while this
+    process still holds it). A move that fails skips the leg rather than running the policy from a
+    pose it was not meant to start from; the verification then reports the phase as not done, like
+    any other failed leg.
+
     The result dict is what the driver wrote: ``{ok, n_frames, dir, preempted}``, or ``{ok: False,
     error}`` when it never got that far.
     """
     from tiptop.hitl.session import phase_summary
 
     global _pending_instruction, _continue_trajectory
-    droid_python, droid_dir, policy_python, policy_dir = _policy_driver_paths(_hitl_cfg)
+    paths = _policy_driver_paths(_hitl_cfg, planner)
     result_file = Path(tempfile.gettempdir()) / f"tiptop-policy-leg-{os.getpid()}-{int(time.time())}.json"
-    cmd = [
-        droid_python, "scripts/policy_capture.py",
-        "--output-root", output_dir,
-        "--instruction", phase.instructions or phase.description,
-        "--config-id", f"tamp/{planner.name}",
-        "--checkpoint", _hitl_cfg.policy_checkpoint,
-        "--policy-python", policy_python,
-        "--policy-dir", policy_dir,
-        "--open-loop-horizon", str(_hitl_cfg.open_loop_horizon),
-        "--num-inference-steps", str(_hitl_cfg.policy_num_inference_steps),
-        "--max-steps", str(_hitl_cfg.policy_max_steps),
-        "--velocity-scale", str(_hitl_cfg.policy_velocity_scale),
-        "--result-file", str(result_file),
-    ]
-    if _trajectory_id:
-        cmd += ["--trajectory-id", _trajectory_id]
+    cmd = _policy_driver_command(
+        _hitl_cfg, planner, paths,
+        output_dir=output_dir,
+        instruction=phase.instructions or phase.description,
+        result_file=result_file,
+        trajectory_id=_trajectory_id,
+    )
 
     _emit_event({
         "event": "policy_phase_start",
@@ -1574,33 +1648,38 @@ def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: s
         # `awaiting_human_phase` carries it: the page shows what the driver printed, and here that
         # is the only description of what the arm is about to do on its own.
         "instructions": phase.instructions,
+        "start_joint_angle": _hitl_cfg.policy_start_joint_angle,
         **phase_summary(_hitl_session, phase),
     })
-    had_external_cam_2 = _release_hardware(container, planner.name)
-    result: dict = {"ok": False, "error": "the policy driver did not report a result"}
-    try:
-        _log.info(f"HITL: running the {planner.name} policy for this phase: {' '.join(cmd)}")
-        # The driver's stdout and stderr are ours, so its progress and the policy server's log stream
-        # into the session log with everything else rather than into a file nobody reads. Its stdin
-        # is NOT: ours is the pipe the data-collection server writes commands down, and a child that
-        # ever read from it would eat a line meant for this process.
-        completed = subprocess.run(
-            cmd, cwd=droid_dir, env=_policy_driver_env(droid_dir), stdin=subprocess.DEVNULL
-        )
-        if result_file.is_file():
-            result = json.loads(result_file.read_text())
-        elif completed.returncode != 0:
-            result = {"ok": False, "error": f"the policy driver exited with code {completed.returncode}"}
-    except OSError as exc:
-        # Almost always a droid python that is not where we think it is. Reported rather than raised:
-        # the arm is parked and the trajectory is still open, and the verification below is the
-        # honest verdict on a phase during which nothing moved.
-        result = {"ok": False, "error": f"could not run the policy driver ({droid_python}): {exc}"}
-    except json.JSONDecodeError as exc:
-        result = {"ok": False, "error": f"the policy driver wrote an unreadable result file: {exc}"}
-    finally:
-        result_file.unlink(missing_ok=True)
-        _reacquire_hardware(container, had_external_cam_2)
+    start_error = _move_to_policy_start(container, planner)
+    if start_error:
+        result: dict = {"ok": False, "error": start_error}
+    else:
+        had_external_cam_2 = _release_hardware(container, planner.name)
+        result = {"ok": False, "error": "the policy driver did not report a result"}
+        try:
+            _log.info(f"HITL: running the {planner.name} policy for this phase: {' '.join(cmd)}")
+            # The driver's stdout and stderr are ours, so its progress and the policy server's log
+            # stream into the session log with everything else rather than into a file nobody reads.
+            # Its stdin is NOT: ours is the pipe the data-collection server writes commands down, and
+            # a child that ever read from it would eat a line meant for this process.
+            completed = subprocess.run(
+                cmd, cwd=paths.droid_dir, env=_policy_driver_env(paths.droid_dir), stdin=subprocess.DEVNULL
+            )
+            if result_file.is_file():
+                result = json.loads(result_file.read_text())
+            elif completed.returncode != 0:
+                result = {"ok": False, "error": f"the policy driver exited with code {completed.returncode}"}
+        except OSError as exc:
+            # Almost always a droid python that is not where we think it is. Reported rather than
+            # raised: the arm is parked and the trajectory is still open, and the verification below
+            # is the honest verdict on a phase during which nothing moved.
+            result = {"ok": False, "error": f"could not run the policy driver ({paths.droid_python}): {exc}"}
+        except json.JSONDecodeError as exc:
+            result = {"ok": False, "error": f"the policy driver wrote an unreadable result file: {exc}"}
+        finally:
+            result_file.unlink(missing_ok=True)
+            _reacquire_hardware(container, had_external_cam_2)
 
     # Queue the SAME task so the rollout loop goes straight round into the next phase instead of
     # dropping to the task prompt. This is the half of _run_teleop_handoff's resume that a policy leg
@@ -4204,11 +4283,12 @@ def _sync_entrypoint(
         if _hitl_cfg.enabled:
             # Resolve both planner names now: a typo in either used to surface a warm-up and a
             # rollout later, with a half-collected trajectory already on disk.
-            from tiptop.hitl.config import check_policy_checkpoint
+            from tiptop.hitl.config import check_policy_checkpoint, check_policy_start_pose
             from tiptop.hitl.planners import check_planners
 
             check_planners(_hitl_cfg)
             check_policy_checkpoint(_hitl_cfg)
+            check_policy_start_pose(_hitl_cfg, tiptop_cfg().robot.dof)
             _log.info(
                 f"Human-in-the-loop planning is ON (proposal: {_hitl_cfg.proposal_model}, "
                 f"grounding: {_hitl_cfg.vlm_model})"
@@ -4218,7 +4298,8 @@ def _sync_entrypoint(
                     f"HITL human phases are carried out by the {_hitl_cfg.policy_type} policy, not a "
                     f"teleoperator: {_hitl_cfg.policy_checkpoint} "
                     f"(open_loop_horizon={_hitl_cfg.open_loop_horizon}, "
-                    f"max_steps={_hitl_cfg.policy_max_steps})"
+                    f"max_steps={_hitl_cfg.policy_max_steps}, "
+                    f"start pose={_hitl_cfg.policy_start_joint_angle or 'wherever the last leg left the arm'})"
                 )
     # num_particles / opt_steps_per_skeleton may be set from the cfg/tamp yml (tamp_overrides) so a
     # data-gen config controls solver effort without CLI flags; an override wins over the CLI default.

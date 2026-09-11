@@ -7,6 +7,7 @@ belongs that changes what a dataset CONTAINS rather than how the arm moves. Deli
 """
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,10 +91,17 @@ class HITLConfig:
     # deploy knob for a policy that moves faster or slower than the demonstrations it learned from;
     # 1.0 sends what it predicted, which is what the training data's units mean.
     policy_velocity_scale: float = 1.0
-    # Interpreter for the policy SERVER, which loads the checkpoint. Its default is the venv of
-    # hitl-baseline/diffusion_policy, the project that trained these checkpoints: LeRobot and torch
-    # live only there, never in the DROID env that drives the arm. A machine that keeps them
-    # somewhere else sets this; nothing about a task decides it.
+    # Joint configuration (radians, one per arm joint) the arm is moved to, through cuRobo, before the
+    # policy takes over. None (the default) starts the policy wherever the previous leg parked the arm,
+    # which is what a teleoperator is handed. Set it to a pose the policy's training legs actually
+    # began from: a BC policy handed a pose its demonstrations never contain tends to under-drive or
+    # stall (hitl-baseline/diffusion_policy/FILTERING.md §5), and where cuTAMP happens to finish a leg
+    # varies with the plan. The move is between legs, so neither leg's recording contains it.
+    policy_start_joint_angle: list[float] | None = None
+    # Interpreter for the policy SERVER, which loads the checkpoint. Its default is the venv of the
+    # hitl-baseline project that trained the checkpoint (planners.PolicyPhasePlanner.project):
+    # LeRobot and torch live only there, never in the DROID env that drives the arm. A machine that
+    # keeps them somewhere else sets this; nothing about a task decides it.
     policy_python: str | None = None
     # SQLite cache for PROPOSAL responses only, keyed on the model, the prompt and a noise-robust
     # hash of the image (after prpl_llm_utils' SQLite3PretrainedLargeModelCache). Worth setting while
@@ -152,6 +160,30 @@ def check_policy_config(cfg: HITLConfig) -> None:
         raise ValueError(f"hitl.policy_max_steps must be at least 1, got {cfg.policy_max_steps}")
     if cfg.policy_velocity_scale <= 0:
         raise ValueError(f"hitl.policy_velocity_scale must be positive, got {cfg.policy_velocity_scale}")
+    start = cfg.policy_start_joint_angle
+    if start is not None and (
+        not isinstance(start, (list, tuple))
+        or not start
+        or not all(isinstance(q, (int, float)) and not isinstance(q, bool) and math.isfinite(q) for q in start)
+    ):
+        raise ValueError(
+            f"hitl.policy_start_joint_angle must be a list of joint angles in radians, got {start!r}"
+        )
+
+
+def check_policy_start_pose(cfg: HITLConfig, dof: int) -> None:
+    """Reject a policy start pose that is not one angle per joint of THIS robot. Called at session start.
+
+    Separate from check_policy_config for the same reason as check_policy_checkpoint: how many joints
+    the arm has is a fact about the machine, not the YAML.
+    """
+    start = cfg.policy_start_joint_angle
+    if not cfg.enabled or cfg.policy_type == "human" or start is None:
+        return
+    if len(start) != dof:
+        raise ValueError(
+            f"hitl.policy_start_joint_angle has {len(start)} joint angles but this robot has {dof} joints"
+        )
 
 
 def check_policy_checkpoint(cfg: HITLConfig) -> None:

@@ -112,21 +112,36 @@ class TeleopPhasePlanner(HandoffPhasePlanner):
     authorship = "vlm"
 
 
-class DiffusionPolicyPhasePlanner(HandoffPhasePlanner):
-    """A human phase driven by a trained diffusion policy instead of a person.
+class PolicyPhasePlanner(HandoffPhasePlanner):
+    """Base for a human phase driven by a trained policy instead of a person.
 
-    The policy is a LeRobot ``DiffusionPolicy`` behaviour-cloned on the TELEOP LEGS of earlier HITL
-    runs of this same task (hitl-baseline/diffusion_policy), so what it imitates is precisely the
-    phase it is being handed. ``tiptop_run._run_policy_phase`` releases the arm and the cameras
-    exactly as a teleop hand-off does and runs the policy's own driver in their place; the phase is
-    then verified by the same VLM check, against the same atoms, as if a person had done it.
+    The policy is behaviour-cloned on the TELEOP LEGS of earlier HITL runs of this same task (one
+    hitl-baseline project per policy type), so what it imitates is precisely the phase it is being
+    handed. ``tiptop_run._run_policy_phase`` releases the arm and the cameras exactly as a teleop
+    hand-off does and runs ``droid/scripts/policy_capture.py`` in their place, which serves the
+    checkpoint with ``serve_module`` under ``project``'s venv; the phase is then verified by the same
+    VLM check, against the same atoms, as if a person had done it.
 
     It is imitation, not achievement: nothing in a BC policy knows what the phase's atoms say, so the
     leg ends on ``hitl.policy_max_steps`` rather than on success, and the verification that follows is
     the only thing that decides whether it worked.
     """
 
+    # The hitl-baseline/<project> that trained the checkpoint; its .venv is where the server runs.
+    project: str
+    # The module policy_capture.py runs (`python -m <serve_module>`) to load the checkpoint.
+    serve_module: str
+    # Whether the checkpoint has a reverse-diffusion step count to set (hitl.policy_num_inference_steps).
+    has_inference_steps: bool = False
+
+
+class DiffusionPolicyPhasePlanner(PolicyPhasePlanner):
+    """A human phase driven by a LeRobot ``DiffusionPolicy`` (hitl-baseline/diffusion_policy)."""
+
     name = "diffusion"
+    project = "diffusion_policy"
+    serve_module = "hitl_dp.serve"
+    has_inference_steps = True
     provenance = (
         "a LeRobot diffusion policy trained on the teleop legs of earlier runs of this task "
         "(hitl-baseline/diffusion_policy), run closed-loop in place of the teleoperator: it drives "
@@ -134,6 +149,25 @@ class DiffusionPolicyPhasePlanner(HandoffPhasePlanner):
         "it did counts"
     )
     authorship = "vlm (what the step must achieve); a diffusion policy (the motion)"
+
+
+class ACTPolicyPhasePlanner(PolicyPhasePlanner):
+    """A human phase driven by a LeRobot ``ACTPolicy`` (hitl-baseline/action_chunk_transformer).
+
+    Trained on exactly the diffusion baseline's corpus, so the two differ by the policy and nothing
+    else -- which is what makes swapping one for the other a fair comparison of the same task.
+    """
+
+    name = "act"
+    project = "action_chunk_transformer"
+    serve_module = "hitl_act.serve"
+    provenance = (
+        "a LeRobot ACT (action chunking transformer) policy trained on the teleop legs of earlier runs "
+        "of this task (hitl-baseline/action_chunk_transformer), run closed-loop in place of the "
+        "teleoperator: it drives the arm for a fixed number of control steps and the phase "
+        "verification decides whether what it did counts"
+    )
+    authorship = "vlm (what the step must achieve); an ACT policy (the motion)"
 
 
 class CuTAMPPhasePlanner:
@@ -217,8 +251,9 @@ def register_robot_planner(planner: PhasePlanner) -> None:
 def register_human_planner(planner: PhasePlanner) -> None:
     """Make a planner selectable as ``hitl.policy_type``.
 
-    The same extension point on the other side. A new one is a class here plus a driver for
-    ``tiptop_run._run_policy_phase`` to run; the plan, the hand-off and the verification are already
+    The same extension point on the other side. A new policy is a :class:`PolicyPhasePlanner` here
+    naming its project and server module (a server speaking ``hitl_dp.wire``, which is all
+    ``tiptop_run._run_policy_phase`` needs); the plan, the hand-off and the verification are already
     written and do not know which one they got.
     """
     assert planner.executor == "human", planner.executor
@@ -228,6 +263,7 @@ def register_human_planner(planner: PhasePlanner) -> None:
 register_robot_planner(CuTAMPPhasePlanner())
 register_human_planner(TeleopPhasePlanner())
 register_human_planner(DiffusionPolicyPhasePlanner())
+register_human_planner(ACTPolicyPhasePlanner())
 
 
 def _lookup(registry: dict[str, PhasePlanner], name: str, key: str) -> PhasePlanner:

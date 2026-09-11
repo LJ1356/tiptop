@@ -866,6 +866,127 @@ def test_a_policy_carries_out_the_same_human_phase_the_teleoperator_would(tmp_pa
     assert record["provenance"]["robot_phases"].startswith("cuTAMP --")
 
 
+def test_an_act_policy_takes_the_same_phase_a_diffusion_policy_would(tmp_path):
+    # ACT is a second policy behind the same hand-off: same phase, same leg of one, and a record that
+    # names the policy that actually drove the arm rather than the diffusion one.
+    from tiptop.hitl.planners import PolicyPhasePlanner, human_planner
+
+    act, diffusion = human_planner("act"), human_planner("diffusion")
+    assert isinstance(act, PolicyPhasePlanner) and isinstance(diffusion, PolicyPhasePlanner)
+    assert (act.project, act.serve_module, act.has_inference_steps) == (
+        "action_chunk_transformer", "hitl_act.serve", False
+    )
+    assert (diffusion.project, diffusion.serve_module, diffusion.has_inference_steps) == (
+        "diffusion_policy", "hitl_dp.serve", True
+    )
+    session = _session()
+    session.cfg = resolve_hitl_config({"enabled": True, "policy_type": "act", "policy_checkpoint": str(tmp_path)})
+    assert [session.planner(p).name for p in session.phases] == ["cutamp", "act", "cutamp"]
+    record = session.to_json()
+    assert "ACT" in record["provenance"]["human_phases"]
+    assert "diffusion" not in record["provenance"]["human_phases"]
+    assert record["phases"][1]["planned_by"] == "vlm (what the step must achieve); an ACT policy (the motion)"
+
+
+def test_a_policy_start_pose_is_checked_against_the_yaml_then_the_robot(tmp_path):
+    ok = {"enabled": True, "policy_type": "act", "policy_checkpoint": str(tmp_path)}
+    pose = [0.3935, 0.2147, 0.1002, -2.3378, -0.1756, 2.5546, -0.4603]
+    assert resolve_hitl_config(ok).policy_start_joint_angle is None  # off unless asked for
+    assert resolve_hitl_config({**ok, "policy_start_joint_angle": pose}).policy_start_joint_angle == pose
+    for bad in ("home", [], [0.1, "x"], [0.1, float("nan")], [True] * 7):
+        with pytest.raises(ValueError, match="policy_start_joint_angle must be a list"):
+            resolve_hitl_config({**ok, "policy_start_joint_angle": bad})
+    # How many joints there are is the robot's to say, so that half waits for session start.
+    from tiptop.hitl.config import check_policy_start_pose
+
+    check_policy_start_pose(resolve_hitl_config({**ok, "policy_start_joint_angle": pose}), 7)
+    with pytest.raises(ValueError, match="has 6 joint angles but this robot has 7"):
+        check_policy_start_pose(resolve_hitl_config({**ok, "policy_start_joint_angle": pose[:6]}), 7)
+    check_policy_start_pose(resolve_hitl_config({"enabled": True}), 7)  # the human default never looks
+
+
+def test_each_policy_leg_is_served_by_its_own_project(tmp_path, monkeypatch):
+    # The driver runs the checkpoint under the venv of the project that trained it and imports the
+    # socket protocol from the diffusion project whichever policy it is -- one wire, two servers.
+    from tiptop import tiptop_run as tr
+    from tiptop.hitl.planners import human_planner
+
+    for var in ("TIPTOP_DIFFUSION_POLICY_DIR", "TIPTOP_ACT_POLICY_DIR", "TIPTOP_ACT_POLICY_PYTHON"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TIPTOP_DROID_PYTHON", "/envs/droid/bin/python")
+    cfg = resolve_hitl_config({
+        "enabled": True, "policy_type": "act", "policy_checkpoint": str(tmp_path), "open_loop_horizon": 15,
+        "policy_num_inference_steps": 10, "policy_max_steps": 350,
+    })
+    act = human_planner("act")
+    paths = tr._policy_driver_paths(cfg, act)
+    assert paths.policy_dir == str(tr._REPO_ROOT / "hitl-baseline" / "action_chunk_transformer")
+    assert paths.policy_python == f"{paths.policy_dir}/.venv/bin/python"
+    assert paths.wire_dir == str(tr._REPO_ROOT / "hitl-baseline" / "diffusion_policy" / "src")
+
+    cmd = tr._policy_driver_command(
+        cfg, act, paths, output_dir="/runs/x", instruction="cover the plate",
+        result_file=tmp_path / "r.json", trajectory_id="abc123",
+    )
+    flags = dict(zip(cmd[2::2], cmd[3::2]))
+    assert cmd[:2] == ["/envs/droid/bin/python", "scripts/policy_capture.py"]
+    assert flags["--policy-module"] == "hitl_act.serve"
+    assert flags["--wire-dir"] == paths.wire_dir
+    assert flags["--open-loop-horizon"] == "15" and flags["--max-steps"] == "350"
+    assert flags["--trajectory-id"] == "abc123" and flags["--config-id"] == "tamp/act"
+    # ACT has no denoising schedule: the driver is told to leave the checkpoint alone, which is the
+    # only thing hitl_act.serve would accept.
+    assert flags["--num-inference-steps"] == "0"
+
+    # The server's settings win over the repo layout, per policy.
+    monkeypatch.setenv("TIPTOP_ACT_POLICY_DIR", "/elsewhere/act")
+    monkeypatch.setenv("TIPTOP_ACT_POLICY_PYTHON", "/elsewhere/act/py")
+    monkeypatch.setenv("TIPTOP_DIFFUSION_POLICY_DIR", "/elsewhere/dp")
+    paths = tr._policy_driver_paths(cfg, act)
+    assert (paths.policy_dir, paths.policy_python, paths.wire_dir) == (
+        "/elsewhere/act", "/elsewhere/act/py", "/elsewhere/dp/src"
+    )
+    diffusion = human_planner("diffusion")
+    dp_cfg = resolve_hitl_config({**{"enabled": True, "policy_type": "diffusion"},
+                                  "policy_checkpoint": str(tmp_path), "policy_num_inference_steps": 10})
+    dp_paths = tr._policy_driver_paths(dp_cfg, diffusion)
+    assert dp_paths.policy_dir == "/elsewhere/dp" and dp_paths.policy_python == "/elsewhere/dp/.venv/bin/python"
+    dp_cmd = tr._policy_driver_command(dp_cfg, diffusion, dp_paths, output_dir="/runs/x", instruction="i",
+                                       result_file=tmp_path / "r.json", trajectory_id=None)
+    dp_flags = dict(zip(dp_cmd[2::2], dp_cmd[3::2]))
+    assert dp_flags["--policy-module"] == "hitl_dp.serve" and dp_flags["--num-inference-steps"] == "10"
+    assert "--trajectory-id" not in dp_cmd
+
+
+def test_the_arm_is_moved_to_the_policy_start_pose_before_the_policy_leg(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tiptop import tiptop_run as tr
+    from tiptop.hitl.planners import human_planner
+
+    moves = []
+    monkeypatch.setattr(tr, "go_to_q", lambda q, **kw: moves.append((q, kw)))
+    monkeypatch.setattr(tr, "tiptop_cfg", lambda: SimpleNamespace(robot=SimpleNamespace(time_dilation_factor=0.5)))
+    container = SimpleNamespace(motion_gen="warm-motion-gen")
+    base = {"enabled": True, "policy_type": "act", "policy_checkpoint": str(tmp_path)}
+
+    monkeypatch.setattr(tr, "_hitl_cfg", resolve_hitl_config(base))
+    assert tr._move_to_policy_start(container, human_planner("act")) is None
+    assert moves == [], "no start pose configured: the policy starts where the last leg left the arm"
+
+    pose = [0.3935, 0.2147, 0.1002, -2.3378, -0.1756, 2.5546, -0.4603]
+    monkeypatch.setattr(tr, "_hitl_cfg", resolve_hitl_config({**base, "policy_start_joint_angle": pose}))
+    assert tr._move_to_policy_start(container, human_planner("act")) is None
+    assert moves == [(pose, {"time_dilation_factor": 0.5, "motion_gen": "warm-motion-gen"})]
+
+    def unreachable(q, **kw):
+        raise RuntimeError("Could not motion plan to target joint positions")
+
+    monkeypatch.setattr(tr, "go_to_q", unreachable)
+    error = tr._move_to_policy_start(container, human_planner("act"))
+    assert error and "could not move the arm to hitl.policy_start_joint_angle" in error
+
+
 def test_the_record_credits_each_half_to_the_planner_that_carried_it_out():
     session = _session()
     session.record_tamp_plan(0, {"plan_skeleton": [_Op("Pick(blue_toy, grasp1, q1)")], "reused": False})
@@ -909,6 +1030,35 @@ def test_the_shipped_hitl_configs_resolve():
     assert shipped, "at least one shipped config should carry an hitl block"
     for path in shipped:
         assert resolve_hitl_config(yaml.safe_load(path.read_text())["hitl"]).enabled, path.name
+
+
+def test_the_shipped_tamp_eval_policies_hand_tiptop_a_block_it_accepts(monkeypatch):
+    # A TAMP + policy EVAL builds its hitl block in data-collection (collect/eval_config.py) from the
+    # policy yml, and tiptop parses it at session start -- where an unknown key or a bad value kills
+    # the session after nothing has warmed up but the operator's patience. The two halves live in
+    # different repos, so this is the test that holds them to one contract.
+    yaml = pytest.importorskip("yaml")
+    import sys
+    from pathlib import Path
+
+    dc = Path(__file__).resolve().parents[2] / "data-collection"
+    if not (dc / "cfg" / "eval" / "policies").exists():
+        pytest.skip("data-collection is not checked out beside tiptop")
+    monkeypatch.syspath_prepend(str(dc))
+    for name in [m for m in list(sys.modules) if m == "collect" or m.startswith("collect.")]:
+        monkeypatch.delitem(sys.modules, name)
+    from collect import eval_config
+
+    tamp = [
+        p for p in sorted((dc / "cfg" / "eval" / "policies").glob("*.yml"))
+        if (yaml.safe_load(p.read_text()) or {}).get("eval_type") in ("tamp_dp", "tamp_act")
+    ]
+    assert tamp, "the TAMP + DP / TAMP + ACT eval policies should be shipped"
+    for path in tamp:
+        policy = eval_config._policy_from_path(path, with_results=False)
+        cfg = resolve_hitl_config(policy["hitl"])
+        assert cfg.enabled and cfg.policy_type == policy["policy_type"], path.name
+        assert cfg.policy_checkpoint == policy["policy_checkpoint"], path.name
 
 
 # --- Deferred objects: naming something a human phase has yet to create ---------------------------
