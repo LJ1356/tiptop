@@ -298,6 +298,65 @@ def _consume_teleop_request() -> bool:
     return True
 
 
+# The policy leg (droid/scripts/policy_capture.py) running RIGHT NOW, or None. Held only for the
+# lifetime of that child, by _run_policy_phase, so _sigusr2_finish_policy_leg can end the LEG
+# without touching this process.
+_policy_leg_proc: subprocess.Popen | None = None
+
+# Set by _sigusr2_finish_policy_leg when the operator ends a policy leg from the UI, and consumed by
+# _hitl_human_phase, which then advances the plan rather than verifying the phase. Cleared at the
+# start of every leg so one phase's request can never carry into the next.
+_policy_leg_finished_by_operator = False
+
+
+def _sigusr2_finish_policy_leg(_signum, _frame) -> None:
+    """"Continue to the next phase" trigger (SIGUSR2) from the data-collection UI's button.
+
+    A BC policy leg has no termination signal, so it runs until `hitl.policy_max_steps` (450 steps,
+    ~30-45 s) whatever it is doing. Watching one flail out the rest of its budget used to leave only
+    Preempt, which ends the WHOLE rollout -- and on a `tamp -> policy -> tamp` plan that throws away
+    the final tamp leg the operator was waiting for. This ends the LEG and nothing else: SIGINT goes
+    to the leg driver alone, which stops stepping the policy, writes what it captured and exits
+    (policy_capture._install_signal_handlers), so the `proc.wait()` in _run_policy_phase returns
+    normally and the plan carries straight on into the next phase.
+
+    It also records that a HUMAN ended the phase, which makes _hitl_human_phase advance the plan
+    instead of running the VLM check. The operator pressed this having just watched the leg, so the
+    classifier could only second-guess them -- and a "not done" verdict would spend a
+    `verify_retries` attempt by restarting the very leg they stopped, which is the opposite of
+    moving on. The cost is real and deliberate: the next phase is then planned believing this one
+    succeeded, so a leg ended because it went WRONG is better preempted than continued.
+
+    Not a preempt: it never raises, and with no leg running it does nothing at all.
+    """
+    global _policy_leg_finished_by_operator
+    proc = _policy_leg_proc
+    if proc is None or proc.poll() is not None:
+        _log.warning(
+            "'continue to the next phase' arrived with no policy leg running -- ignoring. "
+            "(The leg may have just ended on its own, or not started yet.)"
+        )
+        return
+    _policy_leg_finished_by_operator = True
+    _log.info("HITL: the operator ended the policy leg; keeping its frames and moving to the next phase")
+    _emit_event({"event": "policy_leg_finish_requested", "trajectory_id": _trajectory_id})
+    try:
+        proc.send_signal(signal.SIGINT)
+    except ProcessLookupError:
+        # It exited between the poll above and here; wait() has already reaped it and the phase
+        # advances anyway, which is what was asked for.
+        pass
+
+
+def _consume_policy_leg_finish() -> bool:
+    """True (once) if the operator ended the last policy leg with "continue to the next phase"."""
+    global _policy_leg_finished_by_operator
+    if not _policy_leg_finished_by_operator:
+        return False
+    _policy_leg_finished_by_operator = False
+    return True
+
+
 # Margin between releasing a ZED and telling another process it may open it. ZedCamera.close()
 # already blocks for the SDK's teardown (~14s for two cameras, measured) and the device is claimable
 # about a second later, so this is slack rather than a readiness check.
@@ -382,8 +441,20 @@ def _reacquire_cameras(container: "_DemoContainer", *, had_external_cam_2: bool)
     same intrinsics, so it stays valid across the swap.
     """
     _log.info("Re-opening the cameras teleop was using")
-    object.__setattr__(container, "cam", get_hand_camera())
-    object.__setattr__(container, "external_cam", get_external_camera())
+    # Every slot is attempted even after one fails. Letting the first exception out left the
+    # remaining handles None on a container the session goes on using, so a single unopenable
+    # camera turned every later rollout into an instant "does perception but is not open" -- even
+    # when the perception camera itself would have opened fine. The error still propagates below,
+    # because this phase really did fail; what changes is that the cameras that came back are
+    # attached, so the session recovers by itself once the cause clears.
+    failures: list[str] = []
+    for slot, opener in (("cam", get_hand_camera), ("external_cam", get_external_camera)):
+        try:
+            object.__setattr__(container, slot, opener())
+        except Exception as exc:
+            object.__setattr__(container, slot, None)
+            failures.append(f"{slot}: {exc}")
+            _log.error(f"Could not re-open the {slot} camera after the hand-off", exc_info=True)
     # get_external_camera_2 returns None both when it isn't configured and when it fails to open, so
     # a camera that was recording before the hand-off and is None now would otherwise just vanish
     # from the next episode's videos.
@@ -394,6 +465,8 @@ def _reacquire_cameras(container: "_DemoContainer", *, had_external_cam_2: bool)
             "rollouts will record without it"
         )
     object.__setattr__(container, "external_cam_2", external_cam_2)
+    if failures:
+        raise RuntimeError("Could not re-open after the hand-off -- " + "; ".join(failures))
 
 
 def _release_hardware(container: "_DemoContainer", to: str) -> bool:
@@ -1547,6 +1620,42 @@ def _policy_driver_paths(cfg, planner) -> _PolicyDriverPaths:
     )
 
 
+def _terminate_policy_leg(proc: subprocess.Popen, *, sigint_grace: float = 5.0, term_grace: float = 3.0) -> None:
+    """Make sure a policy leg is really dead before we try to take its cameras back.
+
+    The driver opens the ZEDs in its own process, so a leg that outlives the rollout keeps
+    /dev/video* claimed. That failure mode is nasty to debug from the logs: the SDK lists a camera
+    held by another process with serial 0 and state NOT AVAILABLE, which the open path reports as
+    CAMERA NOT DETECTED -- indistinguishable, without checking who holds the device node, from a
+    camera that was unplugged.
+
+    Escalates SIGINT -> SIGTERM -> SIGKILL. SIGINT goes first because the driver handles it by
+    writing the result file for the frames it did capture, which is what makes a force-stopped leg
+    still countable for the rubric; the harder signals are only for a leg wedged past caring.
+    """
+    for sig, grace in ((signal.SIGINT, sigint_grace), (signal.SIGTERM, term_grace)):
+        if proc.poll() is not None:
+            return
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            _log.warning(f"Policy leg {proc.pid} did not exit on {sig.name} after {grace:.0f}s; escalating")
+    if proc.poll() is None:
+        proc.kill()
+        try:
+            proc.wait(timeout=term_grace)
+        except subprocess.TimeoutExpired:
+            _log.error(
+                f"Policy leg {proc.pid} survived SIGKILL; it may still hold the cameras. If the next "
+                f"rollout reports CAMERA NOT DETECTED, check `fuser /dev/video*` for this pid."
+            )
+
+
 def _policy_driver_command(cfg, planner, paths: _PolicyDriverPaths, *, output_dir: str, instruction: str,
                            result_file: Path, trajectory_id: str | None) -> list[str]:
     """The ``policy_capture.py`` command line for one policy leg (run from ``paths.droid_dir``)."""
@@ -1627,7 +1736,9 @@ def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: s
     """
     from tiptop.hitl.session import phase_summary
 
-    global _pending_instruction, _continue_trajectory
+    global _pending_instruction, _continue_trajectory, _policy_leg_proc, _policy_leg_finished_by_operator
+    # A request left over from an earlier leg must never skip THIS phase's verification.
+    _policy_leg_finished_by_operator = False
     paths = _policy_driver_paths(_hitl_cfg, planner)
     result_file = Path(tempfile.gettempdir()) / f"tiptop-policy-leg-{os.getpid()}-{int(time.time())}.json"
     cmd = _policy_driver_command(
@@ -1663,13 +1774,30 @@ def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: s
             # stream into the session log with everything else rather than into a file nobody reads.
             # Its stdin is NOT: ours is the pipe the data-collection server writes commands down, and
             # a child that ever read from it would eat a line meant for this process.
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, cwd=paths.droid_dir, env=_policy_driver_env(paths.droid_dir), stdin=subprocess.DEVNULL
             )
+            # Published for exactly as long as the leg lives, so the UI's "continue to the next
+            # phase" button (SIGUSR2 -> _sigusr2_finish_policy_leg) can end this child and only this
+            # child. Cleared in the finally below rather than after wait(), so a preempt unwinding
+            # through here cannot leave a dead pid behind for the next press to signal.
+            _policy_leg_proc = proc
+            try:
+                returncode = proc.wait()
+            except BaseException:
+                # A preempt raises KeyboardInterrupt inside this wait (_sigint_preempt), and
+                # subprocess.run would NOT kill the child for us: it assumes the SIGINT already
+                # reached the whole process group (bpo-25942) and only waits ~0.25 s. When the
+                # driver did not get it, the leg survives as an orphan -- reparented to init, still
+                # holding the ZEDs it opened. _reacquire_cameras below then cannot take them back,
+                # and because the SDK reports a camera held elsewhere as NOT AVAILABLE, every later
+                # rollout in the warm session dies looking like an unplugged camera.
+                _terminate_policy_leg(proc)
+                raise
             if result_file.is_file():
                 result = json.loads(result_file.read_text())
-            elif completed.returncode != 0:
-                result = {"ok": False, "error": f"the policy driver exited with code {completed.returncode}"}
+            elif returncode != 0:
+                result = {"ok": False, "error": f"the policy driver exited with code {returncode}"}
         except OSError as exc:
             # Almost always a droid python that is not where we think it is. Reported rather than
             # raised: the arm is parked and the trajectory is still open, and the verification below
@@ -1678,6 +1806,7 @@ def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: s
         except json.JSONDecodeError as exc:
             result = {"ok": False, "error": f"the policy driver wrote an unreadable result file: {exc}"}
         finally:
+            _policy_leg_proc = None
             result_file.unlink(missing_ok=True)
             _reacquire_hardware(container, had_external_cam_2)
 
@@ -1771,6 +1900,8 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
     finished_from_teleop = False
 
     while True:
+        # Set only by the UI's "continue to the next phase" button, and only for a policy leg.
+        ended_by_operator = False
         if not by_hand:
             # A policy leg asks nobody for anything, so it does NOT emit `awaiting_human_phase`:
             # that event parks the data-collection UI on a prompt whose buttons write to a stdin
@@ -1780,6 +1911,7 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
             # open, and the verification below is the honest verdict on a phase during which the
             # policy may have done nothing -- which is exactly the case `verify_retries` handles.
             answer = "done"
+            ended_by_operator = _consume_policy_leg_finish()
         else:
             _emit_event({
                 "event": "awaiting_human_phase",
@@ -1828,6 +1960,36 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
             session.advance()
             _hitl_reset_session("every phase of the task is done")
             return True
+
+        # The operator ended this leg from the UI with "continue to the next phase". That is a human
+        # verdict on a phase they just watched, so the classifier is not consulted: it could only
+        # second-guess them, and a "not done" verdict would spend a `verify_retries` attempt by
+        # restarting the very leg they stopped. Recorded skipped:true, like the final phase, so the
+        # audit trail says the phase was never checked rather than that it passed.
+        if ended_by_operator:
+            _log.info(
+                "HITL: the operator ended the policy leg and asked for the next phase -- not verifying"
+            )
+            _emit_event({
+                "event": "human_phase_verified",
+                "description": phase.description,
+                "ok": True,
+                "skipped": True,
+                "ended_by_operator": True,
+                "verdicts": [],
+            })
+            session.advance()
+            if session.finished:
+                # Only reachable if is_final_phase() above ever stops catching the last phase; a
+                # finished plan must reach the label prompt, never fall through to another rollout.
+                _log.info("HITL: every phase of the task is done")
+                _hitl_reset_session("every phase of the task is done")
+                return True
+            _log.info(
+                f"HITL: {len(session.phases) - session.index} phase(s) still to go; the robot "
+                "carries on from here"
+            )
+            return False
 
         try:
             ok, verdicts = await verify_phase(
@@ -4421,6 +4583,10 @@ def _sync_entrypoint(
     # hands the robot + cameras to a teleop process and waits for them back. See
     # _sigusr1_teleop_switch / _run_teleop_handoff.
     signal.signal(signal.SIGUSR1, _sigusr1_teleop_switch)
+    # SIGUSR2 is the "continue to the next phase" trigger from the same UI. It ends the policy leg
+    # that is running and nothing else, so a `tamp -> policy -> tamp` plan still gets its final tamp
+    # leg -- which is what separates it from Preempt. See _sigusr2_finish_policy_leg.
+    signal.signal(signal.SIGUSR2, _sigusr2_finish_policy_leg)
 
     exit_code = 1
     try:

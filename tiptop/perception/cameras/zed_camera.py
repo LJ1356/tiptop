@@ -82,6 +82,35 @@ def _usb_attached_serials() -> dict[str, str]:
     return serials
 
 
+def _usb_video_products() -> list[str]:
+    """Product strings of the Stereolabs USB3 VIDEO interfaces the kernel sees.
+
+    The complement of :func:`_usb_attached_serials`, which keeps only the HID halves. Needed to tell
+    "the video interface never came up" (a cable/port fault) from "it is up but the SDK will not give
+    it to us" (someone else holds it) -- the two look identical in the SDK's error code. The video
+    half carries no real serial, so this cannot be attributed to a specific camera; it only answers
+    whether ANY video interface is attached.
+    """
+    products = []
+    for dev_dir in Path("/sys/bus/usb/devices").glob("*/"):
+        try:
+            if (dev_dir / "idVendor").read_text().strip() != _STEREOLABS_USB_VENDOR_ID:
+                continue
+            product = (dev_dir / "product").read_text().strip()
+        except OSError:
+            continue
+        # The serial file is absent entirely on some video interfaces (the ZED-M's) and a generic
+        # placeholder on others (the ZED 2i's "OV0001"), so "no real serial" is the test -- reading
+        # it as required would drop exactly the devices this function exists to count.
+        try:
+            serial = (dev_dir / "serial").read_text().strip()
+        except OSError:
+            serial = ""
+        if not (serial.isdigit() and serial != "0"):
+            products.append(product)
+    return products
+
+
 def _open_failure_help(serial: str) -> str:
     """Explain an open failure in terms of what is actually attached, not just the SDK error code."""
     sdk = _sdk_visible_serials()
@@ -94,14 +123,40 @@ def _open_failure_help(serial: str) -> str:
         f"  SDK enumerates: {sdk if sdk else 'no cameras at all'}",
         f"  Stereolabs USB devices attached: {usb if usb else 'none'}",
     ]
-    if serial in usb:
+    # A ZED already opened by ANOTHER PROCESS is enumerated with serial 0 and state NOT AVAILABLE,
+    # so it never matches `serial in sdk` above and used to fall through to the cable/port verdict
+    # below -- sending you after the hardware when the camera was fine and a stale process (a
+    # policy leg or teleop driver that outlived its rollout) was holding it.
+    held = [desc for key, desc in sdk.items() if key == "0" or "NOT AVAILABLE" in desc.upper()]
+    if held:
         lines += [
-            f"  -> s/n {serial} IS attached ({usb[serial]}) but only its HID interface enumerated; its USB3",
-            "     video interface never came up. The serial is correct -- editing it will not help.",
-            "     Cause is the cable, the port, or the camera itself. To tell them apart: move the camera to",
-            "     a USB3 port on the same controller as a working ZED and re-check. A video node appearing",
-            "     means cable/port; still missing means the unit.",
+            f"  -> The SDK enumerates {len(held)} camera(s) it cannot use ({', '.join(held)}). A ZED held",
+            "     open by another process reports exactly this, with serial 0, because the serial is only",
+            "     readable once the video interface is claimed. Check for a stale holder FIRST:",
+            "         fuser -v /dev/video*        # which pid has the camera",
+            "         pgrep -af 'policy_capture|teleop'",
+            "     Killing that process releases the camera; no replugging needed. Only if nothing holds",
+            "     the device nodes is the hardware advice below worth following.",
         ]
+    if serial in usb:
+        video = _usb_video_products()
+        lines.append(f"  -> s/n {serial} IS attached ({usb[serial]}); the serial is correct, editing it will not help.")
+        if video:
+            # Claiming the video interface "never came up" while the kernel is listing one is how this
+            # message used to send people after cables that were never the problem. Say what is there.
+            lines += [
+                f"     Stereolabs USB3 video interface(s) ARE attached ({', '.join(video)}), so this is most",
+                "     likely NOT a cable or port fault -- the video half is up and something else is holding",
+                "     it, or it is wedged. Check the holder above first; a `sl.Camera.reboot(serial)` or a",
+                "     replug clears a wedged module.",
+            ]
+        else:
+            lines += [
+                "     Only its HID interface enumerated: no USB3 video interface is attached at all, so the",
+                "     camera is not delivering video. Cause is the cable, the port, or the camera itself. To",
+                "     tell them apart: move the camera to a USB3 port on the same controller as a working ZED",
+                "     and re-check. A video node appearing means cable/port; still missing means the unit.",
+            ]
     elif usb:
         lines += [
             f"  -> s/n {serial} is not attached at all. The serials above are what is plugged in; if a camera",
@@ -283,12 +338,43 @@ class ZedCamera:
         self._is_recording = True
         _log.info(f"Started recording to {filename}")
 
+    def recording_frames_encoded(self) -> int | None:
+        """Frames the SDK's SVO writer has actually encoded, or None if not recording / unreadable.
+
+        ``enable_recording`` only sets the writer up. If the encoder then dies -- H265 goes through
+        NVENC, which fails when VRAM is exhausted by the perception servers or a policy checkpoint
+        -- every ``grab()`` still returns SUCCESS and the failure is reported *only* here. Without
+        this probe such a recording is invisible until the SVO fails to open at conversion time and
+        looks like file corruption.
+        """
+        if not self._is_recording:
+            return None
+        try:
+            return int(self._cam.get_recording_status().number_frames_encoded)
+        except Exception:
+            _log.debug(f"Could not read recording status for ZED {self.serial}", exc_info=True)
+            return None
+
     def stop_recording(self):
-        """Stop recording camera stream."""
+        """Stop recording camera stream.
+
+        NOT thread-safe against :meth:`read_camera`: ``disable_recording`` finalizes the SVO while
+        ``grab`` may be appending to it, and one ``sl.Camera`` cannot do both at once -- the file
+        ends up truncated ("Corruption detected in SVO file" when it is later opened). Callers that
+        grab on a background thread must stop it from that same thread.
+        """
         if self._is_recording:
+            encoded = self.recording_frames_encoded()
             self._cam.disable_recording()
             self._is_recording = False
-            _log.info("Stopped recording")
+            if encoded == 0:
+                _log.error(
+                    f"ZED {self.serial} encoded 0 frames: the SVO has a header and no video and "
+                    f"will not open. The SDK recorder failed (H265/NVENC needs free VRAM), the "
+                    f"recording was not truncated."
+                )
+            else:
+                _log.info(f"Stopped recording ({encoded if encoded is not None else '?'} frames encoded)")
 
     def close(self):
         self.stop_recording()

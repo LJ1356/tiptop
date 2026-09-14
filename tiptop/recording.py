@@ -19,13 +19,22 @@ from PIL import Image
 
 import tiptop
 from tiptop.config import tiptop_cfg, tiptop_config_path
-from tiptop.perception.cameras.zed_camera import ZedCamera, convert_svo_to_mp4
+from tiptop.perception.cameras.zed_camera import (
+    CorruptSVOError,
+    SVOGPUMemoryError,
+    ZedCamera,
+    convert_svo_to_mp4,
+)
 from tiptop.perception.utils import get_o3d_pcd
 from tiptop.perception.visualization import visualize_detections, visualize_masks
 from tiptop.utils import NumpyEncoder
 from tiptop.viz_utils import get_heatmap
 
 _log = logging.getLogger(__name__)
+
+# How long to wait for a camera's grab thread to notice the stop event and close out its
+# recording. Generous on purpose: the alternative to waiting is a corrupt file.
+_STOP_JOIN_TIMEOUT = 30.0
 
 
 @cache
@@ -191,9 +200,20 @@ def record_cameras(recordings: list[tuple[object, Path, Path | None]]) -> Genera
         for _, _, _, stop_event, _ in started:
             stop_event.set()
         for camera, _, _, _, thread in started:
-            thread.join(timeout=5.0)
-            if isinstance(camera, ZedCamera):
-                camera.stop_recording()
+            # A ZED closes out its own SVO on its grab thread (see recording_loop), so this join
+            # has to actually finish -- calling stop_recording() from here while grab() is still
+            # in flight is concurrent access to one sl.Camera and truncates the file mid-write.
+            # A normal stop takes one frame period; a USB hiccup makes the SDK retry the grab for
+            # several seconds, so wait well past that rather than give up and corrupt the file.
+            thread.join(timeout=_STOP_JOIN_TIMEOUT)
+            if thread.is_alive():
+                _log.error(
+                    f"Camera {camera.serial} grab thread did not stop within "
+                    f"{_STOP_JOIN_TIMEOUT:.0f}s and still owns the device; leaving its recording "
+                    f"open, because finalizing it from here would corrupt the file. Its video will "
+                    f"be unusable and the session probably needs a restart."
+                )
+                continue
             _log.info(f"Stopped recording camera {camera.serial}")
         for serial, writer in writers.items():
             frames = writer.close()
@@ -204,14 +224,22 @@ def record_cameras(recordings: list[tuple[object, Path, Path | None]]) -> Genera
             stop_event = threading.Event()
 
             if isinstance(camera, ZedCamera):
-                # The SDK records the SVO itself; the loop only has to keep grabbing.
+                # The SDK records the SVO itself; the loop only has to keep grabbing. It also
+                # finalizes the recording, so disable_recording() can never overlap an in-flight
+                # grab() on this sl.Camera (see ZedCamera.stop_recording).
                 def recording_loop(cam=camera, event=stop_event):
-                    while not event.is_set():
+                    try:
+                        while not event.is_set():
+                            try:
+                                cam.read_camera()
+                            except Exception as e:
+                                _log.error(f"Error grabbing frame during recording: {e}")
+                                break
+                    finally:
                         try:
-                            cam.read_camera()
-                        except Exception as e:
-                            _log.error(f"Error grabbing frame during recording: {e}")
-                            break
+                            cam.stop_recording()
+                        except Exception:
+                            _log.exception(f"Failed to finalize the SVO for camera {cam.serial}")
 
                 camera.start_recording(str(svo_path))
                 _log.info(f"Started recording camera {camera.serial} to {svo_path}")
@@ -258,6 +286,23 @@ def record_cameras(recordings: list[tuple[object, Path, Path | None]]) -> Genera
 
         # Convert to MP4 after all cameras have stopped. Only the ZEDs need this — a directly
         # encoded camera closed its writer inside stop_all() and its mp4 is already on disk.
+        #
+        # Nothing in here may raise. dump_raw_episode runs *after* this context manager, so an
+        # exception on the way out throws away a rollout the robot actually executed -- including
+        # the proprioception and the cameras that are fine -- over a video problem. Two distinct
+        # failures both end up here and both keep the episode:
+        #
+        #   - A full GPU blocks the decode context, NOT the recording: the .svo2 on disk is
+        #     complete and converts fine once VRAM frees up, so leave the MP4s to `svo-to-mp4`
+        #     offline. Once the GPU is full every remaining camera fails identically, so stop
+        #     trying after the first one.
+        #   - A corrupt/truncated .svo2 is genuinely unrecoverable, but only for that one camera.
+        #     The LeRobot build already drops an episode whose exterior_1/wrist video is missing
+        #     (build_lerobot._decode_cameras), so a bad camera cannot leak into training data,
+        #     while an eval rollout scored off the external view stays scoreable.
+        gpu_full: SVOGPUMemoryError | None = None
+        unconverted: list[Path] = []
+        corrupt: list[tuple[Path, CorruptSVOError]] = []
         for camera, svo_path, mp4_path, _, _ in started:
             if not isinstance(camera, ZedCamera):
                 continue
@@ -269,12 +314,40 @@ def record_cameras(recordings: list[tuple[object, Path, Path | None]]) -> Genera
                 if svo2_path.exists():
                     _log.debug(f"SVO actually written by ZED SDK to {svo2_path.name}")
                     actual_svo_path = svo2_path
-            if actual_svo_path.exists():
-                convert_svo_to_mp4(actual_svo_path, mp4_path)
-            else:
-                raise FileNotFoundError(
-                    f"Recording failed: SVO file not found at {svo_path} or {svo_path.with_suffix('.svo2')}"
+            if not actual_svo_path.exists():
+                _log.error(
+                    f"Recording failed: SVO file not found at {svo_path} or "
+                    f"{svo_path.with_suffix('.svo2')}; {mp4_path.name} will be missing"
                 )
+                continue
+            if gpu_full is not None:
+                unconverted.append(actual_svo_path)
+                continue
+            try:
+                convert_svo_to_mp4(actual_svo_path, mp4_path)
+            except SVOGPUMemoryError as e:
+                gpu_full = e
+                unconverted.append(actual_svo_path)
+            except CorruptSVOError as e:
+                corrupt.append((actual_svo_path, e))
+
+        if gpu_full is not None:
+            _log.error(
+                f"{gpu_full}\n"
+                f"The episode is INTACT and is being saved; only the MP4s are missing. "
+                f"Free VRAM and convert them offline before building the dataset:\n"
+                f"  svo-to-mp4 -r {unconverted[0].parent}\n"
+                f"Pending: {', '.join(p.name for p in unconverted)}"
+            )
+
+        for bad_path, err in corrupt:
+            _log.error(
+                f"{err}\n"
+                f"{bad_path.name} is unrecoverable, so {bad_path.stem}.mp4 is missing. The rest of "
+                f"the episode (proprioception and the other cameras) is being saved: an eval "
+                f"rollout is still scoreable, and the LeRobot build will skip this episode if the "
+                f"missing camera is one it requires. The .svo2 is kept on disk for inspection."
+            )
 
 
 def save_perception_outputs(

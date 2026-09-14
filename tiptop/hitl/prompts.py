@@ -178,7 +178,7 @@ Each robot phase is planned fresh, so an object may be picked up in more than on
 
 PLAN THE WHOLE INSTRUCTION. Work through it clause by clause and give every clause a phase, in the \
 order stated. Fill in `coverage` with one entry per clause, naming the phase that carries it out \
-(the index in your `phases` list), or -1 if you had to leave it out. The commonest mistake is to \
+(the index in your `phases` list), or -1 if you had to leave it out. The most common mistake is to \
 plan the first clause carefully and stop; the last phase must leave the workspace as the END of the \
 instruction describes.
 

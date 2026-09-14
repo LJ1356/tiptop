@@ -25,14 +25,23 @@
   },
   "34032889": {
     "pose": [
-      0.59232549917372,
-      -0.5073165370635324,
-      0.3708863688217851,
-      -1.8327014835044162,
-      0.04873407972676347,
-      0.4292693155040675
+      0.596145516302798,
+      -0.5059556093430027,
+      0.3675185192026867,
+      -1.8397328113725175,
+      0.0472909903727976,
+      0.4332077054409907
     ],
-    "timestamp": 1788559581.9159496,
-    "source": "copied verbatim from droid 34032889_left in /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json (the robot env's editable `droid` points at the tamp-vla checkout, not ~/droid -- ~/droid's copy is stale at 2026-08-12), recalibrated 2026-09-04 18:06. Supersedes the 2026-08-27 14:06 solve by 6.5deg / 12.3mm (dx -6.1, dy +3.6, dz -10.1 mm); the rotation change is almost all yaw (rz 0.537 -> 0.429), well outside the ~10-15mm / <1deg run-to-run scatter of the 08-26..08-27 cluster, so the unit was most likely physically nudged or remounted. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
+    "pose_uncalibrated_solve": [
+      0.596145516302798,
+      -0.5059556093430027,
+      0.3775185192026867,
+      -1.8397328113725175,
+      0.0472909903727976,
+      0.4332077054409907
+    ],
+    "correction": "world z -0.010 m, applied by hand on 2026-09-10 to compensate for grasps landing ~1cm high",
+    "timestamp": 1789095150.804143,
+    "source": "copied from droid 34032889_left in /home/prpl/tamp-vla/droid/droid/calibration/calibration_info.json (the robot env's editable `droid` points at the tamp-vla checkout, not ~/droid -- ~/droid's copy is stale at 2026-08-12), recalibrated 2026-09-10 22:52, THEN HAND-CORRECTED. `pose` is not the raw solve: world z is biased -0.010 m from `pose_uncalibrated_solve` because grasps were consistently landing ~1cm above the intended contact. Since load_calibration() applies translation in the world frame, that shifts every point reconstructed through this camera down 1cm in world z regardless of the camera's tilt. CAVEATS: (a) the fudge only moves perception that comes through THIS serial -- the wrist cam (13222437) and any top cam still carry the original bias, so if the true cause is the TCP/gripper offset rather than these extrinsics, it is only masked for the side view; (b) tiptop's update_calibration_info() rewrites an entry as {pose, timestamp} only, so the next `calibrate-third-person-cam` run on this serial silently discards this correction AND these notes -- re-apply the -0.010 m by hand after any recalibration, or the 1cm error comes back. Prior solve history: 2026-09-10 22:52 superseded 2026-09-10 22:16 by 6.6mm / 0.47deg, which superseded 2026-09-04 18:06 by 6.1mm / 0.63deg; both inside the ~10-15mm / <1deg run-to-run scatter of the 08-26..08-27 cluster, so those read as repeat solves of one mount position. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. NOTE: only read when DC_WORKSPACE=prpl; a bare run falls back to assets/calibration_info.json"
   }
 }
