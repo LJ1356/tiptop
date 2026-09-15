@@ -195,6 +195,75 @@ class VLMPredicate:
 
 
 @dataclass(frozen=True)
+class HumanOperator:
+    """The explicit TAMP operator behind ONE human phase -- ``Push(box)`` and what it does.
+
+    A human phase used to carry only ``atoms``: what should be true when it is over. That is an
+    effect list with no contract around it -- nothing said what the world had to look like for the
+    step to be possible, and nothing said what the step UNDOES. This makes both explicit, in the
+    shape cuTAMP states its own operators in (``cutamp.tamp_domain.TAMPOperator``):
+
+        Push(box)
+            preconditions:   HandEmpty(), On(box, table)
+            add effects:     IsPushed(box)
+            delete effects:  On(box, table)
+
+    Stored GROUNDED, not lifted. cuTAMP's operators are lifted because its search instantiates them;
+    this one is never searched over -- the proposal stage already decided that this phase happens
+    here, to these objects -- so the useful form is the instance, which is what a camera can be asked
+    about. ``parameters`` is kept only so the record can print a typed signature.
+
+    Nothing here enters cuTAMP's symbolic search: a human operator's effects are not achievable by
+    any robot operator (that is what makes the phase a human's), so offering it to the skeleton
+    search would only produce plans the robot cannot execute. It is used for exactly two things --
+    the pre/post checks around the hand-off, and the plan-time consistency check.
+    """
+
+    name: str
+    args: tuple[str, ...]
+    parameters: tuple[Parameter, ...]
+    preconditions: frozenset[Atom] = frozenset()
+    add_effects: frozenset[Atom] = frozenset()
+    delete_effects: frozenset[Atom] = frozenset()
+
+    def __post_init__(self) -> None:
+        assert len(self.args) == len(self.parameters), (self.args, self.parameters)
+
+    @property
+    def display(self) -> str:
+        """``Push(box)`` -- the instance, as the proposer wrote it."""
+        return f"{display_name(self.name)}({', '.join(self.args)})"
+
+    @property
+    def signature(self) -> str:
+        """``Push(?x0: movable)`` -- the lifted shape, for the audit record."""
+        return f"{display_name(self.name)}({', '.join(str(p) for p in self.parameters)})"
+
+    def apply(self, state: frozenset[Atom]) -> frozenset[Atom]:
+        """``state`` after this operator ran: delete effects removed, add effects added.
+
+        Add effects win a tie. An atom in both lists is rejected at parse time, so this only decides
+        the order for a state that already held something the operator both deletes and adds.
+        """
+        return frozenset((set(state) - set(self.delete_effects)) | set(self.add_effects))
+
+    def unmet(self, state: frozenset[Atom]) -> frozenset[Atom]:
+        """Preconditions this state does not satisfy."""
+        return frozenset(self.preconditions) - frozenset(state)
+
+    def to_json(self) -> dict:
+        return {
+            "name": display_name(self.name),
+            "args": list(self.args),
+            "signature": self.signature,
+            "instance": self.display,
+            "preconditions": sorted(display_atom(a) for a in self.preconditions),
+            "add_effects": sorted(display_atom(a) for a in self.add_effects),
+            "delete_effects": sorted(display_atom(a) for a in self.delete_effects),
+        }
+
+
+@dataclass(frozen=True)
 class Phase:
     """One step of the task, carried out by one agent.
 
@@ -202,26 +271,64 @@ class Phase:
     and go straight into ``create_tamp_environment``, which plans and executes them like any ordinary
     rollout. A ``human`` phase is one thing a person does; ``atoms`` are what should be true
     afterwards, and are what the VLM is asked about to check they did it.
+
+    A human phase also carries its ``operator`` -- the explicit ``Push(box)`` with preconditions and
+    add/delete effects (:class:`HumanOperator`). ``atoms`` stays the phase's own statement of what
+    must hold afterwards and is always a subset of the operator's add effects, so every existing
+    reader keeps working unchanged; the operator is what the pre/post checks and the plan-time
+    consistency check are stated over. Optional: a proposal from before operators, or one the model
+    declined to give an operator for, leaves it None and behaves exactly as it did.
     """
 
     executor: str  # "robot" | "human"
     description: str
     atoms: frozenset[Atom]
     instructions: str = ""
+    operator: "HumanOperator | None" = None
 
     def __post_init__(self) -> None:
         assert self.executor in ("robot", "human"), self.executor
+        assert self.operator is None or self.is_human, "only a human phase carries an operator"
+
+    @property
+    def preconditions(self) -> frozenset[Atom]:
+        """What must hold before this phase can be carried out. Empty without an operator."""
+        return self.operator.preconditions if self.operator else frozenset()
+
+    @property
+    def add_effects(self) -> frozenset[Atom]:
+        """What this phase makes true. The phase's own atoms when it has no operator."""
+        return self.operator.add_effects if self.operator else self.atoms
+
+    @property
+    def delete_effects(self) -> frozenset[Atom]:
+        """What this phase makes false. Empty without an operator -- the old implicit behaviour."""
+        return self.operator.delete_effects if self.operator else frozenset()
 
     @property
     def is_human(self) -> bool:
         return self.executor == "human"
 
     def rebind(self, mapping: Mapping[str, str]) -> "Phase":
-        """The same phase with its objects renamed to this pass's labels."""
-        atoms = frozenset(
-            a.fluent.ground(*[mapping.get(v, v) for v in a.values]) for a in self.atoms
-        )
-        return Phase(self.executor, self.description, atoms, self.instructions)
+        """The same phase with its objects renamed to this pass's labels.
+
+        The operator is re-bound with it. Skipping it would leave the pre/post checks stated over
+        names this perception pass no longer produces -- the very drift `rebind` exists to absorb.
+        """
+        def relabel(atoms):
+            return frozenset(a.fluent.ground(*[mapping.get(v, v) for v in a.values]) for a in atoms)
+
+        operator = None
+        if self.operator is not None:
+            operator = HumanOperator(
+                name=self.operator.name,
+                args=tuple(mapping.get(v, v) for v in self.operator.args),
+                parameters=self.operator.parameters,
+                preconditions=relabel(self.operator.preconditions),
+                add_effects=relabel(self.operator.add_effects),
+                delete_effects=relabel(self.operator.delete_effects),
+            )
+        return Phase(self.executor, self.description, relabel(self.atoms), self.instructions, operator)
 
     def summary(self) -> dict:
         record = {
@@ -231,6 +338,10 @@ class Phase:
         }
         if self.is_human:
             record["instructions"] = self.instructions
+            # The explicit operator behind this phase: what had to be true first, what it makes true
+            # and what it undoes. Absent on a plan proposed without one.
+            if self.operator is not None:
+                record["operator"] = self.operator.to_json()
         return record
 
 
@@ -259,6 +370,11 @@ class TaskSpecification:
     @property
     def needs_human(self) -> bool:
         return any(p.is_human for p in self.phases)
+
+    @property
+    def operators(self) -> tuple[HumanOperator, ...]:
+        """The explicit operator behind each human phase, in phase order."""
+        return tuple(p.operator for p in self.phases if p.operator is not None)
 
     @property
     def descriptions(self) -> dict[str, str]:
@@ -303,6 +419,14 @@ class TaskSpecification:
                     "instructions": p.instructions,
                 }
                 for p in sorted(self.invented, key=lambda p: p.name)
+            ],
+            # One per human phase, in phase order: the operator that phase IS, with its
+            # preconditions and add/delete effects. Empty on an all-robot plan, and on a plan
+            # proposed without operators at all.
+            "human_operators": [
+                {"phase": i, **phase.operator.to_json()}
+                for i, phase in enumerate(self.phases)
+                if phase.operator is not None
             ],
             "surfaces": sorted(self.scene_types.surfaces),
             "movables": sorted(self.scene_types.movables),

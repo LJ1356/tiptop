@@ -1525,6 +1525,20 @@ def _hitl_goal_resolver(task_instruction: str, rgb, state: dict):
                 f"HITL: the {leg.planner} planner takes {len(leg.phases)} consecutive robot phases as "
                 "a single goal -- " + "; ".join(p.description for p in leg.phases)
             )
+        # Is the world still as the plan believes, before cuTAMP is asked for a plan that assumes it?
+        # Checked on THIS pass's frame -- the one perception just used -- rather than a fresh grab, so
+        # the check and the plan are looking at the same workspace.
+        expected = session.expected_now()
+        if _hitl_cfg.check_tamp_preconditions and expected:
+            blocked = await _hitl_check_preconditions(
+                lambda: to_pil(rgb), expected, session,
+                what="robot leg", description=leg.phases[0].description,
+            )
+            if blocked is not None:
+                # NOT a session reset: the phases already done are still done, and re-running the
+                # task re-perceives and tries again. Same reasoning as the deferred-object failure.
+                state["failure"] = blocked
+                return [], set(session.spec.scene_types.surfaces), session.robot_movables()
         return list(leg.goal), set(session.spec.scene_types.surfaces), session.robot_movables()
 
     return resolve
@@ -1704,6 +1718,94 @@ def _move_to_policy_start(container: "_DemoContainer", planner) -> str | None:
         _log.exception("HITL: could not reach the policy's start pose")
         return f"could not move the arm to hitl.policy_start_joint_angle: {exc}"
     return None
+
+
+async def _hitl_check_preconditions(get_image, atoms, session, *, what: str, description: str) -> str | None:
+    """Put a set of entry conditions to a camera. Returns why to stop, or None to carry on.
+
+    Serves both halves of the contract. For a human phase ``atoms`` is its operator's declared
+    preconditions; for a robot leg it is ``session.expected_now()`` -- the beliefs earlier phases are
+    responsible for -- since a robot phase declares none of its own.
+
+    ``get_image`` is a thunk, not a frame: grabbing it is a camera read that can fail, and that must
+    be inside the same guard as the classifier call. A classifier -- or a camera -- that cannot be
+    reached is not a reason to stop, the same rule the effect check follows. Whether an unmet
+    precondition stops anything at all is ``hitl.precondition_enforced``: off (the default) it is
+    recorded and reported and the work goes ahead.
+    """
+    from tiptop.hitl.grounding import missing_statements, verify_atoms
+
+    try:
+        ok, verdicts = await verify_atoms(
+            get_image(), session.spec.invented, _hitl_cfg, expect_true=atoms, role="precondition"
+        )
+    except Exception:
+        _log.exception(f"HITL: could not check the {what} preconditions; carrying on unchecked")
+        return None
+    if not verdicts:
+        # Nothing a camera can settle -- HandEmpty() alone, say. Not a check that passed.
+        return None
+    session.verdicts.extend(verdicts)
+    _emit_event({
+        "event": "phase_preconditions_checked",
+        "description": description,
+        "what": what,
+        "ok": ok,
+        "enforced": _hitl_cfg.precondition_enforced,
+        "verdicts": [v.summary() for v in verdicts],
+    })
+    if ok:
+        _log.info(f"HITL: the {what} preconditions hold")
+        return None
+    detail = "; ".join(missing_statements(verdicts))
+    if not _hitl_cfg.precondition_enforced:
+        _log.warning(
+            f"HITL: the {what} preconditions do not hold ({detail}), but precondition_enforced is "
+            "off; carrying on"
+        )
+        return None
+    _log.error(f"HITL: refusing to run the {what} -- its preconditions do not hold: {detail}")
+    return f"the preconditions of the {what} {description!r} do not hold: {detail}"
+
+
+async def _hitl_check_effects(container, phases, session, *, what: str, description: str) -> bool:
+    """Did a robot leg leave the workspace as its phases said it would? Observational only.
+
+    ``hitl.check_tamp_effects``. Never stops anything: cuTAMP either found and executed a plan for
+    ``On(toy, box)`` or it reported that it could not, and the arm's own account of that is better
+    evidence than a third-person camera. This is here to make the camera's disagreement visible --
+    a placement the robot believes it made and the image does not show is worth knowing about.
+    """
+    from tiptop.hitl.grounding import missing_statements, verify_atoms
+
+    atoms = frozenset().union(*(p.atoms for p in phases)) if phases else frozenset()
+    try:
+        # Inside the try with the classifier call: the camera read can fail too, and neither is a
+        # reason to stop a leg the robot has already executed.
+        ok, verdicts = await verify_atoms(
+            _hitl_verification_image(container), session.spec.invented, _hitl_cfg,
+            expect_true=atoms, role="effect",
+        )
+    except Exception:
+        _log.exception(f"HITL: could not check the {what} effects; carrying on unchecked")
+        return True
+    if not verdicts:
+        return True
+    session.verdicts.extend(verdicts)
+    _emit_event({
+        "event": "phase_effects_checked",
+        "description": description,
+        "what": what,
+        "ok": ok,
+        "enforced": False,
+        "verdicts": [v.summary() for v in verdicts],
+    })
+    if not ok:
+        _log.warning(
+            f"HITL: the {what} ran, but the camera does not show "
+            f"{'; '.join(missing_statements(verdicts))}"
+        )
+    return ok
 
 
 def _run_policy_phase(container: "_DemoContainer", phase, planner, output_dir: str) -> dict:
@@ -1886,7 +1988,7 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
     which is why a spent retry budget still ends at the label prompt rather than dropping the legs
     unlabeled.
     """
-    from tiptop.hitl.grounding import missing_statements, verify_phase
+    from tiptop.hitl.grounding import missing_statements, verify_effects
     from tiptop.hitl.planners import teleop_planner
     from tiptop.hitl.session import handoff_message, phase_summary, retry_message
 
@@ -1898,6 +2000,18 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
     by_hand = planner is teleop_planner()
     attempts_left = _hitl_cfg.verify_retries
     finished_from_teleop = False
+
+    # Is the workspace in a state this phase can be carried out from? Once, before the first attempt:
+    # a retry runs the same phase in a world its own failed attempt may have changed, and re-checking
+    # the entry conditions there would report the attempt rather than the set-up.
+    if _hitl_cfg.check_human_preconditions and phase.preconditions:
+        blocked = await _hitl_check_preconditions(
+            lambda: _hitl_verification_image(container), phase.preconditions, session,
+            what="human phase", description=phase.description,
+        )
+        if blocked is not None:
+            _hitl_reset_session(blocked)
+            return False
 
     while True:
         # Set only by the UI's "continue to the next phase" button, and only for a policy leg.
@@ -1991,19 +2105,28 @@ async def _hitl_human_phase(container: "_DemoContainer", phase, can_finish: bool
             )
             return False
 
-        try:
-            ok, verdicts = await verify_phase(
-                _hitl_verification_image(container), phase, session.spec.invented, _hitl_cfg
-            )
-        except Exception:
-            # A classifier that cannot be reached must not cost the operator their demonstration.
-            _log.exception("HITL: could not verify the human step; accepting it unchecked")
+        skipped = not _hitl_cfg.check_human_effects
+        if skipped:
+            # Turned off: the phase is taken as done and the operator's label is the only verdict on
+            # it. Marked skipped in the event below, like the final phase, so the trail says it was
+            # NOT checked rather than that it passed.
+            _log.info("HITL: check_human_effects is off -- not verifying this phase")
             ok, verdicts = True, []
+        else:
+            try:
+                ok, verdicts = await verify_effects(
+                    _hitl_verification_image(container), phase, session.spec.invented, _hitl_cfg
+                )
+            except Exception:
+                # A classifier that cannot be reached must not cost the operator their demonstration.
+                _log.exception("HITL: could not verify the human step; accepting it unchecked")
+                ok, verdicts = True, []
         session.verdicts.extend(verdicts)
         _emit_event({
             "event": "human_phase_verified",
             "description": phase.description,
             "ok": ok,
+            "skipped": skipped,
             "verdicts": [v.summary() for v in verdicts],
         })
         if ok or not _hitl_cfg.verify_enforced:
@@ -4160,6 +4283,13 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             # cuTAMP found for it BEFORE advancing: the phase only said what had to
                             # be established, cuTAMP decided how.
                             hitl_session.record_tamp_plan(hitl_session.index, plan_out)
+                            if _hitl_cfg.check_tamp_effects:
+                                # Before advance(), so `robot_run()` is still the leg that just ran.
+                                await _hitl_check_effects(
+                                    container, hitl_session.robot_run(), hitl_session,
+                                    what="robot leg",
+                                    description=hitl_session.phases[hitl_session.index].description,
+                                )
                             hitl_session.advance()
                             nxt = hitl_session.current
                             human_phase = nxt if (nxt is not None and nxt.is_human) else None

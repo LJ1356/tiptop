@@ -10,10 +10,17 @@ This package keeps the fold in the goal. Given the workspace image and the instr
   1. interprets the goal into cuTAMP atoms, INVENTING a predicate where none of TiPToP's fit
      (``IsFolded(cloth)``, grounded by a natural-language description a VLM checks in an image);
   2. breaks the instruction into an ORDERED list of phases, each one either a sub-goal for TiPToP or
-     an action only a human can do;
+     an action only a human can do -- and states each human phase as an explicit OPERATOR
+     (``Push(box)``: preconditions, add effects, delete effects), in the shape cuTAMP states its own,
+     so what a human step requires and what it changes is declared rather than implied;
   3. hands each human phase over -- via the teleop hand-off this repo already has, or, with
      ``hitl.policy_type`` set, to a policy trained on the teleop legs of earlier runs of the task;
-  4. checks, from a fresh image, that the phase actually had the intended effect.
+  4. checks, from a fresh image, that the operator's contract held: its preconditions before the
+     phase, its add and delete effects after (``hitl.check_*``, config.py).
+
+The operator is never searched over -- step 2 already fixed the order, and no robot operator can
+achieve a human one's effects. It is a contract: checked against the camera around each phase, and
+checked against the rest of the plan before the arm moves (``planning.check_plan_effects``).
 
 Each robot phase becomes one ordinary TiPToP rollout aimed at that phase's sub-goal, and each human
 phase becomes one hand-off leg -- both planned by whichever PhasePlanner owns them (``planners.py``:
@@ -38,6 +45,7 @@ from tiptop.hitl.planners import (
 )
 from tiptop.hitl.structs import (
     HITLProposalError,
+    HumanOperator,
     Phase,
     SceneTypes,
     TaskSpecification,
@@ -47,6 +55,7 @@ from tiptop.hitl.structs import (
 __all__ = [
     "HITLConfig",
     "HITLProposalError",
+    "HumanOperator",
     "Leg",
     "Phase",
     "PhasePlanner",

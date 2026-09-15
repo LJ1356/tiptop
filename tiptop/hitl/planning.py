@@ -15,7 +15,13 @@ import numpy as np
 from cutamp.tamp_domain import Holding, On, all_tamp_operators, get_initial_state
 from cutamp.task_planning import Atom, State
 
-from tiptop.hitl.structs import DeferredObject, Phase, SceneTypes, TaskSpecification, display_atom
+from tiptop.hitl.structs import (
+    DeferredObject,
+    Phase,
+    SceneTypes,
+    TaskSpecification,
+    display_atom,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -64,6 +70,114 @@ def check_robot_phases(spec: TaskSpecification, initial_state: State) -> str | N
                 f"phase {i} ({phase.description!r}) asks the robot for "
                 f"{', '.join(display_atom(a) for a in unachievable)}, which no robot operator can achieve"
             )
+    return None
+
+
+@dataclass(frozen=True)
+class PhaseTrace:
+    """What the plan believes about the world on either side of one phase.
+
+    ``before`` is the state the phase is entered in and ``after`` the state it leaves; ``unmet`` are
+    the phase's preconditions ``before`` does not contain. Only the atoms the plan can actually reason
+    about are in these sets -- see ``simulate_phases`` for what that means and does not mean.
+    """
+
+    index: int
+    phase: Phase
+    before: frozenset[Atom]
+    after: frozenset[Atom]
+    unmet: frozenset[Atom]
+
+
+def _displaced_by(atoms: frozenset[Atom], state: frozenset[Atom]) -> set[Atom]:
+    """The ``On`` atoms in ``state`` that placing ``atoms`` makes false.
+
+    An object rests on one thing at a time, so ``On(toy, shelf)`` replaces ``On(toy, table)`` outright.
+    This is the only delete effect a phase gets for free: a robot phase declares no delete effects (it
+    has no operator), and its placements are the one thing whose consequence is not in doubt.
+    """
+    placed = {a.values[0] for a in atoms if a.name == On.name and a.values}
+    return {a for a in state if a.name == On.name and a.values and a.values[0] in placed and a not in atoms}
+
+
+def simulate_phases(spec: TaskSpecification, initially_true: frozenset[Atom] = frozenset()) -> list[PhaseTrace]:
+    """Walk the phase list symbolically and report what holds on either side of each phase.
+
+    The state tracked here is the WORLD's, not cuTAMP's. cuTAMP's own initial state deliberately
+    carries no ``On`` atom at all (``initial_state_for``) because each robot leg is planned from a
+    fresh perception pass; that is the right model for planning one leg and the wrong one for asking
+    whether a plan hangs together across legs, which is what this is for.
+
+    It starts from ``initially_true`` -- which is EMPTY unless ``hitl.classify_initial`` ran -- and
+    that is why this is a sound-not-complete check and not a simulator. An atom absent from a state
+    here means "nothing in the plan established it", never "it is false": the workspace may well have
+    started that way. ``check_plan_effects`` is what turns this into a verdict, and it only ever
+    concludes something is wrong when the plan itself is the reason.
+    """
+    state = frozenset(initially_true)
+    traces: list[PhaseTrace] = []
+    for i, phase in enumerate(spec.phases):
+        unmet = frozenset(phase.preconditions) - state
+        after = frozenset((set(state) - _displaced_by(phase.add_effects, state) - set(phase.delete_effects))
+                          | set(phase.add_effects))
+        traces.append(PhaseTrace(index=i, phase=phase, before=state, after=after, unmet=unmet))
+        state = after
+    return traces
+
+
+def check_plan_effects(
+    spec: TaskSpecification, initially_true: frozenset[Atom] = frozenset(), *, initial_state_known: bool = False
+) -> str | None:
+    """Why the declared operators do not hang together, or None when they do.
+
+    Two things are provable from the plan alone and nothing else is:
+
+      * a precondition an earlier phase DELETED and no phase put back. The plan itself made it false,
+        so no assumption about the starting workspace can rescue it. This is the check that catches
+        "the human closes the box" placed before "the robot puts the toy in the box".
+      * a precondition over an INVENTED predicate that no phase establishes -- only when the starting
+        state was actually measured (``hitl.classify_initial``, hence ``initial_state_known``).
+        Without that measurement the workspace may simply have started that way, and rejecting the
+        plan would be guessing.
+
+    Everything else is left alone, deliberately. A precondition over ``On`` that no phase establishes
+    is the commonest shape there is -- the toy was already on the box when the run started -- and a
+    check that refused it would reject almost every plan that is in fact fine.
+    """
+    established: set[Atom] = set()
+    deleted: set[Atom] = set()
+    invented_names = {p.name for p in spec.invented}
+    for trace in simulate_phases(spec, initially_true):
+        for atom in sorted(trace.unmet, key=str):
+            provably_false = atom in deleted and atom not in established
+            never_established = (
+                initial_state_known
+                and atom.name in invented_names
+                and atom not in established
+                and atom not in initially_true
+            )
+            if not (provably_false or never_established):
+                continue
+            operator = trace.phase.operator
+            where = f" ({operator.display})" if operator is not None else ""
+            why = (
+                "an earlier phase deletes it and no phase puts it back"
+                if provably_false
+                else "no phase makes it true and it is not true in the workspace to begin with"
+            )
+            return (
+                f"phase {trace.index} ({trace.phase.description!r}){where} requires "
+                f"{display_atom(atom)}, but {why}. Either reorder the phases so it still holds, or "
+                f"drop it from that operator's preconditions."
+            )
+        # A placement deletes whatever the object was resting on before, so it counts as something
+        # the plan made false just as much as a declared delete effect does. Computed against what
+        # was ESTABLISHED, not against the trace's state: the question is whether an earlier phase
+        # is on the hook for the atom, and only an atom some phase established can be.
+        displaced = _displaced_by(trace.phase.add_effects, frozenset(established))
+        deleted |= set(trace.phase.delete_effects) | displaced
+        established |= set(trace.phase.add_effects)
+        established -= set(trace.phase.delete_effects) | displaced
     return None
 
 

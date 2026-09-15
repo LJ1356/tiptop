@@ -17,7 +17,9 @@ from tiptop.hitl.config import HITLConfig, check_policy_config, load_hitl_config
 from tiptop.hitl.grounding import Verdict
 from tiptop.hitl.planning import (
     ObjectGeometry,
+    check_plan_effects,
     phase_moves,
+    simulate_phases,
     wasted_robot_move,
     bind_deferred_object,
     bind_deferred_objects,
@@ -43,6 +45,21 @@ OBJECTS = ["blue_toy", "white_box"]
 TABLE = "table"
 CFG = HITLConfig(enabled=True)
 
+
+def _atoms(*pairs):
+    return [{"predicate": name, "args": list(args)} for name, args in pairs]
+
+
+def _op(name, args, *, pre=(), add=(), dele=()):
+    """A human phase's `operator` entry. Every human phase needs one (proposal._build_operator)."""
+    return {
+        "name": name,
+        "args": list(args),
+        "preconditions": _atoms(*pre),
+        "add_effects": _atoms(*add),
+        "delete_effects": _atoms(*dele),
+    }
+
 # The plan the proposer should produce for the three-phase task. The ordering is the whole point:
 # the box is opened BEFORE anything is placed in it, which the previous design could not express.
 PLAN_RESPONSE = {
@@ -60,6 +77,8 @@ PLAN_RESPONSE = {
             "description": "open the box",
             "instructions": "Open the white_box and fold its flaps back.",
             "atoms": [{"predicate": "IsOpen", "args": ["white_box"]}],
+            "operator": _op("Open", ["white_box"],
+                            pre=[("HandEmpty", [])], add=[("IsOpen", ["white_box"])]),
         },
         {
             "executor": "robot",
@@ -235,7 +254,8 @@ def test_an_invented_predicate_used_inconsistently_is_rejected():
     response = {**PLAN_RESPONSE, "phases": [
         *PLAN_RESPONSE["phases"],
         {"executor": "human", "description": "and the toy", "instructions": "open the toy",
-         "atoms": [{"predicate": "IsOpen", "args": ["blue_toy"]}]},
+         "atoms": [{"predicate": "IsOpen", "args": ["blue_toy"]}],
+         "operator": _op("Open", ["blue_toy"], add=[("IsOpen", ["blue_toy"])])},
     ]}
     with pytest.raises(HITLProposalError, match="inconsistent arguments"):
         parse(response)
@@ -360,6 +380,8 @@ def test_a_repeated_robot_move_is_reported_but_not_refused():
                     "description": "solve the puzzle",
                     "atoms": [{"predicate": "IsSolved", "args": ["puzzle_board"]}],
                     "instructions": "Fit each piece into its matching cut-out.",
+                    "operator": _op("Solve", ["puzzle_board"],
+                                    pre=[("HandEmpty", [])], add=[("IsSolved", ["puzzle_board"])]),
                 },
             ),
         },
@@ -489,6 +511,8 @@ SORT_RESPONSE = {
             "description": "cover both bowls with the cloth",
             "instructions": "Drape the blue_cloth over both bowls.",
             "atoms": [{"predicate": "AreCoveredBy", "args": ["blue_bowl", "green_bowl", "blue_cloth"]}],
+            "operator": _op("Cover", ["blue_cloth"], pre=[("HandEmpty", [])],
+                            add=[("AreCoveredBy", ["blue_bowl", "green_bowl", "blue_cloth"])]),
         },
     ],
 }
@@ -646,30 +670,289 @@ def test_only_camera_settleable_atoms_are_put_to_the_vlm():
     # a photo: the frame is a third-person view chosen because the arm is wherever the operator left
     # it, so the gripper is often out of shot, and the classifier answers false when it cannot see
     # the statement to be true.
+    atoms = [
+        {"predicate": "IsOpen", "args": ["white_box"]},
+        {"predicate": "On", "args": ["blue_toy", "table"]},
+        {"predicate": "HandEmpty", "args": []},
+    ]
     response = _plan(phases=[{
         "executor": "human", "description": "open the box", "instructions": "open it",
-        "atoms": [
-            {"predicate": "IsOpen", "args": ["white_box"]},
-            {"predicate": "On", "args": ["blue_toy", "table"]},
-            {"predicate": "HandEmpty", "args": []},
-        ],
+        "atoms": atoms,
+        "operator": _op("Open", ["white_box"], pre=[("HandEmpty", [])],
+                        add=[("IsOpen", ["white_box"]), ("On", ["blue_toy", "table"]),
+                             ("HandEmpty", [])]),
     }])
     spec = parse(response)
     phase = spec.phases[0]
     asked = []
 
-    async def fake_classify_all(image, atoms, descriptions, cfg):
+    async def fake_classify_all(image, atoms, descriptions, cfg, *, expected=True, role="effect"):
         asked.extend(atoms)
-        return [Verdict(a, describe_atom(a, descriptions), True, "") for a in atoms]
+        return [Verdict(a, describe_atom(a, descriptions), expected, "", expected=expected) for a in atoms]
 
     with mock.patch.object(grounding, "classify_all", fake_classify_all):
-        ok, _ = asyncio.run(grounding.verify_phase(None, phase, spec.invented, CFG))
+        ok, _ = asyncio.run(grounding.verify_effects(None, phase, spec.invented, CFG))
     assert ok
     assert {display_atom(a) for a in asked} == {"IsOpen(white_box)", "On(blue_toy, table)"}
 
     # But the human is still TOLD about all of it, so they know what is expected.
     shown = grounding.describe_expectations(phase, grounding.descriptions_for(spec.invented))
     assert any("gripper is empty" in line for line in shown)
+
+
+# --- the human operator ---------------------------------------------------------------------------
+
+
+def _open_close(**changes):
+    """A three-phase plan whose middle human phase CLOSES what the first one opened."""
+    plan = {
+        "new_predicates": [
+            {"name": "IsOpen", "instructions": "the container {0} is open"},
+            {"name": "IsClosed", "instructions": "the container {0} is shut"},
+        ],
+        "phases": [
+            {"executor": "human", "description": "open the box", "instructions": "open it",
+             "atoms": _atoms(("IsOpen", ["white_box"])),
+             "operator": _op("Open", ["white_box"], add=[("IsOpen", ["white_box"])])},
+            {"executor": "human", "description": "close the box", "instructions": "shut it",
+             "atoms": _atoms(("IsClosed", ["white_box"])),
+             "operator": _op("Close", ["white_box"], pre=[("IsOpen", ["white_box"])],
+                             add=[("IsClosed", ["white_box"])], dele=[("IsOpen", ["white_box"])])},
+            {"executor": "human", "description": "drop the toy in", "instructions": "put it in",
+             "atoms": _atoms(("On", ["blue_toy", "white_box"])),
+             "operator": _op("Insert", ["blue_toy", "white_box"], pre=[("IsOpen", ["white_box"])],
+                             add=[("On", ["blue_toy", "white_box"])])},
+        ],
+    }
+    return {**plan, **changes}
+
+
+def test_a_human_phase_carries_its_operator_grounded_to_this_scene():
+    operator = parse().phases[1].operator
+    assert operator.display == "Open(white_box)"
+    # Typed from the args' scene types, like an invented predicate's parameters are.
+    assert operator.signature == "Open(x0: surface)"
+    assert {display_atom(a) for a in operator.preconditions} == {"HandEmpty()"}
+    assert {display_atom(a) for a in operator.add_effects} == {"IsOpen(white_box)"}
+    assert operator.delete_effects == frozenset()
+
+
+def test_a_robot_phase_never_carries_an_operator():
+    # cuTAMP's operators are the robot's and they are fixed; `preconditions` on a robot phase falls
+    # back to the empty set rather than to something invented for it.
+    robot = parse().phases[0]
+    assert robot.operator is None
+    assert robot.preconditions == frozenset()
+    # With no operator, the phase's own atoms ARE its add effects -- the pre-operator behaviour.
+    assert robot.add_effects == robot.atoms
+    assert robot.delete_effects == frozenset()
+
+
+@pytest.mark.parametrize(
+    "operator,expected",
+    [
+        (None, "needs an `operator`"),
+        (_op("Open", ["white_box"], add=[("On", ["blue_toy", "table"])]),
+         "does not make that true"),
+        (_op("Open", ["white_box"], add=[("IsOpen", ["white_box"])], dele=[("IsOpen", ["white_box"])]),
+         "both adds and deletes"),
+        (_op("Open", ["white_box"]), "has no `add_effects`"),
+        (_op("Open", ["green_crate"], add=[("IsOpen", ["white_box"])]), "not an object in this scene"),
+        (_op("Open", ["white_box"], pre=[("IsShiny", ["white_box"])], add=[("IsOpen", ["white_box"])]),
+         "Unknown predicate 'IsShiny'"),
+    ],
+)
+def test_operator_rejections(operator, expected):
+    response = _plan(phases=[{
+        "executor": "human", "description": "open the box", "instructions": "open it",
+        "atoms": _atoms(("IsOpen", ["white_box"])), "operator": operator,
+    }])
+    with pytest.raises(HITLProposalError, match=re.escape(expected)):
+        parse(response)
+
+
+def test_an_operator_on_a_robot_phase_is_refused():
+    # Almost always a human step written as a robot phase, which is the misjudgement worth catching.
+    response = _phases({
+        "executor": "robot", "description": "shove it",
+        "atoms": _atoms(("On", ["blue_toy", "table"])),
+        "operator": _op("Shove", ["blue_toy"], add=[("On", ["blue_toy", "table"])]),
+    })
+    with pytest.raises(HITLProposalError, match="Only a human phase"):
+        parse(response)
+
+
+def test_an_invented_predicate_used_only_inside_an_operator_is_still_typed():
+    # IsClosed appears in an add effect and IsOpen in a delete effect; neither has to appear in any
+    # phase's `atoms`, and a predicate with no uses at all is rejected as unused.
+    spec = parse(_open_close(), objects=OBJECTS)
+    assert {display_name(p.name) for p in spec.invented} == {"IsOpen", "IsClosed"}
+
+
+def test_a_plan_that_deletes_what_a_later_phase_needs_is_refused():
+    # The check the operator contract exists for: phase 1 closes the box, phase 2 needs it open.
+    spec = parse(_open_close())
+    assert "IsOpen(white_box)" in check_plan_effects(spec)
+    assert "an earlier phase deletes it" in check_plan_effects(spec)
+
+
+def test_reordering_the_same_phases_makes_the_plan_consistent():
+    phases = _open_close()["phases"]
+    fixed = parse(_open_close(phases=[phases[0], phases[2], phases[1]]))
+    assert check_plan_effects(fixed) is None
+
+
+def test_a_placement_that_invalidates_a_later_precondition_is_caught():
+    # A placement deletes whatever the object rested on before, without ever declaring it: the robot
+    # moving the toy into the box is what makes On(blue_toy, table) false. A later phase requiring it
+    # is as broken as one requiring a declared delete effect, and has to be caught the same way.
+    response = {
+        "new_predicates": [{"name": "IsWiped", "instructions": "the surface {0} has been wiped"}],
+        "phases": [
+            {"executor": "robot", "description": "toy to the table",
+             "atoms": _atoms(("On", ["blue_toy", "table"]))},
+            {"executor": "robot", "description": "toy into the box",
+             "atoms": _atoms(("On", ["blue_toy", "white_box"]))},
+            {"executor": "human", "description": "wipe under the toy", "instructions": "wipe it",
+             "atoms": _atoms(("IsWiped", ["table"])),
+             "operator": _op("Wipe", ["table"], pre=[("On", ["blue_toy", "table"])],
+                             add=[("IsWiped", ["table"])])},
+        ],
+    }
+    broken = check_plan_effects(parse(response))
+    assert "On(blue_toy, table)" in broken and "an earlier phase deletes it" in broken
+
+
+def test_a_precondition_nothing_establishes_is_left_alone_when_the_scene_is_unmeasured():
+    # HandEmpty() is nobody's add effect, and On(toy, box) may simply have been true to begin with.
+    # Refusing either would reject almost every plan that is in fact fine, so the check is sound and
+    # not complete: it only concludes something is wrong when the PLAN made it wrong.
+    assert check_plan_effects(parse()) is None
+
+
+def test_the_trace_replaces_an_On_atom_rather_than_accumulating_both():
+    # An object rests on one thing at a time, so the second placement displaces the first. Without
+    # this the trace would believe the toy is on the table AND in the box.
+    traces = simulate_phases(parse())
+    assert {display_atom(a) for a in traces[1].before} == {"On(blue_toy, table)"}
+    assert {display_atom(a) for a in traces[2].after} == {"IsOpen(white_box)", "On(blue_toy, white_box)"}
+
+
+def test_a_relabelled_plan_relabels_its_operators_too():
+    # Otherwise the pre/post checks would be stated over names this perception pass no longer emits
+    # -- the drift `rebind` exists to absorb.
+    spec = parse().rebind({"white_box": "cardboard_box"})
+    operator = spec.phases[1].operator
+    assert operator.display == "Open(cardboard_box)"
+    assert {display_atom(a) for a in operator.add_effects} == {"IsOpen(cardboard_box)"}
+
+
+def test_the_record_carries_each_human_phases_operator():
+    record = parse().to_json()
+    assert [o["instance"] for o in record["human_operators"]] == ["Open(white_box)"]
+    assert record["human_operators"][0]["phase"] == 1
+    assert record["human_operators"][0]["preconditions"] == ["HandEmpty()"]
+
+
+# --- checking the contract against a camera -------------------------------------------------------
+
+
+def _verdicts(spec, phase, answers):
+    """Run verify_effects with a canned classifier: atom display name -> what the camera "sees"."""
+    async def fake_classify(image, atom, descriptions, cfg, *, expected=True, role="effect"):
+        return Verdict(atom, describe_atom(atom, descriptions), answers[display_atom(atom)], "",
+                       expected=expected, role=role)
+
+    with mock.patch.object(grounding, "classify", fake_classify):
+        return asyncio.run(grounding.verify_effects(None, phase, spec.invented, CFG))
+
+
+def test_a_delete_effect_that_is_still_true_fails_the_phase():
+    # The reason Verdict separates `holds` from `expected`: for a delete effect "holds: true" IS the
+    # failure, and branching on `holds` would silently invert the check.
+    spec = parse(_open_close())
+    phase = spec.phases[1]  # Close(white_box): adds IsClosed, deletes IsOpen
+    ok, verdicts = _verdicts(spec, phase, {"IsClosed(white_box)": True, "IsOpen(white_box)": True})
+    assert not ok
+    deleted = next(v for v in verdicts if display_atom(v.atom) == "IsOpen(white_box)")
+    assert deleted.holds and not deleted.expected and not deleted.satisfied
+    # And the operator is told the right way round, not asked to redo what they already did.
+    assert any("no longer" in line for line in grounding.missing_statements(verdicts))
+
+
+def test_a_phase_passes_when_its_add_effects_hold_and_its_delete_effects_do_not():
+    spec = parse(_open_close())
+    ok, verdicts = _verdicts(
+        spec, spec.phases[1], {"IsClosed(white_box)": True, "IsOpen(white_box)": False}
+    )
+    assert ok
+    assert all(v.satisfied for v in verdicts)
+    assert {v.role for v in verdicts} == {"effect", "effect (deleted)"}
+
+
+def test_preconditions_are_checked_as_their_own_role():
+    spec = parse(_open_close())
+
+    async def fake_classify(image, atom, descriptions, cfg, *, expected=True, role="effect"):
+        return Verdict(atom, describe_atom(atom, descriptions), True, "", expected=expected, role=role)
+
+    with mock.patch.object(grounding, "classify", fake_classify):
+        ok, verdicts = asyncio.run(
+            grounding.verify_preconditions(None, spec.phases[1], spec.invented, CFG)
+        )
+    assert ok
+    assert [v.role for v in verdicts] == ["precondition"]
+    assert display_atom(verdicts[0].atom) == "IsOpen(white_box)"
+
+
+def test_a_phase_with_no_operator_has_nothing_to_check_before_it():
+    # A robot phase, and a plan proposed before operators existed: no preconditions, trivially fine.
+    spec = parse()
+    ok, verdicts = asyncio.run(grounding.verify_preconditions(None, spec.phases[0], spec.invented, CFG))
+    assert ok and verdicts == []
+
+
+def test_a_robot_leg_inherits_only_what_earlier_phases_established():
+    # The robot-side precondition set: every atom an earlier phase was responsible for and no later
+    # one undid. Both of these are beliefs that can have gone stale by now -- the human phase may
+    # not have opened the box it was verified as opening, and it may have knocked the toy off the
+    # table while it was at it.
+    session = _session()
+    session.index = 2  # the last robot phase, after the human one
+    assert {display_atom(a) for a in session.expected_now()} == {
+        "On(blue_toy, table)", "IsOpen(white_box)"
+    }
+    # HandEmpty() is nobody's add effect -- it is the human operator's PRECONDITION -- so no earlier
+    # phase can be held to it and it is not put to a camera here.
+    assert not any(display_atom(a) == "HandEmpty()" for a in session.expected_now())
+
+
+def test_nothing_is_inherited_before_the_first_phase_runs():
+    assert _session().expected_now() == frozenset()
+
+
+def test_which_halves_of_the_contract_were_checked_is_on_the_record():
+    # A phase with no verdicts is otherwise ambiguous between "checked and fine" and "never checked".
+    record = _session().to_json()
+    assert record["checks"]["human_effects"] is True
+    assert record["checks"]["human_preconditions"] is False
+    assert record["checks"]["tamp_preconditions"] is False
+    assert record["checks"]["tamp_effects"] is False
+
+
+def test_only_the_check_nothing_else_can_answer_is_on_by_default():
+    # A human phase's effects are the only evidence the step happened at all. Every other half of
+    # the contract is either provable for free at plan time or something the robot already knows,
+    # and each costs a VLM call with the arm parked -- so they are opt-in.
+    cfg = HITLConfig(enabled=True)
+    assert cfg.check_human_effects is True
+    assert (cfg.check_human_preconditions, cfg.check_tamp_preconditions, cfg.check_tamp_effects) == (
+        False, False, False
+    )
+    # A failed precondition is observational until asked for otherwise.
+    assert cfg.precondition_enforced is False
+    # The free one stays on: symbolic, no VLM call, and it feeds the reprompt loop.
+    assert cfg.check_plan_effects is True
 
 
 # --- the reprompt loop ----------------------------------------------------------------------------
@@ -1019,7 +1302,10 @@ def test_the_robot_phases_go_to_cutamp_unless_the_config_says_otherwise():
 
 def test_the_shipped_hitl_configs_resolve():
     # The configs this feature ships with; their hitl blocks have to survive resolve_hitl_config or
-    # the run turns the feature off without saying so.
+    # the run turns the feature off without saying so. `enabled` is read off the file rather than
+    # asserted true: a config may turn HITL off DELIBERATELY as the no-HITL control for a task
+    # (8c_pp_3bread_cloth_08272026_v4 is v3 with exactly that one key flipped). What must not happen
+    # is a block that says on and resolves off, which is the silent failure this guards.
     yaml = pytest.importorskip("yaml")
     from pathlib import Path
 
@@ -1028,8 +1314,12 @@ def test_the_shipped_hitl_configs_resolve():
         pytest.skip("data-collection is not checked out beside tiptop")
     shipped = sorted(p for p in cfg_dir.glob("*.yml") if "hitl" in (yaml.safe_load(p.read_text()) or {}))
     assert shipped, "at least one shipped config should carry an hitl block"
+    assert any(
+        yaml.safe_load(path.read_text())["hitl"].get("enabled") for path in shipped
+    ), "every shipped hitl block is switched off -- nothing here exercises the feature"
     for path in shipped:
-        assert resolve_hitl_config(yaml.safe_load(path.read_text())["hitl"]).enabled, path.name
+        block = yaml.safe_load(path.read_text())["hitl"]
+        assert resolve_hitl_config(block).enabled == bool(block.get("enabled")), path.name
 
 
 def test_the_shipped_tamp_eval_policies_hand_tiptop_a_block_it_accepts(monkeypatch):
@@ -1130,6 +1420,8 @@ JENGA_PLAN = {
             "description": "push a block out of the tower onto the paper",
             "instructions": "Use the screwdriver to push one block out of the jenga_tower and put it on the white_paper.",
             "atoms": [{"predicate": "On", "args": ["loose_block", "white_paper"]}],
+            "operator": _op("Pry", ["loose_block", "jenga_tower"], pre=[("HandEmpty", [])],
+                            add=[("On", ["loose_block", "white_paper"])]),
         },
         {
             "executor": "robot",
@@ -1300,7 +1592,9 @@ def test_binding_never_steals_a_label_the_plan_already_owns():
                 "new_objects": [{"name": "loose_block", "created_by_phase": 0, "description": "d"}],
                 "phases": [
                     {"executor": "human", "description": "make it", "instructions": "do it",
-                     "atoms": [{"predicate": "On", "args": ["screwdriver", "white_paper"]}]},
+                     "atoms": [{"predicate": "On", "args": ["screwdriver", "white_paper"]}],
+                     "operator": _op("Pry", ["screwdriver"],
+                                     add=[("On", ["screwdriver", "white_paper"])])},
                     {"executor": "robot", "description": "move it",
                      "atoms": [{"predicate": "On", "args": ["loose_block", "jenga_tower"]}]},
                 ],

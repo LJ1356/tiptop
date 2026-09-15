@@ -36,6 +36,22 @@ _ATOM_ITEM = {
     "required": ["predicate", "args"],
 }
 
+# A human phase's operator. `name`/`args` are the action itself (`Push`, ["box"]); the three atom
+# lists are its contract. Only `delete_effects` is genuinely optional -- plenty of human steps take
+# nothing away -- but it is asked for explicitly so an empty list is a STATEMENT rather than an
+# omission, which is the difference between "this undoes nothing" and "nobody said".
+_OPERATOR_ITEM = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "args": {"type": "array", "items": {"type": "string"}},
+        "preconditions": {"type": "array", "items": _ATOM_ITEM},
+        "add_effects": {"type": "array", "items": _ATOM_ITEM},
+        "delete_effects": {"type": "array", "items": _ATOM_ITEM},
+    },
+    "required": ["name", "args", "preconditions", "add_effects", "delete_effects"],
+}
+
 PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -75,6 +91,12 @@ PLAN_SCHEMA = {
                     "description": {"type": "string"},
                     "atoms": {"type": "array", "items": _ATOM_ITEM},
                     "instructions": {"type": "string"},
+                    # The explicit operator a HUMAN phase is, stated the way cuTAMP states its own:
+                    # what must hold first, what becomes true, what stops being true. Asked for per
+                    # phase rather than as a lifted library because the proposer has already decided
+                    # this step happens here, to these objects -- and the grounded instance is the
+                    # only form a camera can be asked about.
+                    "operator": _OPERATOR_ITEM,
                 },
                 "required": ["executor", "description", "atoms"],
             },
@@ -150,6 +172,31 @@ The human can do anything the robot cannot -- open, close, fold, unfold, tie, fl
 manipulate cloth. Give a human phase `instructions` addressed to the person, and `atoms` saying what \
 should be true afterwards. That is what a camera will be used to check, so it must be visible.
 
+EVERY HUMAN PHASE IS AN OPERATOR, AND YOU MUST SAY WHAT IT IS. Give the phase an `operator` with:
+- `name`: what the action is, one word, capitalised -- Push, Open, Fold, Insert, Tie, Solve.
+- `args`: the objects it acts on, from the object list, in the order the name reads.
+- `preconditions`: what must ALREADY be true for the person to be able to do it. Write them with \
+On, Holding, HandEmpty or a predicate you invented. HandEmpty() belongs here whenever the person \
+needs the robot to be out of the way -- which is almost always.
+- `add_effects`: what becomes true. Every atom you put in the phase's `atoms` must appear here.
+- `delete_effects`: what STOPS being true. This is the one most often forgotten. If the person moves \
+something off a surface, the old On(...) is a delete effect; if they close what an earlier phase \
+opened, the IsOpen(...) is. An empty list is fine and means "this takes nothing away" -- but say it.
+
+Worked operator. Objects: box, table. Phase: the human shoves the box aside.
+  operator: {{"name": "Push", "args": ["box"],
+              "preconditions":  [{{"predicate": "HandEmpty", "args": []}},
+                                 {{"predicate": "On", "args": ["box", "table"]}}],
+              "add_effects":    [{{"predicate": "IsPushedAside", "args": ["box"]}}],
+              "delete_effects": [{{"predicate": "On", "args": ["box", "table"]}}]}}
+Read it as: the robot must not be holding anything and the box must be on the table; afterwards the \
+box is pushed aside and is no longer where it was.
+
+The preconditions and effects are CHECKED against a camera image, before and after the person acts, \
+and they are checked against each other across your whole plan. So they have to be true statements \
+about the world, not decoration: do not list a precondition that nothing in your plan makes true, \
+and do not delete something a later phase still needs.
+
 NEW OBJECTS. Sometimes the instruction is about a thing that is not a separate object yet, and only \
 becomes one because of what the human does: a block still inside the tower, a card still in the \
 deck, a lid still on the jar. It is not in the list above because it cannot be seen yet.
@@ -215,6 +262,11 @@ Instruction: "place the toy on the cloth and solve the puzzle". Two clauses, so 
   phase 1, human  -- "solve the puzzle"            atoms: IsSolved(puzzle_board)
                      instructions: "Fit each puzzle piece into its matching cut-out in the
                      puzzle_board so it sits flush."
+                     operator: {{"name": "Solve", "args": ["puzzle_board"],
+                                 "preconditions":  [{{"predicate": "HandEmpty", "args": []}}],
+                                 "add_effects":    [{{"predicate": "IsSolved",
+                                                     "args": ["puzzle_board"]}}],
+                                 "delete_effects": []}}
   coverage: [["place the toy on the cloth", 0], ["solve the puzzle", 1]]
 "solve the puzzle" is NOT On(pink_toy, puzzle_board). Resting the toy on the board solves nothing -- \
 the piece has to go INTO its slot, which the robot cannot do. Writing it as a robot phase is worse \
@@ -230,7 +282,12 @@ you invent -- if a phase needs one, it is a human phase.
 first one away, so the first is wasted motion -- and it almost always means a step that is not really \
 a pick-and-place was given to the robot. If a human phase belongs between them, put it there; if the \
 second phase is the one the robot cannot do, make IT the human phase.
-- Every phase needs at least one atom, and a human phase needs `instructions` too.
+- Every phase needs at least one atom, and a human phase needs `instructions` and an `operator` too.
+- An operator's `add_effects` must include every atom in its phase's `atoms`, and no atom may be in \
+both `add_effects` and `delete_effects`.
+- An operator's `preconditions` must be reachable: either true in the workspace to begin with, or \
+made true by an earlier phase. Do not require something no phase establishes, and do not delete \
+something a later phase's preconditions still need.
 - Every object name must be one of the objects listed above, spelled exactly, or one you declared in \
 `new_objects`. Do not name an object any other way.
 - A `new_objects` entry must be created by a HUMAN phase, that phase must come before every phase \

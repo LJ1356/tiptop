@@ -18,11 +18,12 @@ from PIL import Image
 from tiptop.hitl.cache import ProposalCache
 from tiptop.hitl.config import HITLConfig
 from tiptop.hitl.llm import query_json
-from tiptop.hitl.planning import wasted_robot_move
+from tiptop.hitl.planning import check_plan_effects, wasted_robot_move
 from tiptop.hitl.prompts import PLAN_SCHEMA, plan_prompt
 from tiptop.hitl.structs import (
     DeferredObject,
     HITLProposalError,
+    HumanOperator,
     Phase,
     SceneTypes,
     TaskSpecification,
@@ -75,8 +76,8 @@ def _atom_entries(data: Any, key: str) -> list[tuple[str, list[str]]]:
     return out
 
 
-def _phase_entries(data: Any) -> list[tuple[str, str, list[tuple[str, list[str]]], str]]:
-    """Parse the ``phases`` list into (executor, description, atom entries, instructions)."""
+def _phase_entries(data: Any) -> list[tuple[str, str, list[tuple[str, list[str]]], str, Any]]:
+    """Parse ``phases`` into (executor, description, atom entries, instructions, raw operator)."""
     entries = _field(data, "phases", [])
     if not isinstance(entries, list) or not entries:
         raise HITLProposalError("The plan must contain at least one phase.")
@@ -96,12 +97,44 @@ def _phase_entries(data: Any) -> list[tuple[str, str, list[tuple[str, list[str]]
             raise HITLProposalError(
                 f"The human phase {description!r} needs `instructions` telling the person what to do."
             )
-        out.append((executor, description, atoms, instructions))
+        operator = entry.get("operator")
+        if executor == "robot" and operator:
+            # cuTAMP's operators are the robot's, and they are fixed. A proposal that declares one
+            # is describing a step it has misjudged -- most often a human step written as a robot
+            # phase, which is the failure the `operator` field exists to make visible.
+            raise HITLProposalError(
+                f"The ROBOT phase {description!r} declares an `operator`. Only a human phase does "
+                "that: the robot's operators are fixed (pick and place). If this step needs an "
+                "operator of its own, it is a human phase."
+            )
+        out.append((executor, description, atoms, instructions, operator))
     return out
 
 
+_OPERATOR_ATOM_KEYS = ("preconditions", "add_effects", "delete_effects")
+
+
+def _operator_predicate_uses(
+    phases: Sequence[tuple[str, str, list[tuple[str, list[str]]], str, Any]]
+) -> list[tuple[str, list[str]]]:
+    """Every (predicate, args) pair named inside an operator, so one can type a predicate.
+
+    An invented predicate may be named ONLY in an operator -- a precondition or a delete effect
+    never has to appear in any phase's `atoms` -- and ``_build_invented`` types a predicate from its
+    uses. Without counting these, such a predicate has no uses at all and is rejected as unused,
+    which would make "the human closes what an earlier phase opened" unstatable.
+    """
+    uses: list[tuple[str, list[str]]] = []
+    for _, _, _, _, raw in phases:
+        if not isinstance(raw, dict):
+            continue
+        for key in _OPERATOR_ATOM_KEYS:
+            uses.extend(_atom_entries(raw, key))
+    return uses
+
+
 def _scene_types(
-    phases: Sequence[tuple[str, str, list[tuple[str, list[str]]], str]],
+    phases: Sequence[tuple[str, str, list[tuple[str, list[str]]], str, object]],
     objects: Sequence[str],
     table_name: str,
     deferred: Sequence[str] = (),
@@ -116,7 +149,7 @@ def _scene_types(
     other. They are always movables: _deferred_entries refuses to let one be a surface.
     """
     surfaces = {table_name}
-    for _, _, atoms, _ in phases:
+    for _, _, atoms, _, _ in phases:
         for name, args in atoms:
             if name == "On" and len(args) == 2:
                 surfaces.add(args[1])
@@ -130,7 +163,7 @@ def _scene_types(
 
 def _deferred_entries(
     data: Any,
-    phases: Sequence[tuple[str, str, list[tuple[str, list[str]]], str]],
+    phases: Sequence[tuple[str, str, list[tuple[str, list[str]]], str, object]],
     objects: Sequence[str],
     table_name: str,
 ) -> list[tuple[str, int, str]]:
@@ -171,7 +204,7 @@ def _deferred_entries(
                 "robot only picks things up and puts them down, so it cannot bring a new object into "
                 "existence. A person has to, so that must be a human phase."
             )
-        uses = [i for i, (_, _, atoms, _) in enumerate(phases) if any(name in args for _, args in atoms)]
+        uses = [i for i, (_, _, atoms, _, _) in enumerate(phases) if any(name in args for _, args in atoms)]
         if any(i < created for i in uses):
             raise HITLProposalError(
                 f"The new object '{name}' is used by phase {min(uses)}, which comes before phase "
@@ -250,6 +283,82 @@ def _build_invented(
         parameters = [make_parameter(f"x{i}", type_name) for i, type_name in enumerate(uses[0])]
         invented[raw_name] = VLMPredicate(Fluent(session_fluent_name(raw_name, session_tag), parameters), instructions)
     return invented
+
+
+def _build_operator(
+    raw: Any,
+    *,
+    description: str,
+    phase_atoms: frozenset,
+    invented: dict[str, VLMPredicate],
+    scene_types: SceneTypes,
+) -> HumanOperator:
+    """One human phase's ``operator`` entry -> a grounded :class:`HumanOperator`.
+
+    Every atom is grounded through the same ``_ground_atom`` the phase's own atoms go through, with
+    ``executor="human"``, so an invented predicate is legal here and an unknown one is rejected with
+    the same message. What is checked beyond that is the operator's internal coherence: an add effect
+    that is also a delete effect says nothing, and an operator whose add effects do not cover the
+    phase's own atoms is contradicting the phase it belongs to.
+    """
+    if not isinstance(raw, dict):
+        raise HITLProposalError(
+            f"The human phase {description!r} needs an `operator` object saying what the action is "
+            "(`name`, `args`) and what it does (`preconditions`, `add_effects`, `delete_effects`)."
+        )
+    name = str(_field(raw, "name")).strip()
+    if not name:
+        raise HITLProposalError(f"The operator for {description!r} needs a `name`, e.g. \"Push\".")
+    if "#" in name:
+        # Same backstop as _build_invented: '#' is the internal session-suffix separator.
+        raise HITLProposalError(f"'{name}' is not a valid operator name: '#' is not allowed.")
+    args = _field(raw, "args", [])
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise HITLProposalError(f"The args of the operator {name} must be a list of strings, got {args!r}.")
+    args = [str(a) for a in args]
+    # type_of raises with the available object names, which is the message the model can act on.
+    parameters = tuple(make_parameter(f"x{i}", scene_types.type_of(a)) for i, a in enumerate(args))
+
+    def atoms(key: str) -> frozenset:
+        return frozenset(
+            _ground_atom(n, a, invented, scene_types, "human") for n, a in _atom_entries(raw, key)
+        )
+
+    preconditions, add_effects, delete_effects = (atoms(k) for k in _OPERATOR_ATOM_KEYS)
+    if not add_effects:
+        raise HITLProposalError(
+            f"The operator {name} has no `add_effects`, so nothing about the workspace changes when "
+            "the person does it and there is no way to tell it happened."
+        )
+    both = add_effects & delete_effects
+    if both:
+        raise HITLProposalError(
+            f"The operator {name} both adds and deletes "
+            f"{', '.join(sorted(display_atom(a) for a in both))}. An atom can be one or the other."
+        )
+    uncovered = phase_atoms - add_effects
+    if uncovered:
+        raise HITLProposalError(
+            f"The phase {description!r} says "
+            f"{', '.join(sorted(display_atom(a) for a in uncovered))} must be true afterwards, but "
+            f"its operator {name} does not make that true. Every atom in a phase's `atoms` must "
+            "appear in its operator's `add_effects`."
+        )
+    contradicted = phase_atoms & delete_effects
+    if contradicted:
+        raise HITLProposalError(
+            f"The operator {name} deletes "
+            f"{', '.join(sorted(display_atom(a) for a in contradicted))}, which the phase "
+            f"{description!r} says must be TRUE afterwards."
+        )
+    return HumanOperator(
+        name=name,
+        args=tuple(args),
+        parameters=parameters,
+        preconditions=preconditions,
+        add_effects=add_effects,
+        delete_effects=delete_effects,
+    )
 
 
 def _resolve_fluent(name: str, invented: dict[str, VLMPredicate], executor: str) -> Fluent:
@@ -363,21 +472,35 @@ def parse_plan_response(
     # object whose type this scene has already fixed.
     declared = {str(_field(e, "name")) for e in (data.get("new_predicates") or [])}
     arg_types: dict[str, list[list[str]]] = {}
-    for _, _, atoms, _ in phase_entries:
-        for name, args in atoms:
-            if name in declared:
-                arg_types.setdefault(name, []).append([scene_types.type_of(a) for a in args])
+    uses = [(n, a) for _, _, atoms, _, _ in phase_entries for n, a in atoms]
+    # Uses inside an operator count too: a precondition or a delete effect may be the only place an
+    # invented predicate is named, and an unused predicate is rejected.
+    uses += _operator_predicate_uses(phase_entries)
+    for name, args in uses:
+        if name in declared:
+            arg_types.setdefault(name, []).append([scene_types.type_of(a) for a in args])
     invented = _build_invented(data.get("new_predicates"), arg_types, session_tag)
 
-    phases = tuple(
-        Phase(
+    phases = []
+    for executor, description, atoms, instructions, raw_operator in phase_entries:
+        grounded = frozenset(_ground_atom(n, a, invented, scene_types, executor) for n, a in atoms)
+        operator = None
+        if executor == "human":
+            operator = _build_operator(
+                raw_operator,
+                description=description,
+                phase_atoms=grounded,
+                invented=invented,
+                scene_types=scene_types,
+            )
+        phases.append(Phase(
             executor=executor,
             description=description,
-            atoms=frozenset(_ground_atom(n, a, invented, scene_types, executor) for n, a in atoms),
+            atoms=grounded,
             instructions=instructions,
-        )
-        for executor, description, atoms, instructions in phase_entries
-    )
+            operator=operator,
+        ))
+    phases = tuple(phases)
     deferred = tuple(
         DeferredObject(
             name=name,
@@ -411,7 +534,16 @@ async def propose_plan(
     prompt = plan_prompt(instruction, list(objects))
 
     def parse(data: Any) -> TaskSpecification:
-        return parse_plan_response(data, instruction, objects, table_name, session_tag)
+        spec = parse_plan_response(data, instruction, objects, table_name, session_tag)
+        if cfg.check_plan_effects:
+            # Inside `parse`, so a plan whose operators contradict each other is REPROMPTED with the
+            # reason rather than failing the task. The starting workspace is unknown here (nothing
+            # has been classified yet), so only what the plan itself makes false is provable -- see
+            # planning.check_plan_effects.
+            broken = check_plan_effects(spec)
+            if broken:
+                raise HITLProposalError(f"This plan does not hang together: {broken}")
+        return spec
 
     spec = await query_json(
         prompt, parse, model=cfg.proposal_model, schema=PLAN_SCHEMA,
@@ -426,6 +558,16 @@ async def propose_plan(
             _log.info(f"HITL phase {i} instructions: {phase.instructions}")
     for predicate in spec.invented:
         _log.info(f"HITL invented predicate {display_name(predicate.name)}: {predicate.instructions}")
+    for i, phase in enumerate(spec.phases):
+        if phase.operator is None:
+            continue
+        op = phase.operator
+        _log.info(
+            f"HITL phase {i} operator {op.display}: pre "
+            f"{sorted(display_atom(a) for a in op.preconditions) or 'none'} -> add "
+            f"{sorted(display_atom(a) for a in op.add_effects)} del "
+            f"{sorted(display_atom(a) for a in op.delete_effects) or 'none'}"
+        )
     for deferred in spec.deferred:
         _log.info(
             f"HITL new object {deferred.name}: does not exist yet -- phase {deferred.created_by_phase} "

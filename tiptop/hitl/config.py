@@ -43,6 +43,44 @@ class HITLConfig:
     # false negative is recoverable by answering the label prompt). False records the verdict in
     # hitl.json and carries on, which is what you want while calibrating the classifier prompts.
     verify_enforced: bool = True
+
+    # ---- What gets checked around each phase (ARCHITECTURE: the operator contract) ---- #
+    # Every human phase declares an operator -- preconditions, add effects, delete effects -- and
+    # every robot phase has cuTAMP's own. These four say which halves of that contract are actually
+    # put to a camera. Each check costs one VLM call per checkable atom, paid with the arm parked,
+    # which is why only ONE is on by default:
+    #
+    #   * a human phase's EFFECTS are the only evidence the step happened at all. Nothing else in
+    #     the system can tell you whether the box got opened, so this stays on -- and it is the
+    #     check that has always run (grounding.verify_effects).
+    #   * a human phase's PRECONDITIONS are usually redundant: `check_plan_effects` below already
+    #     proved, symbolically and for free, that the plan establishes them. Worth turning on when a
+    #     human phase keeps failing and it is not clear whether it was ever set up properly.
+    #   * a robot leg's PRECONDITIONS guard against planning onto a stale belief -- the previous
+    #     human phase may not have done what it was verified as doing. Real, but it lands between
+    #     perception and cuTAMP with the arm parked, and a collection run would rather spend that
+    #     time collecting.
+    #   * a robot leg's EFFECTS are the robot's own business: cuTAMP either found and executed a
+    #     plan for `On(toy, box)` or it reported that it could not, and a third-person camera is a
+    #     worse witness to that than the arm's own report.
+    #
+    # A failed check is recorded in hitl.json and emitted as an event either way. Whether it STOPS
+    # the plan is `verify_enforced` (human effects) and `precondition_enforced` (either
+    # precondition); nothing enforces a robot leg's effects.
+    check_human_preconditions: bool = False
+    check_human_effects: bool = True
+    check_tamp_preconditions: bool = False
+    check_tamp_effects: bool = False
+    # Treat an unmet precondition as a reason not to proceed. Off by default, matching this package's
+    # standing rule that one classifier call must not cost the operator a demonstration: the verdict
+    # is recorded and the phase goes ahead. On, an unmet precondition stops the plan before the arm
+    # is handed over (human) or before cuTAMP is asked for a plan (robot).
+    precondition_enforced: bool = False
+    # Check the declared operators against each other before the arm moves: walk the phase list
+    # symbolically and refuse a plan that deletes a precondition a later phase needs. Costs nothing
+    # (no VLM call) and the rejection goes back to the proposer through the reprompt loop, which is
+    # why it is on. See planning.check_plan_effects for what it can and cannot prove.
+    check_plan_effects: bool = True
     # Write every image sent to the VLM, and a rendered PNG of what it answered, into `vlm/` beside
     # each rollout (plus index.jsonl with the full prompts and replies). Rejected attempts included.
     # On by default: when a HITL run goes wrong the question is almost always "what did the model

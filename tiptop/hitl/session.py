@@ -25,10 +25,12 @@ from tiptop.hitl.grounding import (
 from tiptop.hitl.planning import (
     ObjectGeometry,
     bind_deferred_objects,
+    check_plan_effects,
     check_robot_phases,
     goal_atoms_to_dicts,
     initial_state_for,
     phase_objects,
+    simulate_phases,
 )
 from tiptop.hitl.planners import Leg, human_planner, planner_for, robot_planner
 from tiptop.hitl.proposal import propose_plan
@@ -138,6 +140,39 @@ class HITLSession:
         if self.finished:
             return None
         return self.planner().leg(self.phases[self.index :], self.spec.scene_types)
+
+    def expected_now(self) -> frozenset[Atom]:
+        """What EARLIER phases should have left true, entering the leg about to run.
+
+        This is the robot-side precondition set (``hitl.check_tamp_preconditions``). A robot phase
+        declares no preconditions of its own -- it has no operator, and cuTAMP replans it from a
+        fresh perception pass -- so what is worth checking before one is the plan's own beliefs:
+        every atom some earlier phase was responsible for establishing and no later one undid.
+
+        Restricted to exactly that. An atom nothing established may or may not hold, and the plan
+        does not depend on which, so putting it to a camera would only manufacture failures; and the
+        atoms that ARE listed are the ones a human phase verified as done may nonetheless have left
+        undone, which is the drift this check exists to catch.
+        """
+        if self.finished:
+            return frozenset()
+        traces = simulate_phases(self.spec, self.initially_true)
+        established: set[Atom] = set()
+        for trace in traces[: self.index]:
+            established |= set(trace.phase.add_effects)
+            established -= set(trace.phase.delete_effects)
+        return frozenset(traces[self.index].before & frozenset(established))
+
+    def plan_inconsistency(self) -> str | None:
+        """Why this plan's operators do not hang together, now that the start state is measured.
+
+        The same check the proposal stage already passed, re-run with ``initially_true`` known. It can
+        conclude more than the parse-time pass could: a precondition over an invented predicate that
+        no phase establishes is provably unmet once the workspace has actually been looked at.
+        """
+        if not self.cfg.check_plan_effects or not self.initially_true:
+            return None
+        return check_plan_effects(self.spec, self.initially_true, initial_state_known=True)
 
     def robot_run(self) -> tuple[Phase, ...]:
         """The consecutive robot phases this leg plans and executes as ONE goal.
@@ -312,11 +347,32 @@ class HITLSession:
                 "phase_sub_goals": "vlm -- the atoms each robot phase must establish",
                 "invented_predicates": "vlm -- name and the natural-language classifier behind it",
                 "human_instructions": "vlm -- the text the operator is shown",
+                "human_operators": (
+                    "vlm -- each human phase is an explicit operator (name, args, preconditions, "
+                    "add effects, delete effects), stated the way cuTAMP states its own. It is never "
+                    "searched over: the phase order is already fixed. It is the contract the "
+                    "pre/post camera checks and the plan-time consistency check are stated over"
+                ),
+                "robot_operators": (
+                    "cutamp -- fixed (pick/place/move), with their own preconditions and effects; "
+                    "nothing invents a robot operator"
+                ),
                 # Who carries out each half, read off the planners themselves rather than named
                 # here: which planner has the robot's phases is a config choice (hitl.robot_planner),
                 # and a record that hard-codes one is a false statement the moment it is changed.
                 "robot_phases": robot_planner(self.cfg.robot_planner).provenance,
                 "human_phases": human_planner(self.cfg.policy_type).provenance,
+            },
+            # Which halves of the operator contract this run put to a camera. Without it a phase
+            # with no verdicts is ambiguous between "checked and fine" and "never checked".
+            "checks": {
+                "human_preconditions": self.cfg.check_human_preconditions,
+                "human_effects": self.cfg.check_human_effects,
+                "tamp_preconditions": self.cfg.check_tamp_preconditions,
+                "tamp_effects": self.cfg.check_tamp_effects,
+                "plan_effects": self.cfg.check_plan_effects,
+                "verify_enforced": self.cfg.verify_enforced,
+                "precondition_enforced": self.cfg.precondition_enforced,
             },
             "phases": phases,
             "phase_index": self.index,
@@ -361,6 +417,16 @@ async def build_session(
     reason = check_robot_phases(spec, initial_state)
     if reason is not None:
         return None, f"HITL planning failed: {reason}"
+    if cfg.check_plan_effects and initially_true:
+        # The plan already passed this check at proposal time, where the starting workspace was
+        # unknown. Now that it has been measured, the same check can prove more -- a precondition
+        # over an invented predicate that no phase establishes and the scene does not already
+        # satisfy. A WARNING rather than a rejection: the proposer is no longer in the loop (the
+        # reprompt happened before the image was classified), and the phases are still worth running
+        # with the gap on the record.
+        broken = check_plan_effects(spec, initially_true, initial_state_known=True)
+        if broken:
+            _log.warning(f"HITL: the plan does not hang together against the measured scene: {broken}")
     if not spec.needs_human:
         _log.info("HITL: the robot can do this whole task on its own; no human phases were proposed")
 
@@ -435,10 +501,15 @@ def phase_summary(session: HITLSession, phase: Phase) -> dict:
     control for the hand-off, and what pressing it does -- carry on with the robot, or close the
     trajectory out -- is the plan's decision, not the operator's: ``is_last_phase`` is that decision.
     """
-    return {
+    summary = {
         "description": phase.description,
         "expected": sorted(str(a) for a in phase.atoms),
         "phase_index": session.index,
         "n_phases": len(session.phases),
         "is_last_phase": session.is_final_phase(),
     }
+    if phase.operator is not None:
+        # The explicit contract, so the UI can show what this step needs and what it changes rather
+        # than only the sentence the person was given.
+        summary["operator"] = phase.operator.to_json()
+    return summary

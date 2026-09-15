@@ -28,7 +28,12 @@ PLAN = {
         {"executor": "robot", "description": "clear the box",
          "atoms": [{"predicate": "On", "args": ["blue_toy", "table"]}]},
         {"executor": "human", "description": "open the box", "instructions": "Open the white_box.",
-         "atoms": [{"predicate": "IsOpen", "args": ["white_box"]}]},
+         "atoms": [{"predicate": "IsOpen", "args": ["white_box"]}],
+         # Every human phase declares its operator (proposal._build_operator).
+         "operator": {"name": "Open", "args": ["white_box"],
+                      "preconditions": [{"predicate": "HandEmpty", "args": []}],
+                      "add_effects": [{"predicate": "IsOpen", "args": ["white_box"]}],
+                      "delete_effects": []}},
         {"executor": "robot", "description": "put the toy in the box",
          "atoms": [{"predicate": "On", "args": ["blue_toy", "white_box"]}]},
     ],
@@ -114,7 +119,7 @@ def test_the_plan_advances_to_the_next_phase_without_verifying(monkeypatch):
     async def _must_not_verify(*a, **k):
         raise AssertionError("the classifier was consulted after the operator had already decided")
 
-    monkeypatch.setattr("tiptop.hitl.grounding.verify_phase", _must_not_verify)
+    monkeypatch.setattr("tiptop.hitl.grounding.verify_effects", _must_not_verify)
     events: list[dict] = []
     monkeypatch.setattr(tr, "_emit_event", events.append)
 
@@ -146,7 +151,7 @@ def test_a_leg_that_ends_on_its_own_is_still_verified(monkeypatch):
         calls.append(1)
         return True, []
 
-    monkeypatch.setattr("tiptop.hitl.grounding.verify_phase", _verify)
+    monkeypatch.setattr("tiptop.hitl.grounding.verify_effects", _verify)
 
     import asyncio
     ended = asyncio.run(tr._hitl_human_phase(object(), session.current, can_finish=False, output_dir="/tmp"))
